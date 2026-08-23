@@ -13,6 +13,11 @@ import {
   fetchTeamHistory,
   webSearchUrlForTeam,
   getArchiveAccess,
+  getSaintsLockAccess,
+  getNextReleaseLabel,
+  fetchFixturesForDate,
+  adminAddFixtureToTicket,
+  adminRemoveFixtureFromTicket,
   dateKey,
   TIER_CONFIG,
   ANONYMOUS_TRIAL_DAYS,
@@ -26,7 +31,10 @@ import {
   type TeamFormSummary,
   type ArchiveAccess,
   type TrialPolicy,
+  type SaintsLockAccess,
+  type AvailableFixture,
 } from '@/lib/dataFetcher';
+import { submitFeedback, type FeedbackCategory } from '@/lib/feedback';
 
 // ---------------------------------------------------------------------------
 // Color tokens — Odd Saint brand
@@ -295,6 +303,11 @@ function formatKickoff(iso: string): string {
     date
   );
   return `${day}, ${time}`;
+}
+
+/** Formats an ISO "available_at" timestamp as a plain local clock time, e.g. "8:00 AM". */
+function formatReleaseTime(iso: string): string {
+  return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
 }
 
 function MatchRow({
@@ -745,24 +758,272 @@ function TeamSearchModal({ onClose }: { onClose: () => void }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Admin match editor — add/remove an individual fixture on a ticket
+// ---------------------------------------------------------------------------
+// Operates on fixtures the pipeline already priced for that ticket's date
+// (the `fixtures` table) — an admin curates from real, already-generated
+// data rather than hand-inventing a brand-new fixture from scratch. The
+// real security boundary is Supabase RLS (see
+// supabase/migrations/002_batch_updates.sql): these calls simply fail for
+// a non-admin, this modal is only ever rendered for archiveAccess.level
+// === 'admin' in the first place.
+
+function AdminMatchEditorModal({
+  ticket,
+  onClose,
+  onChanged,
+}: {
+  ticket: Ticket;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [available, setAvailable] = useState<AvailableFixture[]>([]);
+  const [loadingAvailable, setLoadingAvailable] = useState(true);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const anchor = ticket.matches[0]?.kickoff ? new Date(ticket.matches[0].kickoff) : new Date();
+    fetchFixturesForDate(anchor)
+      .then(setAvailable)
+      .finally(() => setLoadingAvailable(false));
+  }, [ticket]);
+
+  const attachedIds = new Set(ticket.matches.map((m) => m.id));
+  const addable = available.filter((f) => !attachedIds.has(String(f.id)));
+
+  async function handleRemove(fixtureId: string) {
+    setError(null);
+    setBusyId(fixtureId);
+    const res = await adminRemoveFixtureFromTicket(ticket.id, Number(fixtureId));
+    setBusyId(null);
+    if (!res.success) setError(res.error ?? 'Could not remove that fixture.');
+    else onChanged();
+  }
+
+  async function handleAdd(fixture: AvailableFixture) {
+    setError(null);
+    setBusyId(String(fixture.id));
+    const res = await adminAddFixtureToTicket(ticket.id, fixture.id);
+    setBusyId(null);
+    if (!res.success) setError(res.error ?? 'Could not add that fixture.');
+    else onChanged();
+  }
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.55)',
+        zIndex: 47,
+        display: 'flex',
+        alignItems: 'flex-start',
+        justifyContent: 'center',
+        padding: 20,
+        paddingTop: '6vh',
+        overflowY: 'auto',
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: COLORS.surface,
+          borderRadius: 14,
+          padding: 20,
+          width: '100%',
+          maxWidth: 460,
+          boxShadow: '0 20px 60px -20px rgba(0,0,0,0.35)',
+          position: 'relative',
+        }}
+      >
+        <button
+          onClick={onClose}
+          aria-label="Close"
+          style={{
+            position: 'absolute',
+            top: 12,
+            right: 12,
+            background: 'none',
+            border: 'none',
+            color: COLORS.textMuted,
+            fontSize: 16,
+            cursor: 'pointer',
+          }}
+        >
+          ✕
+        </button>
+
+        <h2
+          style={{
+            fontFamily: FONT_DISPLAY,
+            fontSize: 16,
+            fontWeight: 800,
+            color: COLORS.textPrimary,
+            margin: '0 0 4px',
+          }}
+        >
+          Edit matches — {ticket.label}
+        </h2>
+        <p style={{ fontSize: 11, color: COLORS.textMuted, margin: '0 0 14px' }}>
+          Admin only. Pull a match you judge too risky, or add a stronger one from today's priced pool.
+        </p>
+
+        {error && (
+          <div style={{ fontSize: 11.5, color: COLORS.red, marginBottom: 10 }}>{error}</div>
+        )}
+
+        <div
+          style={{
+            fontFamily: FONT_BODY,
+            fontSize: 10.5,
+            fontWeight: 700,
+            color: COLORS.textMuted,
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+            marginBottom: 6,
+          }}
+        >
+          On this ticket ({ticket.matches.length})
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          {ticket.matches.map((m) => (
+            <div
+              key={m.id}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 8,
+                padding: '8px 0',
+                borderBottom: `1px solid ${COLORS.border}`,
+              }}
+            >
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 12.5, fontWeight: 600, color: COLORS.textPrimary }}>
+                  {m.homeTeam} vs {m.awayTeam}
+                </div>
+                <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>
+                  {m.market} · {m.odds} · {formatKickoff(m.kickoff)}
+                </div>
+              </div>
+              <button
+                onClick={() => handleRemove(m.id)}
+                disabled={busyId === m.id}
+                style={{
+                  flexShrink: 0,
+                  padding: '6px 10px',
+                  borderRadius: 7,
+                  border: `1px solid ${COLORS.red}`,
+                  background: 'transparent',
+                  color: COLORS.red,
+                  fontFamily: FONT_BODY,
+                  fontSize: 11,
+                  fontWeight: 700,
+                  cursor: busyId === m.id ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {busyId === m.id ? '...' : 'Remove'}
+              </button>
+            </div>
+          ))}
+          {ticket.matches.length === 0 && (
+            <div style={{ fontSize: 12, color: COLORS.textMuted, padding: '6px 0' }}>No matches left on this ticket.</div>
+          )}
+        </div>
+
+        <div
+          style={{
+            fontFamily: FONT_BODY,
+            fontSize: 10.5,
+            fontWeight: 700,
+            color: COLORS.textMuted,
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+            marginBottom: 6,
+          }}
+        >
+          Available today
+        </div>
+        {loadingAvailable && <div style={{ fontSize: 12, color: COLORS.textMuted }}>Loading priced fixtures…</div>}
+        {!loadingAvailable && addable.length === 0 && (
+          <div style={{ fontSize: 12, color: COLORS.textMuted }}>
+            No other priced fixtures available for this date yet.
+          </div>
+        )}
+        <div style={{ maxHeight: 260, overflowY: 'auto' }}>
+          {addable.map((f) => (
+            <div
+              key={f.id}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 8,
+                padding: '8px 0',
+                borderBottom: `1px solid ${COLORS.border}`,
+              }}
+            >
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 12.5, fontWeight: 600, color: COLORS.textPrimary }}>
+                  {f.homeTeam} vs {f.awayTeam}
+                </div>
+                <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>
+                  {f.league} · {f.market} · {f.odds} · conf {f.confidence}%
+                </div>
+              </div>
+              <button
+                onClick={() => handleAdd(f)}
+                disabled={busyId === String(f.id)}
+                style={{
+                  flexShrink: 0,
+                  padding: '6px 10px',
+                  borderRadius: 7,
+                  border: 'none',
+                  background: COLORS.emerald,
+                  color: '#ffffff',
+                  fontFamily: FONT_BODY,
+                  fontSize: 11,
+                  fontWeight: 700,
+                  cursor: busyId === String(f.id) ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {busyId === String(f.id) ? '...' : 'Add'}
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function TicketCard({
   ticket,
   unlocked,
   trialActive,
   isSignedIn,
+  isAdmin,
+  hasSaintsLockAccess,
   onWatchAd,
   onSubscribe,
   onPayPerTicket,
   onSelectMatch,
+  onEditAsAdmin,
 }: {
   ticket: Ticket;
   unlocked: boolean;
   trialActive: boolean;
   isSignedIn: boolean;
+  isAdmin: boolean;
+  hasSaintsLockAccess: boolean;
   onWatchAd: (ticketId: string) => void;
   onSubscribe: () => void;
   onPayPerTicket: (ticketId: string) => void;
   onSelectMatch: (match: Match) => void;
+  onEditAsAdmin: (ticket: Ticket) => void;
 }) {
   const [open, setOpen] = useState(false);
   const overallStatus = getTicketStatus(ticket);
@@ -772,7 +1033,8 @@ function TicketCard({
   const isWeeklyTitanUnlockedForever = ticket.tier === 'weekly_titan' && isSignedIn;
   // Saint's Lock ignores ticket.isFree/trial/unlocked entirely — it has its
   // own product, its own pricing, sign-up is mandatory, and no free trial
-  // ever applies to it (see saints_lock_access in supabase/schema.sql).
+  // ever applies to it (see saints_lock_access in supabase/schema.sql and
+  // getSaintsLockAccess in dataFetcher.ts — passed in as a real prop here).
   const isLocked = isSaintsLock
     ? !hasSaintsLockAccess
     : !ticket.isFree && !isWeeklyTitanUnlockedForever && !trialActive && !unlocked;
@@ -809,65 +1071,88 @@ function TicketCard({
         }}
       />
 
-      <button
-        onClick={() => setOpen((o) => !o)}
-        style={{
-          width: '100%',
-          background: 'none',
-          border: 'none',
-          padding: 0,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          cursor: 'pointer',
-          color: 'inherit',
-        }}
-      >
-        <div style={{ textAlign: 'left' }}>
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 7 }}>
-            <div style={{ fontFamily: FONT_DISPLAY, fontSize: 16.5, fontWeight: 600, color: COLORS.textPrimary }}>
-              {ticket.label}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <button
+          onClick={() => setOpen((o) => !o)}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            background: 'none',
+            border: 'none',
+            padding: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            cursor: 'pointer',
+            color: 'inherit',
+          }}
+        >
+          <div style={{ textAlign: 'left', minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 7, flexWrap: 'wrap' }}>
+              <div style={{ fontFamily: FONT_DISPLAY, fontSize: 16.5, fontWeight: 600, color: COLORS.textPrimary }}>
+                {ticket.label}
+              </div>
+              {ticket.availableAt && (
+                <span
+                  style={{
+                    fontFamily: FONT_BODY,
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color: COLORS.textMuted,
+                    background: COLORS.surfaceAlt,
+                    borderRadius: 999,
+                    padding: '1px 7px',
+                  }}
+                >
+                  Released {formatReleaseTime(ticket.availableAt)}
+                </span>
+              )}
             </div>
-            {ticket.slipLabel && (
-              <span
-                style={{
-                  fontFamily: FONT_BODY,
-                  fontSize: 10.5,
-                  fontWeight: 700,
-                  color: COLORS.emerald,
-                  background: 'rgba(11,138,79,0.1)',
-                  borderRadius: 999,
-                  padding: '1px 7px',
-                }}
-              >
-                Slip {ticket.slipLabel}
-              </span>
-            )}
+            <div style={{ fontSize: 11.5, color: COLORS.textMuted, marginTop: 3 }}>
+              {ticket.matchCount} matches · odds {ticket.oddsRange} · total{' '}
+              <span style={{ color: COLORS.emerald, fontWeight: 700 }}>{ticket.totalOdds}x</span>
+            </div>
           </div>
-          <div style={{ fontSize: 11.5, color: COLORS.textMuted, marginTop: 3 }}>
-            {ticket.matchCount} matches · odds {ticket.oddsRange} · total{' '}
-            <span style={{ color: COLORS.emerald, fontWeight: 700 }}>{ticket.totalOdds}x</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+            <span
+              className={overallStatus === 'pending' ? 'live-pulse' : undefined}
+              style={{
+                fontFamily: FONT_BODY,
+                fontSize: 10,
+                fontWeight: 700,
+                letterSpacing: '0.06em',
+                padding: '4px 10px',
+                borderRadius: 999,
+                color: overallStatus === 'green' ? '#04150f' : overallStatus === 'red' ? '#2a0808' : '#3d2900',
+                background: borderColor,
+              }}
+            >
+              {statusLabel}
+            </span>
+            <span style={{ color: COLORS.textMuted, fontSize: 12 }}>{open ? '▲' : '▼'}</span>
           </div>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span
-            className={overallStatus === 'pending' ? 'live-pulse' : undefined}
-            style={{
-              fontFamily: FONT_BODY,
-              fontSize: 10,
-              fontWeight: 700,
-              letterSpacing: '0.06em',
-              padding: '4px 10px',
-              borderRadius: 999,
-              color: overallStatus === 'green' ? '#04150f' : overallStatus === 'red' ? '#2a0808' : '#3d2900',
-              background: borderColor,
-            }}
-          >
-            {statusLabel}
-          </span>
-          <span style={{ color: COLORS.textMuted, fontSize: 12 }}>{open ? '▲' : '▼'}</span>
-        </div>
-      </button>
+        </button>
+      </div>
+
+      {isAdmin && (
+        <button
+          onClick={() => onEditAsAdmin(ticket)}
+          style={{
+            marginTop: 10,
+            background: 'none',
+            border: `1px dashed ${COLORS.hairline}`,
+            borderRadius: 7,
+            padding: '4px 9px',
+            color: COLORS.textMuted,
+            fontFamily: FONT_BODY,
+            fontSize: 10.5,
+            fontWeight: 700,
+            cursor: 'pointer',
+          }}
+        >
+          ✎ Edit matches (admin)
+        </button>
+      )}
 
       {open && (
         <div style={{ marginTop: 14 }}>
@@ -901,42 +1186,50 @@ function TicketCard({
                     textAlign: 'center',
                   }}
                 >
-                  Your 30-day free trial has ended. Unlock this ticket:
+                  {isSaintsLock
+                    ? isSignedIn
+                      ? "Saint's Lock requires a paid pass — no free trial applies here."
+                      : "Saint's Lock requires a free account, then a paid pass — sign in to continue."
+                    : 'Your free trial has ended. Unlock this ticket:'}
                 </div>
-                <button
-                  onClick={() => onWatchAd(ticket.id)}
-                  style={{
-                    padding: '11px 0',
-                    borderRadius: 9,
-                    border: 'none',
-                    fontFamily: FONT_BODY,
-                    fontWeight: 600,
-                    fontSize: 13,
-                    background: `linear-gradient(135deg, ${COLORS.emerald}, #0d9668)`,
-                    color: '#04150f',
-                    cursor: 'pointer',
-                  }}
-                >
-                  ▶ Watch Ad to Reveal Selection
-                </button>
-                <div style={{ display: 'flex', gap: 8 }}>
+                {!isSaintsLock && (
                   <button
-                    onClick={() => onPayPerTicket(ticket.id)}
+                    onClick={() => onWatchAd(ticket.id)}
                     style={{
-                      flex: 1,
-                      padding: '9px 0',
-                      borderRadius: 8,
-                      border: `1px solid ${COLORS.hairline}`,
+                      padding: '11px 0',
+                      borderRadius: 9,
+                      border: 'none',
                       fontFamily: FONT_BODY,
                       fontWeight: 600,
-                      fontSize: 12,
-                      background: 'transparent',
-                      color: COLORS.textPrimary,
+                      fontSize: 13,
+                      background: `linear-gradient(135deg, ${COLORS.emerald}, #0d9668)`,
+                      color: '#04150f',
                       cursor: 'pointer',
                     }}
                   >
-                    Pay Micro-Fee
+                    ▶ Watch Ad to Reveal Selection
                   </button>
+                )}
+                <div style={{ display: 'flex', gap: 8 }}>
+                  {!isSaintsLock && (
+                    <button
+                      onClick={() => onPayPerTicket(ticket.id)}
+                      style={{
+                        flex: 1,
+                        padding: '9px 0',
+                        borderRadius: 8,
+                        border: `1px solid ${COLORS.hairline}`,
+                        fontFamily: FONT_BODY,
+                        fontWeight: 600,
+                        fontSize: 12,
+                        background: 'transparent',
+                        color: COLORS.textPrimary,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      Pay Micro-Fee
+                    </button>
+                  )}
                   <button
                     onClick={onSubscribe}
                     style={{
@@ -952,7 +1245,7 @@ function TicketCard({
                       cursor: 'pointer',
                     }}
                   >
-                    Subscribe Monthly
+                    {isSaintsLock ? "Get Saint's Lock Pass" : 'Subscribe Monthly'}
                   </button>
                 </div>
               </div>
@@ -967,6 +1260,270 @@ function TicketCard({
         </div>
       )}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Saint's Lock — daily marketing countdown
+// ---------------------------------------------------------------------------
+// Rendered as a standalone strip ABOVE the accordion (not just inside it),
+// per the "market it daily, give a time reminder before kickoff" spec —
+// this is meant to be seen whether or not someone opens the ticket.
+
+function SaintsLockCountdown({ ticket }: { ticket: Ticket }) {
+  const kickoffISO = ticket.matches[0]?.kickoff;
+  const [msLeft, setMsLeft] = useState(() => (kickoffISO ? new Date(kickoffISO).getTime() - Date.now() : null));
+
+  useEffect(() => {
+    if (!kickoffISO) return;
+    const t = setInterval(() => setMsLeft(new Date(kickoffISO).getTime() - Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [kickoffISO]);
+
+  if (!kickoffISO || msLeft === null) return null;
+
+  const label =
+    msLeft <= 0
+      ? 'Kicking off now'
+      : (() => {
+          const h = Math.floor(msLeft / 3_600_000);
+          const m = Math.floor((msLeft % 3_600_000) / 60_000);
+          return `Kicks off in ${h}h ${m}m`;
+        })();
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 10,
+        background: '#12241c',
+        borderRadius: 10,
+        padding: '10px 14px',
+        marginBottom: 8,
+      }}
+    >
+      <div style={{ fontSize: 11.5, color: '#ffffff', fontWeight: 700 }}>
+        🔒 Today's Saint's Lock — {ticket.matches[0].homeTeam} vs {ticket.matches[0].awayTeam}
+      </div>
+      <div
+        className={msLeft > 0 ? 'live-pulse' : undefined}
+        style={{ fontSize: 11, color: COLORS.gold, fontWeight: 800, flexShrink: 0 }}
+      >
+        {label}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Customer support / feedback widget
+// ---------------------------------------------------------------------------
+// Submissions go through prefilterFeedback (obvious-spam check) then land
+// as `status: 'pending'` in the `feedback` table — nothing here is ever
+// shown publicly without an admin moderating it first. See
+// src/lib/feedback.ts and supabase/migrations/002_batch_updates.sql.
+
+function SupportModal({
+  onClose,
+  userId,
+  userEmail,
+}: {
+  onClose: () => void;
+  userId: string | null;
+  userEmail: string | null;
+}) {
+  const categories: { id: FeedbackCategory; label: string }[] = [
+    { id: 'usability', label: 'Usability' },
+    { id: 'performance', label: 'Performance / results' },
+    { id: 'bug', label: 'Something broken' },
+    { id: 'support_request', label: 'General support' },
+  ];
+
+  const [category, setCategory] = useState<FeedbackCategory>('support_request');
+  const [message, setMessage] = useState('');
+  const [status, setStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setStatus('sending');
+    const res = await submitFeedback({ userId, email: userEmail, category, message });
+    if (!res.success) {
+      setError(res.error ?? 'Could not submit — please try again.');
+      setStatus('error');
+      return;
+    }
+    setStatus('sent');
+  }
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.5)',
+        zIndex: 46,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 20,
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: COLORS.surface,
+          borderRadius: 14,
+          padding: 22,
+          width: '100%',
+          maxWidth: 400,
+          boxShadow: '0 20px 60px -20px rgba(0,0,0,0.35)',
+          position: 'relative',
+        }}
+      >
+        <button
+          onClick={onClose}
+          aria-label="Close"
+          style={{
+            position: 'absolute',
+            top: 12,
+            right: 12,
+            background: 'none',
+            border: 'none',
+            color: COLORS.textMuted,
+            fontSize: 16,
+            cursor: 'pointer',
+          }}
+        >
+          ✕
+        </button>
+
+        <h2
+          style={{
+            fontFamily: FONT_DISPLAY,
+            fontSize: 17,
+            fontWeight: 800,
+            color: COLORS.textPrimary,
+            margin: '0 0 4px',
+          }}
+        >
+          Support & feedback
+        </h2>
+
+        {status === 'sent' ? (
+          <p style={{ fontSize: 12.5, color: COLORS.emerald, lineHeight: 1.6, marginTop: 14 }}>
+            Thanks — your message has been received and will be reviewed by our team.
+          </p>
+        ) : (
+          <>
+            <p style={{ fontSize: 11.5, color: COLORS.textMuted, margin: '0 0 16px' }}>
+              Every message is reviewed before it informs any change we make — tell us what's working or not.
+            </p>
+
+            <form onSubmit={handleSubmit}>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
+                {categories.map((c) => (
+                  <button
+                    type="button"
+                    key={c.id}
+                    onClick={() => setCategory(c.id)}
+                    style={{
+                      fontFamily: FONT_BODY,
+                      fontSize: 11,
+                      fontWeight: 700,
+                      padding: '5px 11px',
+                      borderRadius: 999,
+                      border: category === c.id ? 'none' : `1px solid ${COLORS.border}`,
+                      background: category === c.id ? COLORS.emerald : 'transparent',
+                      color: category === c.id ? '#ffffff' : COLORS.textMuted,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {c.label}
+                  </button>
+                ))}
+              </div>
+
+              <textarea
+                required
+                value={message}
+                onChange={(e) => setMessage(e.target.value)}
+                placeholder="What's on your mind?"
+                rows={5}
+                style={{
+                  width: '100%',
+                  padding: '10px 12px',
+                  borderRadius: 8,
+                  border: `1px solid ${COLORS.border}`,
+                  background: COLORS.surfaceAlt,
+                  color: COLORS.textPrimary,
+                  fontFamily: FONT_BODY,
+                  fontSize: 13,
+                  marginBottom: 12,
+                  resize: 'vertical',
+                  boxSizing: 'border-box',
+                }}
+              />
+
+              {error && <div style={{ fontSize: 11.5, color: COLORS.red, marginBottom: 10 }}>{error}</div>}
+
+              <button
+                type="submit"
+                disabled={status === 'sending' || !message.trim()}
+                style={{
+                  width: '100%',
+                  padding: '11px 0',
+                  borderRadius: 9,
+                  border: 'none',
+                  fontFamily: FONT_BODY,
+                  fontWeight: 600,
+                  fontSize: 13,
+                  cursor: status === 'sending' || !message.trim() ? 'not-allowed' : 'pointer',
+                  background:
+                    status === 'sending' || !message.trim()
+                      ? COLORS.border
+                      : `linear-gradient(135deg, ${COLORS.emerald}, #0d9668)`,
+                  color: status === 'sending' || !message.trim() ? COLORS.textMuted : '#04150f',
+                }}
+              >
+                {status === 'sending' ? 'Sending…' : 'Send'}
+              </button>
+            </form>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SupportButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      aria-label="Support and feedback"
+      style={{
+        position: 'fixed',
+        right: 14,
+        bottom: 74,
+        zIndex: 25,
+        width: 46,
+        height: 46,
+        borderRadius: 999,
+        border: 'none',
+        background: COLORS.emerald,
+        color: '#ffffff',
+        fontFamily: FONT_DISPLAY,
+        fontSize: 19,
+        cursor: 'pointer',
+        boxShadow: '0 10px 24px -8px rgba(11,138,79,0.6)',
+      }}
+    >
+      ?
+    </button>
   );
 }
 
@@ -1205,11 +1762,12 @@ function LoginModal({ onSent, onClose }: { onSent: (email: string) => void; onCl
 }
 
 /**
- * The daily ticket-generation job runs at 06:00 UTC (see
- * .github/workflows/generate-tickets.yml). This converts that fixed UTC
- * anchor into whatever timezone the visitor's own device is set to — same
- * technique as formatKickoff — so every user sees the correct local time
- * for when fresh tickets drop, regardless of where they are.
+ * The daily ticket-generation job releases two staggered batches per tier
+ * (see RELEASE_SLOT_HOURS_UTC / .github/workflows/generate-tickets.yml).
+ * This converts the first of those fixed UTC anchors into whatever
+ * timezone the visitor's own device is set to — same technique as
+ * formatKickoff — so every user sees the correct local time for when the
+ * first batch of the day drops, regardless of where they are.
  */
 function getDailyRefreshInfo(): { timeLabel: string; hasRefreshedToday: boolean } {
   const now = new Date();
@@ -1239,6 +1797,7 @@ function Hero({
   onViewHistory: () => void;
 }) {
   const { timeLabel, hasRefreshedToday } = getDailyRefreshInfo();
+  const nextRelease = getNextReleaseLabel();
 
   return (
     <div
@@ -1292,7 +1851,10 @@ function Hero({
 
       {/* Refresh-schedule indicator — always visible, converted to the
           visitor's own local time, so nobody has to guess when to check
-          back for a fresh batch. */}
+          back for a fresh batch. Each tier releases up to 2 staggered
+          batches a day — the currently-visible batch stays up until the
+          next one lands, so this is purely informational, not a
+          "your tickets are about to disappear" warning. */}
       <div
         style={{
           display: 'inline-flex',
@@ -1301,7 +1863,7 @@ function Hero({
           background: 'rgba(255,255,255,0.14)',
           borderRadius: 999,
           padding: '5px 12px',
-          marginBottom: 16,
+          marginBottom: 6,
           fontFamily: FONT_BODY,
           fontSize: 11,
           fontWeight: 600,
@@ -1319,8 +1881,18 @@ function Hero({
           }}
         />
         {hasRefreshedToday
-          ? `Today's tickets are live · next refresh ${timeLabel} tomorrow`
+          ? `Today's tickets are live · next batch at ${nextRelease.label}`
           : `New tickets drop today at ${timeLabel}`}
+      </div>
+      <div
+        style={{
+          fontFamily: FONT_BODY,
+          fontSize: 10,
+          color: 'rgba(255,255,255,0.7)',
+          marginBottom: 10,
+        }}
+      >
+        Today's current tickets stay up until the next batch releases — nothing disappears early.
       </div>
 
       <div
@@ -1500,7 +2072,17 @@ function PerformanceHistory({ history }: { history: DayPerformance[] }) {
   );
 }
 
-function TicketArchiveModal({ access, onClose }: { access: ArchiveAccess; onClose: () => void }) {
+function TicketArchiveModal({
+  access,
+  onClose,
+  isAdmin,
+  onEditAsAdmin,
+}: {
+  access: ArchiveAccess;
+  onClose: () => void;
+  isAdmin: boolean;
+  onEditAsAdmin: (ticket: Ticket) => void;
+}) {
   const yesterday = new Date();
   yesterday.setDate(yesterday.getDate() - 1);
   const yesterdayStr = dateKey(yesterday);
@@ -1643,10 +2225,13 @@ function TicketArchiveModal({ access, onClose }: { access: ArchiveAccess; onClos
               trialActive={true}
               unlocked={true}
               isSignedIn={true}
+              isAdmin={isAdmin}
+              hasSaintsLockAccess={true}
               onWatchAd={() => {}}
               onSubscribe={() => {}}
               onPayPerTicket={() => {}}
               onSelectMatch={setArchiveSelectedMatch}
+              onEditAsAdmin={onEditAsAdmin}
             />
           ))}
 
@@ -1662,16 +2247,25 @@ function PricingModal({
   onClose,
   userId,
   userEmail,
+  product = 'subscription',
 }: {
   onClose: () => void;
   userId: string | null;
   userEmail: string | null;
+  /** 'saints_lock' shows Saint's Lock's own $1.50/day-$7/week-$27/month plans instead of the standard subscription tiers — see src/lib/plans.ts. */
+  product?: 'subscription' | 'saints_lock';
 }) {
-  const plans = [
+  const subscriptionPlans = [
     { id: 'weekly' as const, label: 'Weekly', price: '$2.49', period: '/week' },
     { id: 'monthly' as const, label: 'Monthly', price: '$7.99', period: '/month', highlight: true },
     { id: 'yearly' as const, label: 'Yearly', price: '$67', period: '/year', badge: 'Best value' },
   ];
+  const saintsLockPlans = [
+    { id: 'daily' as const, label: 'Daily', price: '$1.50', period: '/day' },
+    { id: 'weekly' as const, label: 'Weekly', price: '$7', period: '/week', highlight: true },
+    { id: 'monthly' as const, label: 'Monthly', price: '$27', period: '/month', badge: 'Best value' },
+  ];
+  const plans = product === 'saints_lock' ? saintsLockPlans : subscriptionPlans;
 
   // Kept in sync with COUNTRY_CORRESPONDENTS in src/lib/pawapay.ts — any
   // country NOT in this list still works, it just falls through to
@@ -1689,7 +2283,7 @@ function PricingModal({
     { code: 'OTHER', label: 'Other / card payment' },
   ];
 
-  const [selectedPlan, setSelectedPlan] = useState<'weekly' | 'monthly' | 'yearly'>('monthly');
+  const [selectedPlan, setSelectedPlan] = useState<string>(product === 'saints_lock' ? 'weekly' : 'monthly');
   const [countryCode, setCountryCode] = useState('KE');
   const [phoneNumber, setPhoneNumber] = useState('');
   const [status, setStatus] = useState<'idle' | 'starting' | 'awaiting_approval' | 'error'>('idle');
@@ -1748,7 +2342,7 @@ function PricingModal({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          product: 'subscription',
+          product,
           plan: selectedPlan,
           userId,
           email: userEmail,
@@ -1827,10 +2421,12 @@ function PricingModal({
             margin: '0 0 4px',
           }}
         >
-          Choose your plan
+          {product === 'saints_lock' ? "Get Saint's Lock access" : 'Choose your plan'}
         </h2>
         <p style={{ fontSize: 11.5, color: COLORS.textMuted, margin: '0 0 16px' }}>
-          Unlock every tier, every day — pay easily with mobile money.
+          {product === 'saints_lock'
+            ? "One ultra-high-confidence pick a day. No free trial applies — pay easily with mobile money."
+            : 'Unlock every tier, every day — pay easily with mobile money.'}
         </p>
 
         {!userId && (
@@ -1844,7 +2440,7 @@ function PricingModal({
               marginBottom: 14,
             }}
           >
-            Sign in first to subscribe — close this, tap Sign in, then come back.
+            Sign in first — close this, tap Sign in, then come back.
           </div>
         )}
 
@@ -1855,7 +2451,7 @@ function PricingModal({
               Check your phone
             </div>
             <div style={{ fontSize: 11.5, color: COLORS.textMuted }}>
-              Approve the payment prompt sent to {phoneNumber} to finish subscribing.
+              Approve the payment prompt sent to {phoneNumber} to finish.
             </div>
           </div>
         ) : (
@@ -1882,7 +2478,7 @@ function PricingModal({
                   <div>
                     <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.textPrimary }}>
                       {plan.label}
-                      {plan.badge && (
+                      {'badge' in plan && plan.badge && (
                         <span
                           style={{
                             marginLeft: 6,
@@ -2148,12 +2744,14 @@ export default function Page() {
   const [showTeamSearch, setShowTeamSearch] = useState(false);
   const [showArchive, setShowArchive] = useState(false);
   const [archiveAccess, setArchiveAccess] = useState<ArchiveAccess>({ level: 'none' });
+  const [saintsLockAccess, setSaintsLockAccess] = useState<SaintsLockAccess>({ active: false, expiresAt: null });
   const [trialPolicy, setTrialPolicy] = useState<TrialPolicy>({
     anonymousDays: ANONYMOUS_TRIAL_DAYS,
     signedUpDays: SIGNED_UP_TRIAL_DAYS,
     milestoneReached: false,
   });
   const [showPricing, setShowPricing] = useState(false);
+  const [pricingProduct, setPricingProduct] = useState<'subscription' | 'saints_lock'>('subscription');
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [history, setHistory] = useState<DayPerformance[]>([]);
   const [showHistory, setShowHistory] = useState(false);
@@ -2161,9 +2759,13 @@ export default function Page() {
   const [adTicketId, setAdTicketId] = useState<string | null>(null);
   const [adReady, setAdReady] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [showSupport, setShowSupport] = useState(false);
+  const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
 
-  // Every visitor gets the 30-day trial immediately — no account required.
-  // The clock starts on first visit and is stored locally on their device.
+  const isAdmin = archiveAccess.level === 'admin';
+
+  // Every visitor gets the trial immediately — no account required. The
+  // clock starts on first visit and is stored locally on their device.
   useEffect(() => {
     setAnonTrialStart(getAnonymousTrialStart());
   }, []);
@@ -2179,6 +2781,7 @@ export default function Page() {
       setRegisteredAt(user?.created_at ?? null);
       setLoading(false);
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
+      getSaintsLockAccess(user?.id ?? null).then((a) => mounted && setSaintsLockAccess(a));
     });
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
@@ -2187,6 +2790,7 @@ export default function Page() {
       setUserId(user?.id ?? null);
       setRegisteredAt(user?.created_at ?? null);
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
+      getSaintsLockAccess(user?.id ?? null).then((a) => mounted && setSaintsLockAccess(a));
     });
 
     return () => {
@@ -2195,13 +2799,17 @@ export default function Page() {
     };
   }, []);
 
-  useEffect(() => {
+  function reloadTickets() {
     fetchTickets()
       .then(setTickets)
       .catch((err) => {
         // eslint-disable-next-line no-console
         console.error('[Odd Saint] Failed to load tickets:', err);
       });
+  }
+
+  useEffect(() => {
+    reloadTickets();
     fetchPerformanceHistory(14)
       .then(setHistory)
       .catch((err) => {
@@ -2260,7 +2868,8 @@ export default function Page() {
     setUnlocks((prev) => ({ ...prev, [ticketId]: true }));
   }
 
-  function handleSubscribe() {
+  function handleSubscribe(ticket?: Ticket) {
+    setPricingProduct(ticket?.tier === 'saints_lock' ? 'saints_lock' : 'subscription');
     setShowPricing(true);
   }
 
@@ -2285,7 +2894,7 @@ export default function Page() {
   }
 
   // Interleave a single in-feed ad slot right after the Bronze slips end
-  // (there are now 5 of them) and before Gold begins.
+  // and before Gold begins.
   const feedItems: Array<{ kind: 'ticket'; ticket: Ticket } | { kind: 'ad' }> = [];
   const lastBronzeIndex = tickets.map((t) => t.tier).lastIndexOf('bronze');
   tickets.forEach((t, idx) => {
@@ -2296,6 +2905,7 @@ export default function Page() {
   const historySummary = summarizeHistory(history);
   const bronzeCountToday = tickets.filter((t) => t.tier === 'bronze').length;
   const goldCountToday = tickets.filter((t) => t.tier === 'gold').length;
+  const saintsLockTickets = tickets.filter((t) => t.tier === 'saints_lock');
 
   return (
     <div style={{ minHeight: '100vh', background: COLORS.bg, color: COLORS.textPrimary, paddingBottom: 76 }}>
@@ -2426,8 +3036,31 @@ export default function Page() {
           signedUpDaysElapsed={signedUpDaysElapsed}
           signedUpTotalDays={trialPolicy.signedUpDays}
           onSignUpClick={() => setShowLoginModal(true)}
-          onUpgradeClick={() => setShowPricing(true)}
+          onUpgradeClick={() => handleSubscribe()}
         />
+
+        {/* Saint's Lock — daily marketing countdown strip. Shown above the
+            accordion feed so it's visible whether or not the ticket is
+            opened. Sign-up required, no trial ever applies (see
+            TicketCard's isLocked logic for saints_lock). */}
+        {saintsLockTickets.map((t) => (
+          <SaintsLockCountdown key={`countdown-${t.id}`} ticket={t} />
+        ))}
+        {saintsLockTickets.length > 0 && !userEmail && (
+          <div
+            style={{
+              background: COLORS.surfaceAlt,
+              border: `1px solid ${COLORS.hairline}`,
+              borderRadius: 10,
+              padding: '10px 14px',
+              marginBottom: 14,
+              fontSize: 11.5,
+              color: COLORS.textMuted,
+            }}
+          >
+            Saint's Lock requires a free account to access — sign in to continue.
+          </div>
+        )}
 
         {/* Ticket feed with in-feed ad injection */}
         {feedItems.map((item, idx) =>
@@ -2442,10 +3075,13 @@ export default function Page() {
               trialActive={trialActive}
               unlocked={!!unlocks[item.ticket.id]}
               isSignedIn={!!userEmail}
+              isAdmin={isAdmin}
+              hasSaintsLockAccess={saintsLockAccess.active}
               onWatchAd={handleWatchAd}
-              onSubscribe={handleSubscribe}
+              onSubscribe={() => handleSubscribe(item.ticket)}
               onPayPerTicket={handlePayPerTicket}
               onSelectMatch={setSelectedMatch}
+              onEditAsAdmin={setEditingTicket}
             />
           )
         )}
@@ -2457,6 +3093,9 @@ export default function Page() {
       <div style={{ position: 'fixed', left: 0, right: 0, bottom: 0, zIndex: 30 }}>
         <AdSlot variant="anchor" />
       </div>
+
+      {/* Support / feedback entry point — always available */}
+      <SupportButton onClick={() => setShowSupport(true)} />
 
       {/* Watch-ad-to-unlock overlay */}
       {adTicketId && (
@@ -2485,11 +3124,39 @@ export default function Page() {
           real security boundary is Supabase RLS on the admins/subscribers
           tables, not this UI gate. */}
       {showArchive && archiveAccess.level !== 'none' && (
-        <TicketArchiveModal access={archiveAccess} onClose={() => setShowArchive(false)} />
+        <TicketArchiveModal
+          access={archiveAccess}
+          onClose={() => setShowArchive(false)}
+          isAdmin={isAdmin}
+          onEditAsAdmin={setEditingTicket}
+        />
       )}
 
       {showPricing && (
-        <PricingModal onClose={() => setShowPricing(false)} userId={userId} userEmail={userEmail} />
+        <PricingModal
+          onClose={() => setShowPricing(false)}
+          userId={userId}
+          userEmail={userEmail}
+          product={pricingProduct}
+        />
+      )}
+
+      {showSupport && (
+        <SupportModal onClose={() => setShowSupport(false)} userId={userId} userEmail={userEmail} />
+      )}
+
+      {/* Admin match editor — rendered only for admins (isAdmin gates the
+          "Edit matches" button that opens this); RLS is still the real
+          enforcement boundary underneath. */}
+      {editingTicket && (
+        <AdminMatchEditorModal
+          ticket={editingTicket}
+          onClose={() => setEditingTicket(null)}
+          onChanged={() => {
+            reloadTickets();
+            setEditingTicket(null);
+          }}
+        />
       )}
     </div>
   );
