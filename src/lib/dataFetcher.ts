@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // Odd Saint — data layer
-// Reads real tickets from Supabase (populated daily by the GitHub Actions
+// Reads real tickets from Supabase (populated by the GitHub Actions
 // pipeline in scripts/generate-tickets.mjs + scripts/grade-tickets.mjs).
 // If no real data exists yet for a given day — e.g. before the pipeline's
 // first run, or a day it couldn't assemble enough fixtures — this falls
@@ -54,6 +54,10 @@ export interface Ticket {
   totalOdds: number;
   isFree: boolean; // true if permanently free (Mega Day Ticket)
   matches: Match[];
+  /** 0 = today's 1st release for this tier, 1 = today's 2nd — see RELEASE_SLOT_HOURS_UTC */
+  releaseSlot?: number;
+  /** ISO timestamp of when this specific slip was actually released */
+  availableAt?: string;
 }
 
 export interface TierConfig {
@@ -65,38 +69,47 @@ export interface TierConfig {
 }
 
 // Tier definitions per the product spec.
+//
+// Platinum/Diamond/Weekly Lite/Weekly Titan match counts are each ONE
+// FEWER than their "standard" size (10/15/20/30) — a deliberate reduction
+// to raise real-world win probability by cutting one compounding leg of
+// bookmaker margin per ticket. MUST stay in sync with TIER_CONFIG in
+// scripts/generate-tickets.mjs — the two representations had drifted out
+// of sync before this fix (dataFetcher.ts still showed the old 10/15/20/30
+// figures while the real pipeline had already moved to 9/14/19/29).
 export const TIER_CONFIG: TierConfig[] = [
   { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
   { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
   { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
   { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
-  { tier: 'platinum', label: 'Platinum', matchCount: 10, oddsRange: '25-300', alwaysFree: false },
-  { tier: 'diamond', label: 'Diamond', matchCount: 15, oddsRange: '300+', alwaysFree: false },
-  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 20, oddsRange: 'Mixed', alwaysFree: false },
-  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 30, oddsRange: 'Mixed', alwaysFree: false },
+  { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
+  { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
+  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
+  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2', alwaysFree: false },
 ];
 
 // ---------------------------------------------------------------------------
-// Daily slip volume
+// Daily slip volume + staggered release
 // ---------------------------------------------------------------------------
-// - Gold ships a fixed 5 slips a day.
-// - Tiers with 5 matches or fewer (Mega, Bronze, Silver) scale from 1 up to
-//   4 slips a day depending on how many fixtures are "available" that day
-//   (a deterministic per-day busyness factor — more fixtures, more slips) —
-//   except on weekends, where the platform always ships the maximum (4),
-//   matching the real pipeline's rule since weekends carry far more real
-//   fixtures across every league.
-// - Everything else (Platinum, Diamond, Weekly Lite, Weekly Titan) ships 1
-//   curated slip a day, since these are large accumulators by nature.
+// Every category caps at 2 tickets/day (down from 3) — mirrors
+// MAX_TICKETS_PER_CATEGORY in scripts/generate-tickets.mjs. The two daily
+// slots release at different times (see RELEASE_SLOT_HOURS_UTC, matching
+// the two cron triggers in generate-tickets.yml) rather than simultaneously
+// — a tier's 2nd slip is a genuinely fresh batch released later in the day,
+// not an alternative shown alongside the 1st, so there's no "which of
+// these do I pick right now" moment for users to be confused by. Whatever
+// batch is currently on Supabase simply stays on screen until the next
+// scheduled slot writes a new row — nothing here ever deletes a previous
+// slip, so "previous batch stays visible until the next one lands" falls
+// out of the read path for free.
+const MAX_TICKETS_PER_CATEGORY = 2;
 
-// Matches generate-tickets.mjs's MAX_TICKETS_PER_CATEGORY — quality over
-// quantity applies uniformly now, replacing the old fixed-5/day Gold rule
-// and the weekend-max-4 override.
-const MAX_TICKETS_PER_CATEGORY = 3;
+/** UTC hours the two daily release slots fire at — must match the cron schedule in .github/workflows/generate-tickets.yml. */
+export const RELEASE_SLOT_HOURS_UTC = [6, 14];
 
 function getDailySlipCount(tier: TicketTier, day: string, date: Date): number {
-  if (tier === 'saints_lock') return 2; // deliberately lower — see SAINTS_LOCK_MIN_CONFIDENCE
+  if (tier === 'saints_lock') return Math.min(MAX_TICKETS_PER_CATEGORY, 2); // min 1/max 2 guaranteed by the real pipeline; see SAINTS_LOCK_MIN_CONFIDENCE
   if (tier === 'platinum' || tier === 'diamond' || tier === 'weekly_lite' || tier === 'weekly_titan') {
     return 1; // large accumulators — one curated slip a day
   }
@@ -104,6 +117,26 @@ function getDailySlipCount(tier: TicketTier, day: string, date: Date): number {
   // factor, capped at MAX_TICKETS_PER_CATEGORY.
   const busyness = hashSeed(`${day}-busyness`) / 233280; // deterministic 0..1
   return Math.min(MAX_TICKETS_PER_CATEGORY, 1 + Math.round(busyness * (MAX_TICKETS_PER_CATEGORY - 1)));
+}
+
+/**
+ * Given "today" in the visitor's local view, returns a human label for
+ * when the tier's NEXT release slot lands — used by the frontend so users
+ * know when to check back rather than risk missing a batch. Purely a
+ * display helper; it does not affect what data gets fetched.
+ */
+export function getNextReleaseLabel(now: Date = new Date()): { label: string; hasReleasedToday: boolean } {
+  const nowUTCHours = now.getUTCHours() + now.getUTCMinutes() / 60;
+  const upcoming = RELEASE_SLOT_HOURS_UTC.find((h) => h > nowUTCHours);
+  const nextHourUTC = upcoming ?? RELEASE_SLOT_HOURS_UTC[0];
+  const rollsToTomorrow = upcoming === undefined;
+
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), nextHourUTC, 0));
+  if (rollsToTomorrow) next.setUTCDate(next.getUTCDate() + 1);
+
+  const label = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(next);
+  const hasReleasedToday = nowUTCHours >= RELEASE_SLOT_HOURS_UTC[0];
+  return { label, hasReleasedToday };
 }
 
 
@@ -332,7 +365,7 @@ function adjustOddsToTarget(matches: Match[], targetRange: [number, number] | un
 }
 
 /** Decide the overall ticket outcome first, then build per-match statuses consistent with it. */
-function buildTicket(config: TierConfig, seed: number, day: Date, slipLabel?: string): Ticket {
+function buildTicket(config: TierConfig, seed: number, day: Date, releaseSlot: number): Ticket {
   const rand = seededRandom(seed);
   const n = config.matchCount;
   const maxOdds = n < 7 ? SMALL_TICKET_MAX_ODDS : 3.8;
@@ -365,16 +398,27 @@ function buildTicket(config: TierConfig, seed: number, day: Date, slipLabel?: st
   adjustOddsToTarget(matches, TIER_ODDS_TARGET[config.tier], 1.3, maxOdds);
   const totalOdds = Math.round(matches.reduce((acc, m) => acc * m.odds, 1) * 100) / 100;
 
+  // Deterministic mock "available_at": anchor to the release slot's clock
+  // hour on this ticket's calendar day, so mock data mirrors the real
+  // pipeline's staggered-release timestamps instead of always looking
+  // "just released."
+  const slotHour = RELEASE_SLOT_HOURS_UTC[releaseSlot] ?? RELEASE_SLOT_HOURS_UTC[0];
+  const availableAt = new Date(
+    Date.UTC(day.getFullYear(), day.getMonth(), day.getDate(), slotHour, 0)
+  ).toISOString();
+
   return {
     id: `t-${config.tier}-${seed}`,
     tier: config.tier,
     label: config.label,
-    slipLabel,
+    slipLabel: undefined, // both daily slips are full tickets released at different times, not "1 of 2" alternatives
     matchCount: n,
     oddsRange: config.oddsRange,
     totalOdds,
     isFree: config.alwaysFree,
     matches,
+    releaseSlot,
+    availableAt,
   };
 }
 
@@ -410,8 +454,7 @@ export function getTicketsForDate(date: Date): Ticket[] {
     const count = getDailySlipCount(config.tier, day, date);
     for (let i = 0; i < count; i++) {
       const seed = hashSeed(`${day}-${config.tier}-${i}`);
-      const slipLabel = count > 1 ? `${i + 1} of ${count}` : undefined;
-      tickets.push(buildTicket(config, seed, date, slipLabel));
+      tickets.push(buildTicket(config, seed, date, i));
     }
   });
 
@@ -432,7 +475,7 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
     const result = await supabase
       .from('tickets')
       .select(
-        `id, tier, slip_label, match_count, odds_range, total_odds, is_free,
+        `id, tier, slip_label, match_count, odds_range, total_odds, is_free, release_slot, available_at,
          ticket_matches ( sort_order, fixtures ( id, league, home_team, away_team, kickoff, market, odds, confidence, result_status, final_home_score, final_away_score ) )`
       )
       .eq('ticket_date', day);
@@ -489,11 +532,20 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
       totalOdds: row.total_odds,
       isFree: row.is_free,
       matches,
+      releaseSlot: row.release_slot ?? 0,
+      availableAt: row.available_at ?? undefined,
     };
   });
 
+  // Previous batches stay visible alongside the newest one — sort order
+  // just needs to be stable and tier-grouped; nothing here filters out an
+  // earlier release_slot, so both of a tier's slips for the day (if both
+  // exist yet) show up until superseded tomorrow.
   tickets.sort(
-    (a, b) => tierOrder.indexOf(a.tier) - tierOrder.indexOf(b.tier) || a.id.localeCompare(b.id)
+    (a, b) =>
+      tierOrder.indexOf(a.tier) - tierOrder.indexOf(b.tier) ||
+      (a.releaseSlot ?? 0) - (b.releaseSlot ?? 0) ||
+      a.id.localeCompare(b.id)
   );
 
   return tickets;
@@ -524,6 +576,140 @@ export async function fetchTicketsByTier(tier: TicketTier, date: Date = new Date
   return all.filter((t) => t.tier === tier);
 }
 
+// ---------------------------------------------------------------------------
+// Admin match editor
+// ---------------------------------------------------------------------------
+// Lets an admin attach/detach an individual fixture on a specific ticket —
+// e.g. pull a match they judge too risky, or add one they consider a
+// stronger pick. The real security boundary is Supabase RLS (see
+// supabase/migrations/002_batch_updates.sql: only a user listed in
+// `admins` can write to ticket_matches/tickets) — these helpers will
+// simply fail silently for a non-admin caller, same pattern as
+// updateAppSettings below.
+
+export interface AvailableFixture {
+  id: number;
+  league: string;
+  homeTeam: string;
+  awayTeam: string;
+  kickoff: string;
+  market: string;
+  odds: number;
+  confidence: number;
+}
+
+/** Fixtures already priced for a given ticket_date — the admin's "add a match" picker pulls from here, not from scratch. */
+export async function fetchFixturesForDate(date: Date): Promise<AvailableFixture[]> {
+  try {
+    const { data, error } = await supabase
+      .from('fixtures')
+      .select('id, league, home_team, away_team, kickoff, market, odds, confidence')
+      .eq('ticket_date', dateKey(date))
+      .order('kickoff', { ascending: true });
+    if (error || !data) return [];
+    return data.map((f: any) => ({
+      id: f.id,
+      league: f.league,
+      homeTeam: f.home_team,
+      awayTeam: f.away_team,
+      kickoff: f.kickoff,
+      market: f.market,
+      odds: f.odds,
+      confidence: f.confidence,
+    }));
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[Odd Saint] fetchFixturesForDate failed:', err);
+    return [];
+  }
+}
+
+async function recomputeTicketTotals(ticketId: string): Promise<{ success: boolean; error?: string }> {
+  const { data: links, error } = await supabase
+    .from('ticket_matches')
+    .select('fixtures(odds)')
+    .eq('ticket_id', ticketId);
+  if (error) return { success: false, error: error.message };
+
+  const oddsList = (links ?? [])
+    .map((l: any) => (Array.isArray(l.fixtures) ? l.fixtures[0]?.odds : l.fixtures?.odds))
+    .filter((o: unknown): o is number => typeof o === 'number');
+  const totalOdds = Math.round(oddsList.reduce((acc: number, o: number) => acc * o, 1) * 100) / 100;
+
+  const { error: updateErr } = await supabase
+    .from('tickets')
+    .update({ match_count: oddsList.length, total_odds: totalOdds })
+    .eq('id', ticketId);
+  if (updateErr) return { success: false, error: updateErr.message };
+  return { success: true };
+}
+
+/** Admin action: attach an already-priced fixture to a ticket, then recompute the ticket's match count / total odds. */
+export async function adminAddFixtureToTicket(
+  ticketId: string,
+  fixtureId: number
+): Promise<{ success: boolean; error?: string }> {
+  const { data: links } = await supabase.from('ticket_matches').select('fixture_id').eq('ticket_id', ticketId);
+  if (links?.some((l: any) => l.fixture_id === fixtureId)) {
+    return { success: false, error: 'That fixture is already on this ticket.' };
+  }
+
+  const sortOrder = links?.length ?? 0;
+  const { error: linkErr } = await supabase
+    .from('ticket_matches')
+    .insert({ ticket_id: ticketId, fixture_id: fixtureId, sort_order: sortOrder });
+  if (linkErr) return { success: false, error: linkErr.message };
+
+  return recomputeTicketTotals(ticketId);
+}
+
+/** Admin action: detach a fixture from a ticket, then recompute the ticket's match count / total odds. */
+export async function adminRemoveFixtureFromTicket(
+  ticketId: string,
+  fixtureId: number
+): Promise<{ success: boolean; error?: string }> {
+  const { error } = await supabase
+    .from('ticket_matches')
+    .delete()
+    .eq('ticket_id', ticketId)
+    .eq('fixture_id', fixtureId);
+  if (error) return { success: false, error: error.message };
+  return recomputeTicketTotals(ticketId);
+}
+
+// ---------------------------------------------------------------------------
+// Saint's Lock access
+// ---------------------------------------------------------------------------
+// Mirrors the pattern already used by getArchiveAccess below — reads the
+// current signed-in user's OWN row only (RLS restricts saints_lock_access
+// selects to `user_id = auth.uid()`), so this can't be used to enumerate
+// anyone else's access. Sign-up is mandatory and no free trial ever
+// applies to Saint's Lock — a null/expired row simply means no access.
+
+export interface SaintsLockAccess {
+  active: boolean;
+  expiresAt: string | null;
+}
+
+export async function getSaintsLockAccess(userId: string | null): Promise<SaintsLockAccess> {
+  if (!userId) return { active: false, expiresAt: null };
+  try {
+    const { data, error } = await supabase
+      .from('saints_lock_access')
+      .select('active, expires_at')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error || !data) return { active: false, expiresAt: null };
+
+    const active = !!data.active && new Date(data.expires_at).getTime() > Date.now();
+    return { active, expiresAt: data.expires_at ?? null };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[Odd Saint] Saint\'s Lock access check failed, defaulting to no access:', err);
+    return { active: false, expiresAt: null };
+  }
+}
+
 /**
  * Trial length in days for anonymous (not signed in) visitors.
  * Signing up grants a separate, fresh SIGNED_UP_TRIAL_DAYS window on top —
@@ -533,6 +719,10 @@ export async function fetchTicketsByTier(tier: TicketTier, date: Date = new Date
  * These are the DEFAULT values, used while the app is still growing. Once
  * SUBSCRIBER_MILESTONE active subscribers is reached, getTrialPolicy()
  * below switches new visitors to a tighter policy instead — see there.
+ *
+ * NOTE: Saint's Lock is explicitly excluded from ALL trial logic on this
+ * page — see getSaintsLockAccess above and the frontend gating in
+ * src/app/page.tsx. Nothing here ever grants Saint's Lock access via trial.
  */
 export const ANONYMOUS_TRIAL_DAYS = 14;
 export const SIGNED_UP_TRIAL_DAYS = 30;
