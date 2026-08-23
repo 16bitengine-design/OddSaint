@@ -1,10 +1,14 @@
 name: Odd Saint — Generate Daily Tickets
 
-# Runs once a day, early morning UTC, before most kickoffs. Can also be
-# triggered manually from the Actions tab.
+# Two triggers a day so each tier's tickets release at staggered times
+# rather than all at once — see MIN_HOURS_BETWEEN_SLOTS in
+# scripts/generate-tickets.mjs, which enforces the real gap between a
+# tier's 1st and 2nd slip of the day regardless of exactly when these
+# crons fire. Can also be triggered manually from the Actions tab.
 on:
   schedule:
-    - cron: '0 6 * * *'
+    - cron: '0 6 * * *'   # slot 0 — morning batch
+    - cron: '0 14 * * *'  # slot 1 — afternoon batch
   workflow_dispatch: {}
 
 jobs:
