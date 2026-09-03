@@ -979,6 +979,9 @@ function AdminMatchEditorModal({
                 <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>
                   {f.league} · {f.market} · {f.odds} · conf {f.confidence}%
                 </div>
+                <div style={{ fontSize: 10, color: COLORS.textMuted, marginTop: '2px' }}>
+                  🕐 {formatKickoff(f.kickoff)}
+                </div>
               </div>
               <button
                 onClick={() => handleAdd(f)}
