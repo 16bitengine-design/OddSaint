@@ -78,14 +78,19 @@ const LEAGUE_ALLOWLIST = loadLeagueAllowlist();
 // the same day, and for this script now running twice a day itself.
 const MAX_ODDS_LOOKUPS_PER_RUN = 25;
 
-// Priority leagues get first pick both when the API request budget limits
-// how many fixtures get priced, and when assembling tickets from the
-// priced pool. Belgium, Denmark, and Norway are prioritized here per
-// product direction, replacing Portugal's former default-set slot. MLS
-// is replaced with multiple European leagues for stronger geographic
-// coverage. League *names* are used (rather than numeric IDs) since
-// these are confirmed values from API-Football's published league list,
-// unlike guessed ID numbers.
+// Named priority leagues break ties when ASSEMBLING tickets from the priced
+// pool (see the final sort at the end of fetchPricedFixtures, and
+// poolForTier/pickFixturesForSlip below) — and get first look in each
+// round of the odds-lookup rotation (see PER_LEAGUE_LOOKUPS_PER_ROUND).
+// They are NOT an exclusive gate on which leagues get priced: on a day
+// where these leagues are thin or mostly unpredictable (no clear
+// favorites, lots of picks failing MIN_CONFIDENCE), the rotation below
+// still gives every other allowlisted league with fixtures today a fair
+// shot at the odds-lookup budget instead of it being exhausted here first.
+// Belgium, Denmark, and Norway are prioritized here per product direction,
+// replacing Portugal's former default-set slot. League *names* are used
+// (rather than numeric IDs) since these are confirmed values from
+// API-Football's published league list, unlike guessed ID numbers.
 const PRIORITY_LEAGUE_NAMES = new Set([
   'Premier League', 'La Liga', 'Serie A', 'Bundesliga', 'Ligue 1',
   'UEFA Champions League', 'UEFA Europa League', 'Eredivisie',
@@ -97,6 +102,18 @@ const PRIORITY_LEAGUE_NAMES = new Set([
   'Superligaen',              // Denmark (regional priority)
   'Eliteserien',              // Norway (regional priority)
 ]);
+
+// How many odds lookups a single league can consume in one rotation pass
+// before yielding to the next league in line. This is the actual fix for
+// "glued to particular leagues": without a per-round cap, a priority
+// league with a full fixture list would consume the entire
+// MAX_ODDS_LOOKUPS_PER_RUN budget before any other league — including
+// other priority leagues further down the list — ever got a single odds
+// lookup, even on a day where that first league's matches were all
+// unpredictable coin-flips that would fail MIN_CONFIDENCE anyway. Kept
+// small (not 1) so a league with genuinely strong, easy fixtures can still
+// contribute more than a token pick per round.
+const PER_LEAGUE_LOOKUPS_PER_ROUND = 3;
 
 // How many extra days ahead to pull fixtures for the two "Weekly" tiers.
 // API-Football's FREE plan only allows querying a narrow window around
@@ -227,58 +244,146 @@ function nextSlotFor(maxSlipsToday, slipState) {
 
 // --- Fetch + price fixtures ---------------------------------------------------
 
+// Empty by default — add exact team names here (matching API-Football's
+// naming) if there are specific clubs or competitions you want the
+// pipeline to avoid picking entirely, for any reason (integrity concerns,
+// unreliable data, or otherwise). This is a business decision left to you
+// rather than a list Claude fills in, since flagging real clubs by name
+// for something as serious as match-fixing needs to be based on your own
+// verified, current judgment — not baked into the code as an assumption.
+const EXCLUDED_TEAMS = new Set([
+  // 'Example FC',
+]);
+
+function isExcluded(homeTeam, awayTeam) {
+  return EXCLUDED_TEAMS.has(homeTeam) || EXCLUDED_TEAMS.has(awayTeam);
+}
+
+/**
+ * Fetches and prices fixtures for the given dates, spending up to
+ * `maxOddsLookups` /odds requests total.
+ *
+ * FLEXIBLE LEAGUE ROTATION (this is the fix for "glued to particular
+ * leagues"): fixtures are grouped by league, then priced in a round-robin
+ * rotation — named priority leagues go first each round, but only
+ * PER_LEAGUE_LOOKUPS_PER_ROUND lookups at a time, before the rotation
+ * moves on to the next league (priority or not) that still has fixtures
+ * queued. The rotation repeats until either the budget runs out or every
+ * league's queue is empty.
+ *
+ * The old behavior sorted ALL priority-league fixtures ahead of ALL other
+ * fixtures, so a single busy priority league could consume the entire
+ * day's odds-lookup budget before any other league was even attempted —
+ * including on days where that league's matches were mostly unpredictable
+ * coin-flips that would go on to fail MIN_CONFIDENCE anyway. The rotation
+ * below means every allowlisted league with fixtures today gets looked at,
+ * not just the named priority set — "priority" now only breaks ties once
+ * fixtures are being assembled into tickets (see the final sort below).
+ */
 async function fetchPricedFixtures(dates, maxOddsLookups) {
   const seen = new Map(); // fixtureId -> priced fixture
   let oddsLookupsUsed = 0;
+  const leagueBreakdown = new Map(); // league name -> count actually priced (for the run summary log)
 
   for (const d of dates) {
     const fixtures = await getFixturesForDate(d);
-    const candidates = fixtures
-      .filter(
-        (f) =>
-          LEAGUE_ALLOWLIST.has(f.league?.id) &&
-          !isBigClash(f.teams?.home?.name, f.teams?.away?.name) &&
-          !isExcluded(f.teams?.home?.name, f.teams?.away?.name)
-      )
-      .sort((a, b) => {
-        const aPriority = PRIORITY_LEAGUE_NAMES.has(a.league?.name) ? 1 : 0;
-        const bPriority = PRIORITY_LEAGUE_NAMES.has(b.league?.name) ? 1 : 0;
-        return bPriority - aPriority;
-      });
+    const eligible = fixtures.filter(
+      (f) =>
+        LEAGUE_ALLOWLIST.has(f.league?.id) &&
+        !isBigClash(f.teams?.home?.name, f.teams?.away?.name) &&
+        !isExcluded(f.teams?.home?.name, f.teams?.away?.name)
+    );
 
-    for (const f of candidates) {
-      if (oddsLookupsUsed >= maxOddsLookups) break;
-      const fixtureId = f.fixture.id;
-      if (seen.has(fixtureId)) continue;
+    if (eligible.length === 0) continue;
 
-      oddsLookupsUsed++;
-      let oddsResponse;
-      try {
-        oddsResponse = await getOddsForFixture(fixtureId);
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.warn(`Odds lookup failed for fixture ${fixtureId}:`, err.message);
-        continue;
+    // Group today's eligible fixtures by league so the rotation below can
+    // give each league with fixtures today a fair, repeated turn instead
+    // of exhausting the budget on whichever league sorts first.
+    const byLeague = new Map(); // league name -> fixture queue (FIFO)
+    eligible.forEach((f) => {
+      const name = f.league?.name ?? 'Unknown League';
+      if (!byLeague.has(name)) byLeague.set(name, []);
+      byLeague.get(name).push(f);
+    });
+
+    // Rotation order: named priority leagues first (so they still get
+    // first look each round), then every other league that actually has
+    // fixtures today, in the order first encountered in the API response.
+    // This is a per-round ordering, not an allowlist — a non-priority
+    // league with fixtures today is never excluded from pricing, only
+    // queued behind the priority set within a given round.
+    const leagueOrder = [
+      ...PRIORITY_LEAGUE_NAMES,
+      ...Array.from(byLeague.keys()).filter((name) => !PRIORITY_LEAGUE_NAMES.has(name)),
+    ].filter((name) => byLeague.has(name));
+
+    let anyQueueHasFixtures = true;
+    while (anyQueueHasFixtures && oddsLookupsUsed < maxOddsLookups) {
+      anyQueueHasFixtures = false;
+
+      for (const leagueName of leagueOrder) {
+        if (oddsLookupsUsed >= maxOddsLookups) break;
+
+        const queue = byLeague.get(leagueName);
+        if (!queue || queue.length === 0) continue;
+
+        let takenThisRound = 0;
+        while (
+          takenThisRound < PER_LEAGUE_LOOKUPS_PER_ROUND &&
+          queue.length > 0 &&
+          oddsLookupsUsed < maxOddsLookups
+        ) {
+          const f = queue.shift();
+          takenThisRound++;
+          if (queue.length > 0) anyQueueHasFixtures = true;
+
+          const fixtureId = f.fixture.id;
+          if (seen.has(fixtureId)) continue; // already priced (e.g. weekly pool overlapping today's date)
+
+          oddsLookupsUsed++;
+          let oddsResponse;
+          try {
+            oddsResponse = await getOddsForFixture(fixtureId);
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.warn(`Odds lookup failed for fixture ${fixtureId}:`, err.message);
+            continue;
+          }
+
+          const picked = pickMarketFromOdds(oddsResponse);
+          if (!picked) continue; // no usable market for this fixture — skip it
+
+          seen.set(fixtureId, {
+            fixtureId,
+            ticketDate: dateStr(new Date()),
+            league: f.league?.name ?? 'Unknown League',
+            homeTeam: f.teams?.home?.name ?? 'Home',
+            awayTeam: f.teams?.away?.name ?? 'Away',
+            kickoff: f.fixture?.date,
+            market: picked.market,
+            odds: picked.odds,
+            confidence: picked.confidence,
+          });
+          leagueBreakdown.set(leagueName, (leagueBreakdown.get(leagueName) ?? 0) + 1);
+        }
       }
-
-      const picked = pickMarketFromOdds(oddsResponse);
-      if (!picked) continue; // no usable market for this fixture — skip it
-
-      seen.set(fixtureId, {
-        fixtureId,
-        ticketDate: dateStr(new Date()),
-        league: f.league?.name ?? 'Unknown League',
-        homeTeam: f.teams?.home?.name ?? 'Home',
-        awayTeam: f.teams?.away?.name ?? 'Away',
-        kickoff: f.fixture?.date,
-        market: picked.market,
-        odds: picked.odds,
-        confidence: picked.confidence,
-      });
     }
   }
 
-  // Priority leagues first, then highest-confidence picks within each tier.
+  if (leagueBreakdown.size > 0) {
+    // eslint-disable-next-line no-console
+    console.log(
+      'Priced fixtures by league this run: ' +
+        Array.from(leagueBreakdown.entries())
+          .map(([name, count]) => `${name}: ${count}`)
+          .join(', ')
+    );
+  }
+
+  // Priority leagues still get first billing once fixtures are being
+  // assembled into tickets (equal-confidence tie-break) — but every
+  // allowlisted league with fixtures today was actually attempted above,
+  // so a non-priority league's picks are never excluded from this pool.
   return Array.from(seen.values()).sort((a, b) => {
     const aPriority = PRIORITY_LEAGUE_NAMES.has(a.league) ? 1 : 0;
     const bPriority = PRIORITY_LEAGUE_NAMES.has(b.league) ? 1 : 0;
@@ -358,21 +463,6 @@ function impliedConfidence(odds) {
 // than the full odds range used for Gold and up.
 const SMALL_TICKET_TIERS = new Set(['mega', 'bronze', 'silver']); // matchCount < 7
 const SMALL_TICKET_MAX_ODDS = 1.77;
-
-// Empty by default — add exact team names here (matching API-Football's
-// naming) if there are specific clubs or competitions you want the
-// pipeline to avoid picking entirely, for any reason (integrity concerns,
-// unreliable data, or otherwise). This is a business decision left to you
-// rather than a list Claude fills in, since flagging real clubs by name
-// for something as serious as match-fixing needs to be based on your own
-// verified, current judgment — not baked into the code as an assumption.
-const EXCLUDED_TEAMS = new Set([
-  // 'Example FC',
-]);
-
-function isExcluded(homeTeam, awayTeam) {
-  return EXCLUDED_TEAMS.has(homeTeam) || EXCLUDED_TEAMS.has(awayTeam);
-}
 
 /** Narrows the pool to safer, lower-odds picks for tiers under 7 matches. */
 function poolForTier(pool, tier) {
