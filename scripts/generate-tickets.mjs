@@ -43,11 +43,11 @@ const DEFAULT_LEAGUE_ALLOWLIST = new Set([
   2,   // UEFA Champions League
   3,   // UEFA Europa League
   88,  // Eredivisie
-  253, // MLS
-  // Belgium, Denmark, Norway are intentionally NOT hardcoded here — their
-  // real numeric league IDs aren't something to guess. Run the "Resolve
-  // League IDs" workflow (scripts/resolve-leagues.mjs already targets all
-  // three) to bring them in via leagues.json with verified IDs instead.
+  // Belgium, Denmark, Norway, Scotland, Austria, Switzerland, Turkey are
+  // intentionally NOT hardcoded here — their real numeric league IDs
+  // aren't something to guess. Run the "Resolve League IDs" workflow
+  // (scripts/resolve-leagues.mjs already targets all seven regional
+  // leagues) to bring them in via leagues.json with verified IDs instead.
 ]);
 
 function loadLeagueAllowlist() {
@@ -81,16 +81,21 @@ const MAX_ODDS_LOOKUPS_PER_RUN = 25;
 // Priority leagues get first pick both when the API request budget limits
 // how many fixtures get priced, and when assembling tickets from the
 // priced pool. Belgium, Denmark, and Norway are prioritized here per
-// product direction, replacing Portugal's former default-set slot. League
-// *names* are used (rather than numeric IDs) since these are confirmed
-// values from API-Football's published league list, unlike guessed ID
-// numbers.
+// product direction, replacing Portugal's former default-set slot. MLS
+// is replaced with multiple European leagues for stronger geographic
+// coverage. League *names* are used (rather than numeric IDs) since
+// these are confirmed values from API-Football's published league list,
+// unlike guessed ID numbers.
 const PRIORITY_LEAGUE_NAMES = new Set([
   'Premier League', 'La Liga', 'Serie A', 'Bundesliga', 'Ligue 1',
-  'UEFA Champions League', 'UEFA Europa League', 'Eredivisie', 'MLS',
-  'Jupiler Pro League', // Belgium
-  'Superligaen',        // Denmark
-  'Eliteserien',        // Norway
+  'UEFA Champions League', 'UEFA Europa League', 'Eredivisie',
+  'Scottish Premiership',    // UK regional tier-one
+  'Austrian Bundesliga',      // Central Europe
+  'Swiss Super League',       // Western Europe
+  'Turkish Super Lig',        // Eastern Europe / Asia-Minor bridge
+  'Jupiler Pro League',       // Belgium (regional priority)
+  'Superligaen',              // Denmark (regional priority)
+  'Eliteserien',              // Norway (regional priority)
 ]);
 
 // How many extra days ahead to pull fixtures for the two "Weekly" tiers.
