@@ -34,7 +34,13 @@ import {
   type SaintsLockAccess,
   type AvailableFixture,
 } from '@/lib/dataFetcher';
-import { submitFeedback, type FeedbackCategory } from '@/lib/feedback';
+import {
+  submitFeedback,
+  fetchPendingFeedback,
+  moderateFeedback,
+  type FeedbackCategory,
+  type FeedbackRow,
+} from '@/lib/feedback';
 
 // ---------------------------------------------------------------------------
 // Color tokens — Odd Saint brand
@@ -1528,6 +1534,203 @@ function SupportButton({ onClick }: { onClick: () => void }) {
 }
 
 // ---------------------------------------------------------------------------
+// Admin feedback moderation
+// ---------------------------------------------------------------------------
+// Admin-only. Lists PENDING feedback (not yet shown anywhere, not yet fed
+// into the self-improvement digest) so an admin can approve or reject each
+// item. Only 'approved' items are ever read by scripts/analyze-feedback.mjs
+// — nothing here changes app behavior on its own, an admin's decision is
+// the actual gate. Same access pattern as AdminMatchEditorModal: rendered
+// only when isAdmin is true, but the real enforcement is Supabase RLS.
+
+const CATEGORY_LABELS: Record<FeedbackCategory, string> = {
+  usability: 'Usability',
+  performance: 'Performance / results',
+  bug: 'Bug',
+  support_request: 'Support request',
+  general: 'General',
+};
+
+function AdminFeedbackModal({ onClose }: { onClose: () => void }) {
+  const [items, setItems] = useState<FeedbackRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  function load() {
+    setLoading(true);
+    fetchPendingFeedback()
+      .then(setItems)
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function handleDecision(id: string, decision: 'approved' | 'rejected') {
+    setError(null);
+    setBusyId(id);
+    const res = await moderateFeedback(id, decision);
+    setBusyId(null);
+    if (!res.success) {
+      setError(res.error ?? 'Could not update that item.');
+      return;
+    }
+    setItems((prev) => prev.filter((i) => i.id !== id));
+  }
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.55)',
+        zIndex: 47,
+        display: 'flex',
+        alignItems: 'flex-start',
+        justifyContent: 'center',
+        padding: 20,
+        paddingTop: '6vh',
+        overflowY: 'auto',
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: COLORS.surface,
+          borderRadius: 14,
+          padding: 20,
+          width: '100%',
+          maxWidth: 480,
+          boxShadow: '0 20px 60px -20px rgba(0,0,0,0.35)',
+          position: 'relative',
+        }}
+      >
+        <button
+          onClick={onClose}
+          aria-label="Close"
+          style={{
+            position: 'absolute',
+            top: 12,
+            right: 12,
+            background: 'none',
+            border: 'none',
+            color: COLORS.textMuted,
+            fontSize: 16,
+            cursor: 'pointer',
+          }}
+        >
+          ✕
+        </button>
+
+        <h2
+          style={{
+            fontFamily: FONT_DISPLAY,
+            fontSize: 16,
+            fontWeight: 800,
+            color: COLORS.textPrimary,
+            margin: '0 0 4px',
+          }}
+        >
+          Moderate feedback
+        </h2>
+        <p style={{ fontSize: 11, color: COLORS.textMuted, margin: '0 0 14px' }}>
+          Admin only. Approved items feed the feedback digest (Actions → "Odd Saint — Feedback Digest") —
+          weigh each against usability, performance quality, and SEO/discoverability before approving.
+        </p>
+
+        {error && <div style={{ fontSize: 11.5, color: COLORS.red, marginBottom: 10 }}>{error}</div>}
+
+        {loading && <div style={{ fontSize: 12, color: COLORS.textMuted }}>Loading pending feedback…</div>}
+
+        {!loading && items.length === 0 && (
+          <div style={{ fontSize: 12, color: COLORS.textMuted }}>Nothing pending — you're caught up.</div>
+        )}
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {items.map((item) => (
+            <div
+              key={item.id}
+              style={{
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: 10,
+                padding: '10px 12px',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color: COLORS.emerald,
+                    background: 'rgba(11,138,79,0.1)',
+                    borderRadius: 999,
+                    padding: '2px 8px',
+                  }}
+                >
+                  {CATEGORY_LABELS[item.category]}
+                </span>
+                <span style={{ fontSize: 10, color: COLORS.textMuted }}>
+                  {new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(
+                    new Date(item.createdAt)
+                  )}
+                </span>
+              </div>
+              <p style={{ fontSize: 12.5, color: COLORS.textPrimary, lineHeight: 1.5, margin: '0 0 8px' }}>
+                {item.message}
+              </p>
+              {item.email && (
+                <div style={{ fontSize: 10.5, color: COLORS.textMuted, marginBottom: 8 }}>From: {item.email}</div>
+              )}
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  onClick={() => handleDecision(item.id, 'approved')}
+                  disabled={busyId === item.id}
+                  style={{
+                    flex: 1,
+                    padding: '7px 0',
+                    borderRadius: 7,
+                    border: 'none',
+                    background: COLORS.emerald,
+                    color: '#ffffff',
+                    fontFamily: FONT_BODY,
+                    fontSize: 11.5,
+                    fontWeight: 700,
+                    cursor: busyId === item.id ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {busyId === item.id ? '...' : 'Approve'}
+                </button>
+                <button
+                  onClick={() => handleDecision(item.id, 'rejected')}
+                  disabled={busyId === item.id}
+                  style={{
+                    flex: 1,
+                    padding: '7px 0',
+                    borderRadius: 7,
+                    border: `1px solid ${COLORS.hairline}`,
+                    background: 'transparent',
+                    color: COLORS.textMuted,
+                    fontFamily: FONT_BODY,
+                    fontSize: 11.5,
+                    fontWeight: 700,
+                    cursor: busyId === item.id ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {busyId === item.id ? '...' : 'Reject'}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Auth gate
 // ---------------------------------------------------------------------------
 
@@ -2761,6 +2964,7 @@ export default function Page() {
   const [loading, setLoading] = useState(true);
   const [showSupport, setShowSupport] = useState(false);
   const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
+  const [showFeedbackAdmin, setShowFeedbackAdmin] = useState(false);
 
   const isAdmin = archiveAccess.level === 'admin';
 
@@ -2960,6 +3164,25 @@ export default function Page() {
               🕐
             </button>
           )}
+          {isAdmin && (
+            <button
+              onClick={() => setShowFeedbackAdmin(true)}
+              aria-label="Moderate feedback"
+              style={{
+                background: 'rgba(255,255,255,0.12)',
+                border: '1px solid rgba(255,255,255,0.4)',
+                borderRadius: 7,
+                padding: '6px 10px',
+                color: '#ffffff',
+                fontFamily: FONT_BODY,
+                fontSize: 13,
+                cursor: 'pointer',
+                lineHeight: 1,
+              }}
+            >
+              💬
+            </button>
+          )}
           {userEmail ? (
             <button
               onClick={() => supabase.auth.signOut()}
@@ -3143,6 +3366,13 @@ export default function Page() {
 
       {showSupport && (
         <SupportModal onClose={() => setShowSupport(false)} userId={userId} userEmail={userEmail} />
+      )}
+
+      {/* Admin feedback moderation — rendered only for admins (isAdmin gates
+          the header button that opens this); RLS is still the real
+          enforcement boundary underneath. */}
+      {showFeedbackAdmin && isAdmin && (
+        <AdminFeedbackModal onClose={() => setShowFeedbackAdmin(false)} />
       )}
 
       {/* Admin match editor — rendered only for admins (isAdmin gates the
