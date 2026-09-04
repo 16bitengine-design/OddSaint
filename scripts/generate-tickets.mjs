@@ -395,7 +395,21 @@ async function fetchPricedFixtures(dates, maxOddsLookups) {
 // A fixture is skipped entirely if nothing viable clears this confidence
 // floor — better to generate one fewer match, or even skip a slip, than to
 // force in a pick the market itself doesn't consider a clear favorite.
-const MIN_CONFIDENCE = 68;
+//
+// RAISED from 68 to 74 as a deliberate, flagged experiment to improve real
+// win rate — NOT a guaranteed fix. This trades sample size for safety: at
+// 74% implied confidence a fixture needs odds ≤ ~1.35 to qualify, versus
+// ~1.47 before, so expect fewer eligible fixtures per day and possibly
+// more skipped slips on thin days. Verify this was the right call with
+// `node scripts/analyze-performance.mjs` (or the "Odd Saint — Performance
+// Digest" GitHub Action) after a couple weeks of new graded results —
+// that report's threshold-backtest table shows the real win rate at this
+// exact threshold and several neighboring ones, so the next adjustment
+// (if any) can be based on real data instead of another guess. If you
+// change this value, also update CURRENT_LIVE_MIN_CONFIDENCE in
+// scripts/analyze-performance.mjs so the digest still correctly marks
+// which threshold is live.
+const MIN_CONFIDENCE = 74;
 
 // Result-based markets to steer away from when priced this short — an
 // extremely tight price on any of these can still be upset (a draw, a cup
