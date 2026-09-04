@@ -41,6 +41,7 @@ import {
   type FeedbackCategory,
   type FeedbackRow,
 } from '@/lib/feedback';
+import { adminGrantAccess, type GrantableProduct } from '@/lib/adminGrant';
 
 // ---------------------------------------------------------------------------
 // Color tokens — Odd Saint brand
@@ -1040,11 +1041,13 @@ function TicketCard({
   // Weekly Titan is free forever once someone signs up — the signup
   // incentive, separate from the time-limited trial.
   const isWeeklyTitanUnlockedForever = ticket.tier === 'weekly_titan' && isSignedIn;
-  // Saint's Lock ignores ticket.isFree/trial/unlocked entirely — it has its
-  // own product, its own pricing, sign-up is mandatory, and no free trial
-  // ever applies to it (see saints_lock_access in supabase/schema.sql and
-  // getSaintsLockAccess in dataFetcher.ts — passed in as a real prop here).
-  const isLocked = isSaintsLock
+  // Admins see every ticket unlocked, every tier, including Saint's Lock —
+  // "administrator can access all tickets without payment." This check
+  // comes FIRST and short-circuits everything else below it; nothing else
+  // in this function needs to special-case admin once this line is right.
+  const isLocked = isAdmin
+    ? false
+    : isSaintsLock
     ? !hasSaintsLockAccess
     : !ticket.isFree && !isWeeklyTitanUnlockedForever && !trialActive && !unlocked;
 
@@ -1101,6 +1104,21 @@ function TicketCard({
               <div style={{ fontFamily: FONT_DISPLAY, fontSize: 16.5, fontWeight: 600, color: COLORS.textPrimary }}>
                 {ticket.label}
               </div>
+              {isAdmin && (
+                <span
+                  style={{
+                    fontFamily: FONT_BODY,
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color: COLORS.emerald,
+                    background: 'rgba(11,138,79,0.1)',
+                    borderRadius: 999,
+                    padding: '1px 7px',
+                  }}
+                >
+                  Admin — unlocked
+                </span>
+              )}
               {ticket.availableAt && (
                 <span
                   style={{
@@ -1728,6 +1746,249 @@ function AdminFeedbackModal({ onClose }: { onClose: () => void }) {
             </div>
           ))}
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Admin grant access — comp a subscription or Saint's Lock pass for someone
+// ---------------------------------------------------------------------------
+// "help any other person subscribe through my administrator account."
+// Admin-only, same access pattern as the other admin modals: rendered only
+// when isAdmin is true, but the real enforcement lives server-side in
+// /api/admin/grant-access (verifies the caller against the `admins` table
+// using the service-role key) — this UI gate is convenience, not security.
+// The target person must have signed in at least once already (their
+// auth.users row has to exist to resolve their email to a user_id).
+
+function AdminGrantAccessModal({ onClose }: { onClose: () => void }) {
+  const [targetEmail, setTargetEmail] = useState('');
+  const [product, setProduct] = useState<GrantableProduct>('subscription');
+  const [plan, setPlan] = useState('monthly');
+  const [status, setStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+  const [error, setError] = useState<string | null>(null);
+
+  const subscriptionPlans = [
+    { id: 'weekly', label: 'Weekly (7 days)' },
+    { id: 'monthly', label: 'Monthly (30 days)' },
+    { id: 'yearly', label: 'Yearly (365 days)' },
+  ];
+  const saintsLockPlans = [
+    { id: 'daily', label: 'Daily (1 day)' },
+    { id: 'weekly', label: 'Weekly (7 days)' },
+    { id: 'monthly', label: 'Monthly (30 days)' },
+  ];
+  const planOptions = product === 'saints_lock' ? saintsLockPlans : subscriptionPlans;
+
+  function handleProductChange(next: GrantableProduct) {
+    setProduct(next);
+    setPlan(next === 'saints_lock' ? 'weekly' : 'monthly');
+  }
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    const trimmed = targetEmail.trim();
+    if (!trimmed) return;
+    setError(null);
+    setStatus('sending');
+    const res = await adminGrantAccess({ targetEmail: trimmed, product, plan });
+    if (!res.success) {
+      setError(res.error ?? 'Could not grant access.');
+      setStatus('error');
+      return;
+    }
+    setStatus('sent');
+  }
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.55)',
+        zIndex: 47,
+        display: 'flex',
+        alignItems: 'flex-start',
+        justifyContent: 'center',
+        padding: 20,
+        paddingTop: '6vh',
+        overflowY: 'auto',
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: COLORS.surface,
+          borderRadius: 14,
+          padding: 20,
+          width: '100%',
+          maxWidth: 420,
+          boxShadow: '0 20px 60px -20px rgba(0,0,0,0.35)',
+          position: 'relative',
+        }}
+      >
+        <button
+          onClick={onClose}
+          aria-label="Close"
+          style={{
+            position: 'absolute',
+            top: 12,
+            right: 12,
+            background: 'none',
+            border: 'none',
+            color: COLORS.textMuted,
+            fontSize: 16,
+            cursor: 'pointer',
+          }}
+        >
+          ✕
+        </button>
+
+        <h2
+          style={{
+            fontFamily: FONT_DISPLAY,
+            fontSize: 16,
+            fontWeight: 800,
+            color: COLORS.textPrimary,
+            margin: '0 0 4px',
+          }}
+        >
+          Grant access to someone
+        </h2>
+        <p style={{ fontSize: 11, color: COLORS.textMuted, margin: '0 0 16px', lineHeight: 1.5 }}>
+          Admin only. Comps subscription or Saint's Lock access for another user — no payment involved.
+          They need to have signed in with the magic link at least once already.
+        </p>
+
+        {status === 'sent' ? (
+          <div>
+            <p style={{ fontSize: 12.5, color: COLORS.emerald, lineHeight: 1.6, marginBottom: 14 }}>
+              Access granted to {targetEmail.trim()}.
+            </p>
+            <button
+              onClick={() => {
+                setStatus('idle');
+                setTargetEmail('');
+              }}
+              style={{
+                padding: '9px 14px',
+                borderRadius: 8,
+                border: `1px solid ${COLORS.hairline}`,
+                background: 'transparent',
+                color: COLORS.textPrimary,
+                fontFamily: FONT_BODY,
+                fontWeight: 600,
+                fontSize: 12,
+                cursor: 'pointer',
+              }}
+            >
+              Grant another
+            </button>
+          </div>
+        ) : (
+          <form onSubmit={handleSubmit}>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.textMuted, marginBottom: 5 }}>
+              Their email (must have signed in before)
+            </label>
+            <input
+              type="email"
+              required
+              value={targetEmail}
+              onChange={(e) => setTargetEmail(e.target.value)}
+              placeholder="person@example.com"
+              style={{
+                width: '100%',
+                padding: '10px 12px',
+                borderRadius: 8,
+                border: `1px solid ${COLORS.border}`,
+                background: COLORS.surfaceAlt,
+                color: COLORS.textPrimary,
+                fontFamily: FONT_BODY,
+                fontSize: 13,
+                marginBottom: 14,
+                boxSizing: 'border-box',
+              }}
+            />
+
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.textMuted, marginBottom: 5 }}>
+              Product
+            </label>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 14 }}>
+              {(['subscription', 'saints_lock'] as GrantableProduct[]).map((p) => (
+                <button
+                  type="button"
+                  key={p}
+                  onClick={() => handleProductChange(p)}
+                  style={{
+                    flex: 1,
+                    padding: '8px 0',
+                    borderRadius: 8,
+                    border: product === p ? 'none' : `1px solid ${COLORS.border}`,
+                    background: product === p ? COLORS.emerald : 'transparent',
+                    color: product === p ? '#ffffff' : COLORS.textMuted,
+                    fontFamily: FONT_BODY,
+                    fontWeight: 700,
+                    fontSize: 12,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {p === 'subscription' ? 'Subscription' : "Saint's Lock"}
+                </button>
+              ))}
+            </div>
+
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.textMuted, marginBottom: 5 }}>
+              Plan / duration
+            </label>
+            <select
+              value={plan}
+              onChange={(e) => setPlan(e.target.value)}
+              style={{
+                width: '100%',
+                padding: '9px 10px',
+                borderRadius: 8,
+                border: `1px solid ${COLORS.border}`,
+                background: COLORS.surfaceAlt,
+                color: COLORS.textPrimary,
+                fontFamily: FONT_BODY,
+                fontSize: 13,
+                marginBottom: 16,
+              }}
+            >
+              {planOptions.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+
+            {error && <div style={{ fontSize: 11.5, color: COLORS.red, marginBottom: 10 }}>{error}</div>}
+
+            <button
+              type="submit"
+              disabled={status === 'sending' || !targetEmail.trim()}
+              style={{
+                width: '100%',
+                padding: '11px 0',
+                borderRadius: 9,
+                border: 'none',
+                fontFamily: FONT_BODY,
+                fontWeight: 600,
+                fontSize: 13,
+                cursor: status === 'sending' || !targetEmail.trim() ? 'not-allowed' : 'pointer',
+                background:
+                  status === 'sending' || !targetEmail.trim()
+                    ? COLORS.border
+                    : `linear-gradient(135deg, ${COLORS.emerald}, #0d9668)`,
+                color: status === 'sending' || !targetEmail.trim() ? COLORS.textMuted : '#04150f',
+              }}
+            >
+              {status === 'sending' ? 'Granting…' : 'Grant access'}
+            </button>
+          </form>
+        )}
       </div>
     </div>
   );
@@ -2968,6 +3229,7 @@ export default function Page() {
   const [showSupport, setShowSupport] = useState(false);
   const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
   const [showFeedbackAdmin, setShowFeedbackAdmin] = useState(false);
+  const [showGrantAccess, setShowGrantAccess] = useState(false);
 
   const isAdmin = archiveAccess.level === 'admin';
 
@@ -3186,6 +3448,25 @@ export default function Page() {
               💬
             </button>
           )}
+          {isAdmin && (
+            <button
+              onClick={() => setShowGrantAccess(true)}
+              aria-label="Grant access to someone"
+              style={{
+                background: 'rgba(255,255,255,0.12)',
+                border: '1px solid rgba(255,255,255,0.4)',
+                borderRadius: 7,
+                padding: '6px 10px',
+                color: '#ffffff',
+                fontFamily: FONT_BODY,
+                fontSize: 13,
+                cursor: 'pointer',
+                lineHeight: 1,
+              }}
+            >
+              🎁
+            </button>
+          )}
           {userEmail ? (
             <button
               onClick={() => supabase.auth.signOut()}
@@ -3249,26 +3530,31 @@ export default function Page() {
             color: trialActive ? COLORS.emerald : COLORS.textMuted,
           }}
         >
-          {trialActive
+          {isAdmin
+            ? 'Admin account — every ticket, every tier, including Saint\'s Lock, is unlocked for you automatically.'
+            : trialActive
             ? userEmail
               ? `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Weekly Titan stays free forever now that you're signed in.`
               : `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Every ticket is unlocked, no account needed.`
             : 'Your free trial has ended. The Mega Day Ticket stays free forever — unlock premium tiers with an ad, a micro-fee, or a subscription.'}
         </div>
 
-        <TrialReminderBanner
-          userEmail={userEmail}
-          daysLeft={daysLeft}
-          signedUpDaysElapsed={signedUpDaysElapsed}
-          signedUpTotalDays={trialPolicy.signedUpDays}
-          onSignUpClick={() => setShowLoginModal(true)}
-          onUpgradeClick={() => handleSubscribe()}
-        />
+        {!isAdmin && (
+          <TrialReminderBanner
+            userEmail={userEmail}
+            daysLeft={daysLeft}
+            signedUpDaysElapsed={signedUpDaysElapsed}
+            signedUpTotalDays={trialPolicy.signedUpDays}
+            onSignUpClick={() => setShowLoginModal(true)}
+            onUpgradeClick={() => handleSubscribe()}
+          />
+        )}
 
         {/* Saint's Lock — daily marketing countdown strip. Shown above the
             accordion feed so it's visible whether or not the ticket is
             opened. Sign-up required, no trial ever applies (see
-            TicketCard's isLocked logic for saints_lock). */}
+            TicketCard's isLocked logic for saints_lock) — admins are the
+            one exception, handled inside TicketCard itself. */}
         {saintsLockTickets.map((t) => (
           <SaintsLockCountdown key={`countdown-${t.id}`} ticket={t} />
         ))}
@@ -3376,6 +3662,14 @@ export default function Page() {
           enforcement boundary underneath. */}
       {showFeedbackAdmin && isAdmin && (
         <AdminFeedbackModal onClose={() => setShowFeedbackAdmin(false)} />
+      )}
+
+      {/* Admin grant-access — rendered only for admins (isAdmin gates the
+          header button that opens this); the real enforcement boundary is
+          server-side in /api/admin/grant-access, checked against the
+          `admins` table with the service-role key. */}
+      {showGrantAccess && isAdmin && (
+        <AdminGrantAccessModal onClose={() => setShowGrantAccess(false)} />
       )}
 
       {/* Admin match editor — rendered only for admins (isAdmin gates the
