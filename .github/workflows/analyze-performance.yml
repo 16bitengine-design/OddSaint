@@ -1,0 +1,29 @@
+name: Odd Saint — Performance Digest
+
+# Manual trigger ONLY — a human decides when enough new graded results
+# have accumulated to make re-checking worthwhile. Produces a report in
+# the workflow's step summary; makes no automatic code or configuration
+# changes (see scripts/analyze-performance.mjs).
+on:
+  workflow_dispatch: {}
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build performance digest
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/analyze-performance.mjs
