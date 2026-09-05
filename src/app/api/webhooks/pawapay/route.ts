@@ -1,5 +1,5 @@
-
 import { NextRequest, NextResponse } from 'next/server';
+import { checkDepositStatus } from '@/lib/pawapay';
 import { grantAccessForPayment } from '@/lib/grantAccess';
 import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 
@@ -7,15 +7,16 @@ import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 // POST /api/webhooks/pawapay
 // Configure this as the callback URL in your PawaPay dashboard.
 //
-// NOTE ON AUTHENTICATION: unlike Stripe (HMAC signature) or Flutterwave
-// (static secret hash), I don't have confirmed details on PawaPay's
-// callback authentication scheme from available documentation. Check your
-// PawaPay dashboard/docs for how they let you verify incoming callbacks
-// (commonly either a shared secret header or an IP allowlist) and add that
-// check here before going live — right now this trusts the payload
-// structure but doesn't cryptographically verify the sender. The
-// /api/checkout/status polling endpoint acts as a safety net that doesn't
-// depend on this webhook alone, but this gap should still be closed.
+// SECURITY: payload.status is NOT trusted directly. The client already
+// knows its own depositId (it's returned from /api/checkout so the
+// frontend can poll with it), so accepting {depositId, status:
+// 'COMPLETED'} from the request body at face value would let anyone
+// grant themselves access without ever paying. This handler only uses
+// the payload to learn WHICH depositId to check, then re-fetches the
+// real status directly from PawaPay's own API before granting anything —
+// the same verify-with-the-provider pattern the Pesapal webhook already
+// uses (it calls getTransactionStatus() rather than trusting its own
+// query params).
 // ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest) {
@@ -28,14 +29,17 @@ export async function POST(req: NextRequest) {
 
   const payload = Array.isArray(event) ? event[0] : event;
   const depositId: string | undefined = payload?.depositId;
-  const status: string | undefined = payload?.status;
 
   if (!depositId) {
     return NextResponse.json({ error: 'Missing depositId' }, { status: 400 });
   }
 
-  if (status === 'COMPLETED') {
-    try {
+  try {
+    // payload.status is deliberately ignored — verify directly with PawaPay.
+    const verified = await checkDepositStatus(depositId);
+    const verifiedStatus: string | undefined = Array.isArray(verified) ? verified[0]?.status : verified?.status;
+
+    if (verifiedStatus === 'COMPLETED') {
       const supabase = getSupabaseAdmin();
       const { data: pending } = await supabase
         .from('pending_transactions')
@@ -49,13 +53,17 @@ export async function POST(req: NextRequest) {
           userId: pending.user_id,
           planId: pending.plan,
           email: pending.email,
+          ticketId: pending.ticket_id,
         });
         await supabase.from('pending_transactions').update({ status: 'completed' }).eq('id', depositId);
       }
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error('[pawapay webhook] Failed to grant access:', err);
     }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[pawapay webhook] Failed to verify/grant access:', err);
+    // Still acknowledge receipt below — the /api/checkout/status polling
+    // endpoint acts as an independent safety net, so a transient failure
+    // here doesn't need to trigger PawaPay's own webhook retry storm.
   }
 
   return NextResponse.json({ received: true });
