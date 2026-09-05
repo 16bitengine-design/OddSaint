@@ -21,6 +21,7 @@ import {
   adminAddFixtureToTicket,
   adminRemoveFixtureFromTicket,
   dateKey,
+  ticketDateKey,
   TIER_CONFIG,
   ANONYMOUS_TRIAL_DAYS,
   SIGNED_UP_TRIAL_DAYS,
@@ -315,9 +316,28 @@ function formatKickoff(iso: string): string {
   return `${day}, ${time}`;
 }
 
-/** Formats an ISO "available_at" timestamp as a plain local clock time, e.g. "8:00 AM". */
-function formatReleaseTime(iso: string): string {
-  return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
+/**
+ * Formats a ticket's "available_at" timestamp for the release badge.
+ *
+ * Normally this is just a local clock time, e.g. "8:00 AM" — but
+ * fetchTickets() (see dataFetcher.ts) can carry forward the PREVIOUS UTC
+ * day's real tickets when today's haven't been generated yet (the real,
+ * expected gap before the 06:00 UTC pipeline run), rather than falling
+ * straight to mock data. Without a visual cue, a carried-forward batch
+ * would look identical to a freshly-released one. `requestedDateKeyUTC` is
+ * the UTC day the feed actually asked for (today, for the main feed; the
+ * picked date, for the archive) — when the ticket's own release day
+ * doesn't match it, a short date is prefixed so this is never ambiguous.
+ */
+function formatReleaseLabel(availableAtISO: string, requestedDateKeyUTC: string): string {
+  const releaseDate = new Date(availableAtISO);
+  const time = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(releaseDate);
+
+  const releaseDayUTC = ticketDateKey(releaseDate);
+  if (releaseDayUTC === requestedDateKeyUTC) return time;
+
+  const shortDate = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(releaseDate);
+  return `${shortDate} · ${time}`;
 }
 
 function MatchRow({
@@ -1021,6 +1041,7 @@ function TicketCard({
   isAdmin,
   hasSaintsLockAccess,
   hasSubscriptionAccess,
+  requestedDateKey,
   onWatchAd,
   onSubscribe,
   onPayPerTicket,
@@ -1034,6 +1055,8 @@ function TicketCard({
   isAdmin: boolean;
   hasSaintsLockAccess: boolean;
   hasSubscriptionAccess: boolean;
+  /** UTC day (see ticketDateKey) this feed actually asked for — lets the release badge tell a carried-forward batch apart from a fresh one. */
+  requestedDateKey: string;
   onWatchAd: (ticketId: string) => void;
   onSubscribe: () => void;
   onPayPerTicket: (ticketId: string) => void;
@@ -1144,7 +1167,7 @@ function TicketCard({
                     padding: '1px 7px',
                   }}
                 >
-                  Released {formatReleaseTime(ticket.availableAt)}
+                  Released {formatReleaseLabel(ticket.availableAt, requestedDateKey)}
                 </span>
               )}
             </div>
@@ -2575,6 +2598,7 @@ function TicketArchiveModal({
   }, [access]);
 
   const [selectedDateStr, setSelectedDateStr] = useState(yesterdayStr);
+  const [loadedDateStr, setLoadedDateStr] = useState<string | null>(null);
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [loading, setLoading] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -2588,9 +2612,22 @@ function TicketArchiveModal({
     const picked = new Date(`${value}T12:00:00`);
     const result = await fetchTickets(picked);
     setTickets(result);
+    // Tracked separately from selectedDateStr — the picker's value can
+    // change before the user hits Load, but the release badge's
+    // "which day did we actually ask for" comparison must stay pinned to
+    // whatever date `tickets` actually corresponds to.
+    setLoadedDateStr(value);
     setLoading(false);
     setLoaded(true);
   }
+
+  // fetchTickets() never carries a different day forward for an explicit
+  // archive date (see the isTodayUTC check in dataFetcher.ts) — real data
+  // for exactly this day, or mock, never a substitute day. Still passed
+  // through so the badge logic has a consistent UTC key to compare against.
+  const requestedDateKeyForLoadedTickets = loadedDateStr
+    ? ticketDateKey(new Date(`${loadedDateStr}T12:00:00`))
+    : ticketDateKey(new Date());
 
   return (
     <div
@@ -2708,6 +2745,7 @@ function TicketArchiveModal({
               isAdmin={isAdmin}
               hasSaintsLockAccess={true}
               hasSubscriptionAccess={true}
+              requestedDateKey={requestedDateKeyForLoadedTickets}
               onWatchAd={() => {}}
               onSubscribe={() => {}}
               onPayPerTicket={() => {}}
@@ -3532,6 +3570,11 @@ export default function Page() {
   const bronzeCountToday = tickets.filter((t) => t.tier === 'bronze').length;
   const goldCountToday = tickets.filter((t) => t.tier === 'gold').length;
   const saintsLockTickets = tickets.filter((t) => t.tier === 'saints_lock');
+  // The main feed always requests "today" (UTC) — see fetchTickets()'s
+  // default param in dataFetcher.ts. Computed once per render so the
+  // release badge's carried-forward comparison stays consistent across
+  // every ticket rendered in this pass.
+  const todayKeyUTC = ticketDateKey(new Date());
 
   return (
     <div style={{ minHeight: '100vh', background: COLORS.bg, color: COLORS.textPrimary, paddingBottom: 76 }}>
@@ -3749,6 +3792,7 @@ export default function Page() {
               isAdmin={isAdmin}
               hasSaintsLockAccess={saintsLockAccess.active}
               hasSubscriptionAccess={subscriptionAccess.active}
+              requestedDateKey={todayKeyUTC}
               onWatchAd={handleWatchAd}
               onSubscribe={() => handleSubscribe(item.ticket)}
               onPayPerTicket={handlePayPerTicket}
