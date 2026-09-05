@@ -1179,3 +1179,66 @@ export async function getArchiveAccess(userId: string | null): Promise<ArchiveAc
     return { level: 'none' };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Subscription access (standard subscription — NOT Saint's Lock, NOT the
+// archive-specific check above)
+// ---------------------------------------------------------------------------
+// This is the check that must gate today's premium tiers (Gold, Platinum,
+// Diamond, etc.) in TicketCard. Previously nothing on the frontend ever
+// consulted the `subscribers` table for today's feed — grantAccessForPayment
+// correctly wrote the row on a successful payment, but TicketCard's lock
+// logic only ever looked at local, session-only React state (`unlocks`,
+// set by watching an ad or the pay-per-ticket flow), never at whether the
+// signed-in user actually has an active subscription. That meant a real,
+// successful payment did not unlock anything on the main feed. This function
+// is the fix — read the user's own row (RLS restricts selects to
+// user_id = auth.uid()) and expose a simple active/expiresAt result.
+
+export interface SubscriptionAccess {
+  active: boolean;
+  expiresAt: string | null;
+}
+
+export async function getSubscriptionAccess(userId: string | null): Promise<SubscriptionAccess> {
+  if (!userId) return { active: false, expiresAt: null };
+  try {
+    const { data, error } = await supabase
+      .from('subscribers')
+      .select('active, expires_at')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error || !data) return { active: false, expiresAt: null };
+
+    const active = !!data.active && (!data.expires_at || new Date(data.expires_at).getTime() > Date.now());
+    return { active, expiresAt: data.expires_at ?? null };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[Odd Saint] Subscription access check failed, defaulting to no access:', err);
+    return { active: false, expiresAt: null };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pay-per-ticket unlocks
+// ---------------------------------------------------------------------------
+// Reads which specific tickets the signed-in user has individually paid to
+// unlock (see supabase/migrations/004_ticket_unlocks.sql and
+// grantAccessForPayment's 'ticket_unlock' branch in grantAccess.ts).
+// Previously "Pay Micro-Fee" was a non-functional stub that unlocked any
+// ticket for free via local React state and never persisted anything —
+// this is the real, persisted equivalent. RLS restricts selects to
+// user_id = auth.uid(), so this can't be used to see anyone else's unlocks.
+
+export async function getUnlockedTicketIds(userId: string | null): Promise<Set<string>> {
+  if (!userId) return new Set();
+  try {
+    const { data, error } = await supabase.from('ticket_unlocks').select('ticket_id').eq('user_id', userId);
+    if (error || !data) return new Set();
+    return new Set(data.map((r: any) => r.ticket_id as string));
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[Odd Saint] ticket_unlocks query failed, defaulting to no unlocks:', err);
+    return new Set();
+  }
+}

@@ -53,3 +53,16 @@ export const SAINTS_LOCK_PLANS: Record<SaintsLockPlanId, SaintsLockPlanConfig> =
 export function isValidSaintsLockPlanId(value: string): value is SaintsLockPlanId {
   return value === 'daily' || value === 'weekly' || value === 'monthly';
 }
+
+// ---------------------------------------------------------------------------
+// Pay-per-ticket unlock ("Pay Micro-Fee") — a flat one-off price, not a
+// dated plan like PLANS/SAINTS_LOCK_PLANS above. No trial or recurring
+// billing applies here; a successful payment upserts exactly one row into
+// `ticket_unlocks` for that specific ticket only (see grantAccess.ts and
+// supabase/migrations/004_ticket_unlocks.sql).
+//
+// ASSUMPTION — PLACEHOLDER PRICE: no per-ticket price existed anywhere in
+// the codebase before this change. $0.99 is a reasonable placeholder given
+// the subscription tiers above, but confirm/adjust this before going live.
+// ---------------------------------------------------------------------------
+export const TICKET_UNLOCK_PRICE_USD = 0.99;
