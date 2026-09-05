@@ -206,6 +206,21 @@ export function dateKey(date: Date): string {
 }
 
 /**
+ * The calendar day the pipeline uses when writing `ticket_date` (see
+ * dateStr() in scripts/generate-tickets.mjs) — always UTC. Deliberately
+ * separate from dateKey() above, which uses the visitor's LOCAL day and is
+ * correct for mock-data seeding and the archive date-picker's display
+ * value, but wrong for any real Supabase query: a visitor whose local day
+ * has already rolled over relative to UTC would otherwise query a date the
+ * pipeline hasn't generated yet, and silently fall back to fabricated mock
+ * data instead of real tickets that already exist under the correct
+ * (UTC) date.
+ */
+export function ticketDateKey(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+/**
  * Spreads mock kickoffs across a realistic matchday window (12:00–20:30 UTC)
  * on the ticket's actual calendar date, rather than relative to "whenever
  * this function happened to run" — that's what makes the played/not-played
@@ -444,7 +459,7 @@ export function getTicketStatus(ticket: Ticket): MatchStatus {
  *   const { data } = await supabase
  *     .from('tickets')
  *     .select('*, matches(*)')
- *     .eq('ticket_date', dateKey(date));
+ *     .eq('ticket_date', ticketDateKey(date));
  */
 export function getTicketsForDate(date: Date): Ticket[] {
   const day = dateKey(date);
@@ -468,7 +483,7 @@ export function getTicketsForDate(date: Date): Ticket[] {
  * an empty feed.
  */
 async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
-  const day = dateKey(date);
+  const day = ticketDateKey(date);
 
   let data;
   try {
@@ -552,13 +567,31 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
 }
 
 /**
- * Fetch all of today's tickets — real pipeline data if available, mock data
- * otherwise (e.g. before the daily generation job has run for this date).
+ * Fetch tickets for a given day — real pipeline data if available for that
+ * exact day, otherwise (ONLY when `date` is today, in UTC — see
+ * ticketDateKey) the most recent day's real tickets that DO exist, so a
+ * visitor never sees fabricated mock data during the real, expected daily
+ * gap between midnight UTC and the pipeline's first run of the day at
+ * 06:00 UTC. Explicit past-date lookups (e.g. the ticket archive) never
+ * get this substitution — asking for a specific past day should return
+ * that day's real data or nothing, never a different day silently swapped
+ * in. Mock data is the last resort, used only when neither today's nor
+ * yesterday's real data exists yet at all.
  */
 export async function fetchTickets(date: Date = new Date()): Promise<Ticket[]> {
   try {
     const real = await fetchRealTicketsForDate(date);
-    return real ?? getTicketsForDate(date);
+    if (real) return real;
+
+    const isTodayUTC = ticketDateKey(date) === ticketDateKey(new Date());
+    if (isTodayUTC) {
+      const previousDay = new Date(date);
+      previousDay.setUTCDate(previousDay.getUTCDate() - 1);
+      const previousDayReal = await fetchRealTicketsForDate(previousDay);
+      if (previousDayReal) return previousDayReal;
+    }
+
+    return getTicketsForDate(date);
   } catch (err) {
     // Last-resort safety net — no matter what goes wrong upstream, the
     // ticket feed should never end up silently empty.
@@ -604,7 +637,7 @@ export async function fetchFixturesForDate(date: Date): Promise<AvailableFixture
     const { data, error } = await supabase
       .from('fixtures')
       .select('id, league, home_team, away_team, kickoff, market, odds, confidence')
-      .eq('ticket_date', dateKey(date))
+      .eq('ticket_date', ticketDateKey(date))
       .order('kickoff', { ascending: true });
     if (error || !data) return [];
     return data.map((f: any) => ({
@@ -897,8 +930,8 @@ async function fetchRealHistoryRange(days: number): Promise<Map<string, DayPerfo
     const result = await supabase
       .from('tickets')
       .select('id, ticket_date, tier, ticket_matches ( fixtures ( result_status ) )')
-      .gte('ticket_date', dateKey(start))
-      .lte('ticket_date', dateKey(today));
+      .gte('ticket_date', ticketDateKey(start))
+      .lte('ticket_date', ticketDateKey(today));
 
     if (result.error) return map;
     data = result.data;
@@ -952,7 +985,11 @@ export async function fetchPerformanceHistory(days: number = 14): Promise<DayPer
   for (let i = 0; i < days; i++) {
     const d = new Date(today);
     d.setDate(d.getDate() - i);
-    history.push(realByDay.get(dateKey(d)) ?? getDayPerformance(d));
+    // realByDay is keyed by the raw `ticket_date` column value (UTC, via
+    // ticketDateKey/fetchRealHistoryRange) — must look it up the same way,
+    // not by the visitor's local day, or this silently misses real days
+    // near a UTC boundary and falls back to mock data for them instead.
+    history.push(realByDay.get(ticketDateKey(d)) ?? getDayPerformance(d));
   }
   return history;
 }
