@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { randomUUID } from 'node:crypto';
-import { PLANS, isValidPlanId, SAINTS_LOCK_PLANS, isValidSaintsLockPlanId } from '@/lib/plans';
+import {
+  PLANS,
+  isValidPlanId,
+  SAINTS_LOCK_PLANS,
+  isValidSaintsLockPlanId,
+  TICKET_UNLOCK_PRICE_USD,
+} from '@/lib/plans';
 import { isPawaPaySupportedCountry, getCorrespondentsForCountry, initiateDeposit } from '@/lib/pawapay';
 import { submitOrder } from '@/lib/pesapal';
 import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
@@ -8,34 +14,42 @@ import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 // ---------------------------------------------------------------------------
 // POST /api/checkout
 // Body: {
-//   product: 'subscription' | 'saints_lock',
-//   plan: string,
+//   product: 'subscription' | 'saints_lock' | 'ticket_unlock',
+//   plan?: string,               // required for subscription/saints_lock, ignored for ticket_unlock
+//   ticketId?: string,           // required for ticket_unlock — which ticket is being paid for
 //   userId: string,
 //   email: string,
 //   countryCode: string (ISO 3166-1 alpha-2, e.g. 'KE'),
-//   phoneNumber: string,
-//   correspondent?: string (which network — required if the country has more than one option)
+//   phoneNumber?: string,        // required only when preferMobileMoney is true
+//   correspondent?: string,      // which network — required if the country has more than one PawaPay option
+//   preferMobileMoney?: boolean  // explicit opt-in; defaults to false
 // }
 //
-// ONE unified checkout screen on the frontend; this route decides the split
-// on the backend:
-//   - If the country/network is covered by PawaPay, use it — direct STK
-//     push straight to the customer's phone, no redirect away from the app.
-//     Returns { provider: 'pawapay', depositId } — frontend then polls
-//     /api/checkout/status for the result.
-//   - Otherwise, fall back to Pesapal's hosted redirect page (also covers
-//     card payments). Returns { provider: 'pesapal', url }.
+// PESAPAL IS THE PRIMARY/DEFAULT CHECKOUT PROVIDER (product decision —
+// see CLAUDE.md). PawaPay's direct-to-phone mobile-money flow is opt-in
+// ONLY: it is used solely when the client explicitly sets
+// preferMobileMoney: true AND the country/network is actually supported.
+// Everyone else — including anyone who doesn't opt in, and anyone whose
+// country/network PawaPay doesn't cover — goes through Pesapal's hosted
+// redirect page, which also handles card payments and East African
+// mobile money through Pesapal's own rails.
+//   - PawaPay path returns { provider: 'pawapay', depositId } — frontend
+//     polls /api/checkout/status?provider=pawapay for the result.
+//   - Pesapal path returns { provider: 'pesapal', url } — frontend
+//     redirects the browser there.
 // ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest) {
   let body: {
     product?: string;
     plan?: string;
+    ticketId?: string;
     userId?: string;
     email?: string;
     countryCode?: string;
     phoneNumber?: string;
     correspondent?: string;
+    preferMobileMoney?: boolean;
   };
   try {
     body = await req.json();
@@ -43,13 +57,20 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
   }
 
-  const { product, plan, userId, email, countryCode, phoneNumber, correspondent } = body;
+  const {
+    product,
+    plan,
+    ticketId,
+    userId,
+    email,
+    countryCode,
+    phoneNumber,
+    correspondent,
+    preferMobileMoney,
+  } = body;
 
-  if (product !== 'subscription' && product !== 'saints_lock') {
+  if (product !== 'subscription' && product !== 'saints_lock' && product !== 'ticket_unlock') {
     return NextResponse.json({ error: 'Invalid product' }, { status: 400 });
-  }
-  if (!plan) {
-    return NextResponse.json({ error: 'Invalid plan' }, { status: 400 });
   }
   if (!userId || !email) {
     return NextResponse.json({ error: 'Must be signed in to purchase' }, { status: 401 });
@@ -58,21 +79,65 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Country is required' }, { status: 400 });
   }
 
-  const planConfig =
-    product === 'subscription'
-      ? isValidPlanId(plan)
-        ? PLANS[plan]
-        : null
-      : isValidSaintsLockPlanId(plan)
-      ? SAINTS_LOCK_PLANS[plan]
-      : null;
+  const supabaseAdmin = getSupabaseAdmin();
 
-  if (!planConfig) {
-    return NextResponse.json({ error: 'Invalid plan' }, { status: 400 });
+  // -------------------------------------------------------------------
+  // Resolve the amount/description/plan-label to charge — derived
+  // server-side from validated config, NEVER trusted from the client.
+  // -------------------------------------------------------------------
+  let amountUsd: number;
+  let description: string;
+  let planForRecord: string;
+
+  if (product === 'ticket_unlock') {
+    if (!ticketId) {
+      return NextResponse.json({ error: 'Missing ticketId' }, { status: 400 });
+    }
+    // Confirm the ticket actually exists before charging for it — never
+    // trust a client-supplied ticket ID blindly.
+    const { data: ticketRow, error: ticketLookupErr } = await supabaseAdmin
+      .from('tickets')
+      .select('id')
+      .eq('id', ticketId)
+      .maybeSingle();
+    if (ticketLookupErr) {
+      // eslint-disable-next-line no-console
+      console.error('[checkout] Ticket lookup failed:', ticketLookupErr);
+      return NextResponse.json({ error: 'Could not verify ticket. Please try again.' }, { status: 500 });
+    }
+    if (!ticketRow) {
+      return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
+    }
+    amountUsd = TICKET_UNLOCK_PRICE_USD;
+    description = 'Odd Saint — Ticket unlock';
+    planForRecord = 'single';
+  } else {
+    if (!plan) {
+      return NextResponse.json({ error: 'Invalid plan' }, { status: 400 });
+    }
+    const planConfig =
+      product === 'subscription'
+        ? isValidPlanId(plan)
+          ? PLANS[plan]
+          : null
+        : isValidSaintsLockPlanId(plan)
+        ? SAINTS_LOCK_PLANS[plan]
+        : null;
+
+    if (!planConfig) {
+      return NextResponse.json({ error: 'Invalid plan' }, { status: 400 });
+    }
+    amountUsd = planConfig.amountUsd;
+    description = `Odd Saint — ${planConfig.label} plan`;
+    planForRecord = plan;
   }
 
   try {
-    if (isPawaPaySupportedCountry(countryCode)) {
+    // Mobile money is opt-in only — see the file header note. Pesapal is
+    // the fallback for everyone else, not the other way around.
+    const wantsMobileMoney = !!preferMobileMoney && isPawaPaySupportedCountry(countryCode);
+
+    if (wantsMobileMoney) {
       if (!phoneNumber) {
         return NextResponse.json({ error: 'Phone number is required for mobile money' }, { status: 400 });
       }
@@ -84,7 +149,7 @@ export async function POST(req: NextRequest) {
       }
 
       const deposit = await initiateDeposit({
-        amountUsd: planConfig.amountUsd,
+        amountUsd,
         correspondent: chosenCorrespondent,
         phoneNumber,
         statementDescription: 'Odd Saint',
@@ -103,20 +168,23 @@ export async function POST(req: NextRequest) {
         userId,
         email,
         product,
-        plan,
+        plan: planForRecord,
+        ticketId: product === 'ticket_unlock' ? ticketId ?? null : null,
       });
 
       return NextResponse.json({ provider: 'pawapay', depositId: deposit.depositId });
     }
 
-    // Fallback: Pesapal's hosted redirect page (also handles card payments).
+    // Pesapal — the primary/default path. Used whenever mobile money
+    // wasn't explicitly requested, or isn't supported for this
+    // country/network. Also handles card payments.
     const merchantReference = `oddsaint-${product}-${randomUUID()}`;
     const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || 'https://odd-saint.vercel.app';
 
     const order = await submitOrder({
       merchantReference,
-      amountUsd: planConfig.amountUsd,
-      description: `Odd Saint — ${planConfig.label} plan`,
+      amountUsd,
+      description,
       callbackUrl: `${siteUrl}?checkout=return`,
       email,
     });
@@ -127,7 +195,8 @@ export async function POST(req: NextRequest) {
       userId,
       email,
       product,
-      plan,
+      plan: planForRecord,
+      ticketId: product === 'ticket_unlock' ? ticketId ?? null : null,
     });
 
     return NextResponse.json({ provider: 'pesapal', url: order.redirectUrl });
@@ -145,6 +214,7 @@ async function recordPendingTransaction(params: {
   email: string;
   product: string;
   plan: string;
+  ticketId?: string | null;
 }): Promise<void> {
   const supabase = getSupabaseAdmin();
   const { error } = await supabase.from('pending_transactions').insert({
@@ -154,6 +224,7 @@ async function recordPendingTransaction(params: {
     email: params.email,
     product: params.product,
     plan: params.plan,
+    ticket_id: params.ticketId ?? null,
   });
   if (error) throw error;
 }
