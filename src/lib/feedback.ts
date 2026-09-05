@@ -14,6 +14,14 @@ import { supabase } from './supabaseClient';
 
 export type FeedbackCategory = 'usability' | 'performance' | 'bug' | 'support_request' | 'general';
 
+export interface FeedbackRow {
+  id: string;
+  category: FeedbackCategory;
+  message: string;
+  email: string | null;
+  createdAt: string;
+}
+
 const MIN_LENGTH = 8;
 const MAX_LENGTH = 2000;
 const LINK_SPAM_PATTERN = /(https?:\/\/[^\s]+){2,}/i; // 2+ links in one message = likely spam
@@ -55,4 +63,52 @@ export async function submitFeedback(params: {
 
   if (error) return { success: false, error: error.message };
   return { success: true };
+}
+
+// ---------------------------------------------------------------------------
+// Admin moderation queue
+// ---------------------------------------------------------------------------
+// Both functions below rely entirely on Supabase RLS for their real
+// security boundary (see supabase/migrations/002_batch_updates.sql: only a
+// user listed in `admins` can select all feedback rows or update their
+// status) — they use the regular browser client (the caller's own signed-in
+// session), not the service-role key. For a non-admin caller, RLS simply
+// returns zero rows / affects zero rows rather than erroring, matching the
+// same "UI gate is convenience, RLS is enforcement" pattern used elsewhere.
+
+/** Admin-only: pending feedback, oldest first — the moderation queue. */
+export async function fetchPendingFeedback(): Promise<FeedbackRow[]> {
+  try {
+    const { data, error } = await supabase
+      .from('feedback')
+      .select('id, category, message, email, created_at')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true });
+    if (error || !data) return [];
+    return data.map((row: any) => ({
+      id: row.id,
+      category: row.category,
+      message: row.message,
+      email: row.email,
+      createdAt: row.created_at,
+    }));
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[Odd Saint] fetchPendingFeedback failed:', err);
+    return [];
+  }
+}
+
+/** Admin-only: moves one feedback row to 'approved' or 'rejected'. */
+export async function moderateFeedback(
+  id: string,
+  decision: 'approved' | 'rejected'
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const { error } = await supabase.from('feedback').update({ status: decision }).eq('id', id);
+    if (error) return { success: false, error: error.message };
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Unknown error' };
+  }
 }
