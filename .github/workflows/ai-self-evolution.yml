@@ -18,18 +18,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          # IMPORTANT: must be false. actions/checkout otherwise persists its
-          # own Authorization header into the local git config
-          # (http.https://github.com/.extraheader). create-pull-request below
-          # ALSO configures its own auth using the `token` input — with both
-          # present, git sends two Authorization headers on the same request
-          # and GitHub rejects it outright:
+          # Primary fix: don't let checkout persist its own Authorization
+          # header into local git config. peter-evans/create-pull-request
+          # configures its own auth when it pushes — if checkout ALSO
+          # leaves one behind, git sends two Authorization headers on the
+          # same request and GitHub rejects it with a 400:
           #   remote: Duplicate header: "Authorization"
           #   fatal: ... The requested URL returned error: 400
-          # This surfaces during create-pull-request's "Checking the base
-          # repository state" step (`git remote prune origin`), NOT during
-          # checkout itself, which is why the job gets all the way through
-          # dependency updates/lint/build before failing.
           persist-credentials: false
 
       - name: Set up Node.js
@@ -63,6 +58,21 @@ jobs:
         run: |
           npm run lint --if-present || true
           npm run build --if-present
+
+      - name: Clear any leftover git auth header (belt-and-suspenders)
+        # Defensive step: even with persist-credentials: false above, some
+        # combination of actions/runner behavior, re-run caching, or another
+        # step in this job can leave a stale
+        # http.https://github.com/.extraheader entry in the LOCAL repo git
+        # config, which then collides with the Authorization header
+        # peter-evans/create-pull-request sets when it pushes — producing
+        # the same "Duplicate header: Authorization" / 400 error. This step
+        # unconditionally removes any such leftover entry immediately
+        # before the PR step runs, so create-pull-request is guaranteed to
+        # be the only thing setting auth. `|| true` because on a clean run
+        # there may be nothing to unset, which would otherwise exit non-zero
+        # and fail the job.
+        run: git config --local --unset-all http.https://github.com/.extraheader || true
 
       - name: Open a pull request with any changes
         uses: peter-evans/create-pull-request@v6
