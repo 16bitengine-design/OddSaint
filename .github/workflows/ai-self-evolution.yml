@@ -17,6 +17,20 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          # IMPORTANT: must be false. actions/checkout otherwise persists its
+          # own Authorization header into the local git config
+          # (http.https://github.com/.extraheader). create-pull-request below
+          # ALSO configures its own auth using the `token` input — with both
+          # present, git sends two Authorization headers on the same request
+          # and GitHub rejects it outright:
+          #   remote: Duplicate header: "Authorization"
+          #   fatal: ... The requested URL returned error: 400
+          # This surfaces during create-pull-request's "Checking the base
+          # repository state" step (`git remote prune origin`), NOT during
+          # checkout itself, which is why the job gets all the way through
+          # dependency updates/lint/build before failing.
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
