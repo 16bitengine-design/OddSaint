@@ -197,27 +197,27 @@ function hashSeed(str: string): number {
   return h % 233280;
 }
 
-/** Local calendar date as 'YYYY-MM-DD', used as the root of every day's seed. */
-export function dateKey(date: Date): string {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
-}
-
 /**
- * The calendar day the pipeline uses when writing `ticket_date` (see
- * dateStr() in scripts/generate-tickets.mjs) — always UTC. Deliberately
- * separate from dateKey() above, which uses the visitor's LOCAL day and is
- * correct for mock-data seeding and the archive date-picker's display
- * value, but wrong for any real Supabase query: a visitor whose local day
- * has already rolled over relative to UTC would otherwise query a date the
- * pipeline hasn't generated yet, and silently fall back to fabricated mock
- * data instead of real tickets that already exist under the correct
- * (UTC) date.
+ * Calendar date as 'YYYY-MM-DD', used as the root of every day's seed AND
+ * as the exact key queried against Supabase's `ticket_date` column.
+ *
+ * IMPORTANT — this MUST use UTC, not the browser's local timezone.
+ * scripts/generate-tickets.mjs writes `ticket_date` using
+ * `d.toISOString().slice(0, 10)`, which is a UTC calendar date. Previously
+ * this function used local getFullYear()/getMonth()/getDate(), so for any
+ * visitor outside UTC+0 there was a multi-hour window around local
+ * midnight where the frontend's "today" and the pipeline's "today"
+ * disagreed by one day — the Supabase query for real tickets would return
+ * nothing, silently falling back to mock data even though real rows
+ * existed for the correct (UTC) date. Using UTC here keeps this the single
+ * source of truth for "what day is it" across both the query path and the
+ * mock generator's seeding, matching the pipeline exactly.
  */
-export function ticketDateKey(date: Date): string {
-  return date.toISOString().slice(0, 10);
+export function dateKey(date: Date): string {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(date.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
 }
 
 /**
@@ -459,7 +459,7 @@ export function getTicketStatus(ticket: Ticket): MatchStatus {
  *   const { data } = await supabase
  *     .from('tickets')
  *     .select('*, matches(*)')
- *     .eq('ticket_date', ticketDateKey(date));
+ *     .eq('ticket_date', dateKey(date));
  */
 export function getTicketsForDate(date: Date): Ticket[] {
   const day = dateKey(date);
@@ -483,7 +483,7 @@ export function getTicketsForDate(date: Date): Ticket[] {
  * an empty feed.
  */
 async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
-  const day = ticketDateKey(date);
+  const day = dateKey(date);
 
   let data;
   try {
@@ -567,29 +567,23 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
 }
 
 /**
- * Fetch tickets for a given day — real pipeline data if available for that
- * exact day, otherwise (ONLY when `date` is today, in UTC — see
- * ticketDateKey) the most recent day's real tickets that DO exist, so a
- * visitor never sees fabricated mock data during the real, expected daily
- * gap between midnight UTC and the pipeline's first run of the day at
- * 06:00 UTC. Explicit past-date lookups (e.g. the ticket archive) never
- * get this substitution — asking for a specific past day should return
- * that day's real data or nothing, never a different day silently swapped
- * in. Mock data is the last resort, used only when neither today's nor
- * yesterday's real data exists yet at all.
+ * Fetch all of today's tickets — real pipeline data if available, mock data
+ * otherwise (e.g. before the daily generation job has run for this date).
+ *
+ * Falls back to the PREVIOUS UTC day's real tickets before giving up to
+ * mock data, since the generation pipeline runs on a schedule (06:00 /
+ * 14:00 UTC) — there's a real window early in a UTC day where today's
+ * batch genuinely hasn't landed yet, and showing yesterday's real, graded
+ * tickets is more honest than switching to placeholder mock data.
  */
 export async function fetchTickets(date: Date = new Date()): Promise<Ticket[]> {
   try {
     const real = await fetchRealTicketsForDate(date);
     if (real) return real;
 
-    const isTodayUTC = ticketDateKey(date) === ticketDateKey(new Date());
-    if (isTodayUTC) {
-      const previousDay = new Date(date);
-      previousDay.setUTCDate(previousDay.getUTCDate() - 1);
-      const previousDayReal = await fetchRealTicketsForDate(previousDay);
-      if (previousDayReal) return previousDayReal;
-    }
+    const previousDay = new Date(date.getTime() - 24 * 60 * 60 * 1000);
+    const carriedForward = await fetchRealTicketsForDate(previousDay);
+    if (carriedForward) return carriedForward;
 
     return getTicketsForDate(date);
   } catch (err) {
@@ -637,7 +631,7 @@ export async function fetchFixturesForDate(date: Date): Promise<AvailableFixture
     const { data, error } = await supabase
       .from('fixtures')
       .select('id, league, home_team, away_team, kickoff, market, odds, confidence')
-      .eq('ticket_date', ticketDateKey(date))
+      .eq('ticket_date', dateKey(date))
       .order('kickoff', { ascending: true });
     if (error || !data) return [];
     return data.map((f: any) => ({
@@ -930,8 +924,8 @@ async function fetchRealHistoryRange(days: number): Promise<Map<string, DayPerfo
     const result = await supabase
       .from('tickets')
       .select('id, ticket_date, tier, ticket_matches ( fixtures ( result_status ) )')
-      .gte('ticket_date', ticketDateKey(start))
-      .lte('ticket_date', ticketDateKey(today));
+      .gte('ticket_date', dateKey(start))
+      .lte('ticket_date', dateKey(today));
 
     if (result.error) return map;
     data = result.data;
@@ -985,11 +979,7 @@ export async function fetchPerformanceHistory(days: number = 14): Promise<DayPer
   for (let i = 0; i < days; i++) {
     const d = new Date(today);
     d.setDate(d.getDate() - i);
-    // realByDay is keyed by the raw `ticket_date` column value (UTC, via
-    // ticketDateKey/fetchRealHistoryRange) — must look it up the same way,
-    // not by the visitor's local day, or this silently misses real days
-    // near a UTC boundary and falls back to mock data for them instead.
-    history.push(realByDay.get(ticketDateKey(d)) ?? getDayPerformance(d));
+    history.push(realByDay.get(dateKey(d)) ?? getDayPerformance(d));
   }
   return history;
 }
@@ -1214,68 +1204,5 @@ export async function getArchiveAccess(userId: string | null): Promise<ArchiveAc
     // eslint-disable-next-line no-console
     console.warn('[Odd Saint] Archive access check failed, defaulting to no access:', err);
     return { level: 'none' };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Subscription access (standard subscription — NOT Saint's Lock, NOT the
-// archive-specific check above)
-// ---------------------------------------------------------------------------
-// This is the check that must gate today's premium tiers (Gold, Platinum,
-// Diamond, etc.) in TicketCard. Previously nothing on the frontend ever
-// consulted the `subscribers` table for today's feed — grantAccessForPayment
-// correctly wrote the row on a successful payment, but TicketCard's lock
-// logic only ever looked at local, session-only React state (`unlocks`,
-// set by watching an ad or the pay-per-ticket flow), never at whether the
-// signed-in user actually has an active subscription. That meant a real,
-// successful payment did not unlock anything on the main feed. This function
-// is the fix — read the user's own row (RLS restricts selects to
-// user_id = auth.uid()) and expose a simple active/expiresAt result.
-
-export interface SubscriptionAccess {
-  active: boolean;
-  expiresAt: string | null;
-}
-
-export async function getSubscriptionAccess(userId: string | null): Promise<SubscriptionAccess> {
-  if (!userId) return { active: false, expiresAt: null };
-  try {
-    const { data, error } = await supabase
-      .from('subscribers')
-      .select('active, expires_at')
-      .eq('user_id', userId)
-      .maybeSingle();
-    if (error || !data) return { active: false, expiresAt: null };
-
-    const active = !!data.active && (!data.expires_at || new Date(data.expires_at).getTime() > Date.now());
-    return { active, expiresAt: data.expires_at ?? null };
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn('[Odd Saint] Subscription access check failed, defaulting to no access:', err);
-    return { active: false, expiresAt: null };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Pay-per-ticket unlocks
-// ---------------------------------------------------------------------------
-// Reads which specific tickets the signed-in user has individually paid to
-// unlock (see supabase/migrations/004_ticket_unlocks.sql and
-// grantAccessForPayment's 'ticket_unlock' branch in grantAccess.ts).
-// Previously "Pay Micro-Fee" was a non-functional stub that unlocked any
-// ticket for free via local React state and never persisted anything —
-// this is the real, persisted equivalent. RLS restricts selects to
-// user_id = auth.uid(), so this can't be used to see anyone else's unlocks.
-
-export async function getUnlockedTicketIds(userId: string | null): Promise<Set<string>> {
-  if (!userId) return new Set();
-  try {
-    const { data, error } = await supabase.from('ticket_unlocks').select('ticket_id').eq('user_id', userId);
-    if (error || !data) return new Set();
-    return new Set(data.map((r: any) => r.ticket_id as string));
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn('[Odd Saint] ticket_unlocks query failed, defaulting to no unlocks:', err);
-    return new Set();
   }
 }
