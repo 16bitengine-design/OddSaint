@@ -14,14 +14,11 @@ import {
   webSearchUrlForTeam,
   getArchiveAccess,
   getSaintsLockAccess,
-  getSubscriptionAccess,
-  getUnlockedTicketIds,
   getNextReleaseLabel,
   fetchFixturesForDate,
   adminAddFixtureToTicket,
   adminRemoveFixtureFromTicket,
   dateKey,
-  ticketDateKey,
   TIER_CONFIG,
   ANONYMOUS_TRIAL_DAYS,
   SIGNED_UP_TRIAL_DAYS,
@@ -35,7 +32,6 @@ import {
   type ArchiveAccess,
   type TrialPolicy,
   type SaintsLockAccess,
-  type SubscriptionAccess,
   type AvailableFixture,
 } from '@/lib/dataFetcher';
 import {
@@ -73,7 +69,7 @@ const SURFACE_GRADIENT = COLORS.surface; // flat surfaces — bookmaker UIs favo
 const FONT_DISPLAY = 'var(--font-body), system-ui, -apple-system, sans-serif';
 const FONT_BODY = 'var(--font-body), system-ui, -apple-system, sans-serif';
 
-type UnlockMap = Record<string, boolean>; // ticketId -> unlocked via ad (session-only)
+type UnlockMap = Record<string, boolean>; // ticketId -> unlocked via ad/purchase
 
 // ---------------------------------------------------------------------------
 // Small shared components
@@ -316,28 +312,9 @@ function formatKickoff(iso: string): string {
   return `${day}, ${time}`;
 }
 
-/**
- * Formats a ticket's "available_at" timestamp for the release badge.
- *
- * Normally this is just a local clock time, e.g. "8:00 AM" — but
- * fetchTickets() (see dataFetcher.ts) can carry forward the PREVIOUS UTC
- * day's real tickets when today's haven't been generated yet (the real,
- * expected gap before the 06:00 UTC pipeline run), rather than falling
- * straight to mock data. Without a visual cue, a carried-forward batch
- * would look identical to a freshly-released one. `requestedDateKeyUTC` is
- * the UTC day the feed actually asked for (today, for the main feed; the
- * picked date, for the archive) — when the ticket's own release day
- * doesn't match it, a short date is prefixed so this is never ambiguous.
- */
-function formatReleaseLabel(availableAtISO: string, requestedDateKeyUTC: string): string {
-  const releaseDate = new Date(availableAtISO);
-  const time = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(releaseDate);
-
-  const releaseDayUTC = ticketDateKey(releaseDate);
-  if (releaseDayUTC === requestedDateKeyUTC) return time;
-
-  const shortDate = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(releaseDate);
-  return `${shortDate} · ${time}`;
+/** Formats an ISO "available_at" timestamp as a plain local clock time, e.g. "8:00 AM". */
+function formatReleaseTime(iso: string): string {
+  return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
 }
 
 function MatchRow({
@@ -569,22 +546,90 @@ function ResultBadge({ result }: { result: 'W' | 'D' | 'L' }) {
   );
 }
 
-function TeamSearchModal({ onClose }: { onClose: () => void }) {
+// ---------------------------------------------------------------------------
+// Unified search — "By team" plus "By date" (search for tickets generated
+// or available on a particular day). Date search reuses the EXACT same
+// access rule as the ticket archive (admin: unlimited, subscriber: their
+// own maxDaysBack, everyone else: none) rather than introducing a second,
+// inconsistent access check — see getArchiveAccess in
+// src/lib/dataFetcher.ts for where that rule actually lives.
+// ---------------------------------------------------------------------------
+
+function SearchModal({
+  onClose,
+  archiveAccess,
+  isAdmin,
+  onEditAsAdmin,
+  onSubscribe,
+}: {
+  onClose: () => void;
+  archiveAccess: ArchiveAccess;
+  isAdmin: boolean;
+  onEditAsAdmin: (ticket: Ticket) => void;
+  onSubscribe: () => void;
+}) {
+  const [tab, setTab] = useState<'team' | 'date'>('team');
+
+  // --- Search by team (unchanged behavior) ---
   const [query, setQuery] = useState('');
   const [searchedTeam, setSearchedTeam] = useState<string | null>(null);
-  const [result, setResult] = useState<TeamFormSummary | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [teamResult, setTeamResult] = useState<TeamFormSummary | null>(null);
+  const [teamLoading, setTeamLoading] = useState(false);
 
-  async function handleSearch(e: FormEvent) {
+  async function handleTeamSearch(e: FormEvent) {
     e.preventDefault();
     const trimmed = query.trim();
     if (!trimmed) return;
-    setLoading(true);
+    setTeamLoading(true);
     setSearchedTeam(trimmed);
     const history = await fetchTeamHistory(trimmed);
-    setResult(history);
-    setLoading(false);
+    setTeamResult(history);
+    setTeamLoading(false);
   }
+
+  // --- Search by date ---
+  const todayStr = dateKey(new Date());
+  const hasDateAccess = archiveAccess.level !== 'none';
+  const minDateStr = useMemo(() => {
+    if (archiveAccess.level !== 'subscriber') return undefined;
+    const oldest = new Date();
+    oldest.setDate(oldest.getDate() - archiveAccess.maxDaysBack);
+    return dateKey(oldest);
+  }, [archiveAccess]);
+
+  const [selectedDateStr, setSelectedDateStr] = useState(todayStr);
+  const [tierFilter, setTierFilter] = useState<TicketTier | 'all'>('all');
+  const [dateTickets, setDateTickets] = useState<Ticket[]>([]);
+  const [dateLoading, setDateLoading] = useState(false);
+  const [dateLoaded, setDateLoaded] = useState(false);
+  const [dateSelectedMatch, setDateSelectedMatch] = useState<Match | null>(null);
+
+  async function loadDate(value: string) {
+    if (!hasDateAccess) return;
+    setDateLoading(true);
+    setDateLoaded(false);
+    // Anchor at noon to avoid a date-input string landing on the wrong
+    // calendar day when parsed near a timezone boundary.
+    const picked = new Date(`${value}T12:00:00`);
+    const result = await fetchTickets(picked);
+    setDateTickets(result);
+    setDateLoading(false);
+    setDateLoaded(true);
+  }
+
+  // "Any other search means" — quick presets instead of always typing an
+  // exact date, plus the tier filter below narrows a day's results further.
+  function quickPick(daysAgo: number) {
+    const d = new Date();
+    d.setDate(d.getDate() - daysAgo);
+    const key = dateKey(d);
+    if (minDateStr && key < minDateStr) return; // outside this account's lookback window
+    setSelectedDateStr(key);
+    loadDate(key);
+  }
+
+  const filteredDateTickets =
+    tierFilter === 'all' ? dateTickets : dateTickets.filter((t) => t.tier === tierFilter);
 
   return (
     <div
@@ -608,8 +653,8 @@ function TeamSearchModal({ onClose }: { onClose: () => void }) {
           borderRadius: 14,
           padding: 22,
           width: '100%',
-          maxWidth: 420,
-          maxHeight: '75vh',
+          maxWidth: 460,
+          maxHeight: '80vh',
           overflowY: 'auto',
           boxShadow: '0 20px 60px -20px rgba(0,0,0,0.35)',
           position: 'relative',
@@ -641,147 +686,356 @@ function TeamSearchModal({ onClose }: { onClose: () => void }) {
             margin: '0 0 14px',
           }}
         >
-          Search a team
+          Search
         </h2>
 
-        <form onSubmit={handleSearch} style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="e.g. Arsenal"
+        <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+          <button
+            onClick={() => setTab('team')}
             style={{
               flex: 1,
-              padding: '10px 12px',
-              borderRadius: 8,
-              border: `1px solid ${COLORS.border}`,
-              background: COLORS.surfaceAlt,
-              color: COLORS.textPrimary,
               fontFamily: FONT_BODY,
-              fontSize: 13,
-              boxSizing: 'border-box',
-            }}
-          />
-          <button
-            type="submit"
-            style={{
-              padding: '10px 16px',
-              borderRadius: 8,
-              border: 'none',
-              background: COLORS.emerald,
-              color: '#ffffff',
-              fontFamily: FONT_BODY,
-              fontSize: 13,
+              fontSize: 12.5,
               fontWeight: 700,
+              padding: '8px 0',
+              borderRadius: 8,
+              border: tab === 'team' ? 'none' : `1px solid ${COLORS.border}`,
+              background: tab === 'team' ? COLORS.emerald : 'transparent',
+              color: tab === 'team' ? '#ffffff' : COLORS.textMuted,
               cursor: 'pointer',
             }}
           >
-            Search
+            By team
           </button>
-        </form>
+          <button
+            onClick={() => setTab('date')}
+            style={{
+              flex: 1,
+              fontFamily: FONT_BODY,
+              fontSize: 12.5,
+              fontWeight: 700,
+              padding: '8px 0',
+              borderRadius: 8,
+              border: tab === 'date' ? 'none' : `1px solid ${COLORS.border}`,
+              background: tab === 'date' ? COLORS.emerald : 'transparent',
+              color: tab === 'date' ? '#ffffff' : COLORS.textMuted,
+              cursor: 'pointer',
+            }}
+          >
+            By date
+          </button>
+        </div>
 
-        {searchedTeam && (
+        {tab === 'team' ? (
           <>
-            {/* External search — opens a real web search in a new tab. This
-                app has no backend to safely hold a live news-API key, so
-                this is the honest, zero-cost way to surface outside
-                information rather than faking it inline. */}
-            <a
-              href={webSearchUrlForTeam(searchedTeam)}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{
-                display: 'block',
-                fontSize: 12,
-                color: COLORS.emerald,
-                fontWeight: 700,
-                marginBottom: 16,
-                textDecoration: 'underline',
-                textUnderlineOffset: 3,
-              }}
-            >
-              Search the web for {searchedTeam} news →
-            </a>
+            <form onSubmit={handleTeamSearch} style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+              <input
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="e.g. Arsenal"
+                style={{
+                  flex: 1,
+                  padding: '10px 12px',
+                  borderRadius: 8,
+                  border: `1px solid ${COLORS.border}`,
+                  background: COLORS.surfaceAlt,
+                  color: COLORS.textPrimary,
+                  fontFamily: FONT_BODY,
+                  fontSize: 13,
+                  boxSizing: 'border-box',
+                }}
+              />
+              <button
+                type="submit"
+                style={{
+                  padding: '10px 16px',
+                  borderRadius: 8,
+                  border: 'none',
+                  background: COLORS.emerald,
+                  color: '#ffffff',
+                  fontFamily: FONT_BODY,
+                  fontSize: 13,
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                }}
+              >
+                Search
+              </button>
+            </form>
 
-            <div
-              style={{
-                fontFamily: FONT_BODY,
-                fontSize: 11,
-                fontWeight: 700,
-                color: COLORS.textMuted,
-                textTransform: 'uppercase',
-                letterSpacing: '0.06em',
-                marginBottom: 8,
-              }}
-            >
-              Match history in our data
-            </div>
-
-            {loading && (
-              <div style={{ fontSize: 12.5, color: COLORS.textMuted }}>Searching…</div>
-            )}
-
-            {!loading && !result && (
-              <div style={{ fontSize: 12.5, color: COLORS.textMuted, lineHeight: 1.5 }}>
-                No history found for "{searchedTeam}" yet — we only have data for teams that have
-                appeared in a generated ticket so far. Try the web search link above for outside
-                information.
-              </div>
-            )}
-
-            {!loading && result && (
-              <div>
-                <div
+            {searchedTeam && (
+              <>
+                {/* External search — opens a real web search in a new tab. This
+                    app has no backend to safely hold a live news-API key, so
+                    this is the honest, zero-cost way to surface outside
+                    information rather than faking it inline. */}
+                <a
+                  href={webSearchUrlForTeam(searchedTeam)}
+                  target="_blank"
+                  rel="noopener noreferrer"
                   style={{
-                    display: 'flex',
-                    gap: 8,
-                    marginBottom: 12,
+                    display: 'block',
                     fontSize: 12,
-                    color: COLORS.textMuted,
+                    color: COLORS.emerald,
+                    fontWeight: 700,
+                    marginBottom: 16,
+                    textDecoration: 'underline',
+                    textUnderlineOffset: 3,
                   }}
                 >
-                  <span>
-                    <strong style={{ color: COLORS.emerald }}>{result.wins}W</strong>
-                  </span>
-                  <span>
-                    <strong style={{ color: COLORS.amber }}>{result.draws}D</strong>
-                  </span>
-                  <span>
-                    <strong style={{ color: COLORS.red }}>{result.losses}L</strong>
-                  </span>
-                  <span>— last {result.matchesFound} in our data</span>
+                  Search the web for {searchedTeam} news →
+                </a>
+
+                <div
+                  style={{
+                    fontFamily: FONT_BODY,
+                    fontSize: 11,
+                    fontWeight: 700,
+                    color: COLORS.textMuted,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.06em',
+                    marginBottom: 8,
+                  }}
+                >
+                  Match history in our data
                 </div>
 
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  {result.recentResults.map((r, idx) => (
+                {teamLoading && (
+                  <div style={{ fontSize: 12.5, color: COLORS.textMuted }}>Searching…</div>
+                )}
+
+                {!teamLoading && !teamResult && (
+                  <div style={{ fontSize: 12.5, color: COLORS.textMuted, lineHeight: 1.5 }}>
+                    No history found for "{searchedTeam}" yet — we only have data for teams that have
+                    appeared in a generated ticket so far. Try the web search link above for outside
+                    information.
+                  </div>
+                )}
+
+                {!teamLoading && teamResult && (
+                  <div>
                     <div
-                      key={idx}
                       style={{
                         display: 'flex',
-                        alignItems: 'center',
-                        gap: 10,
-                        padding: '8px 0',
-                        borderBottom: `1px solid ${COLORS.border}`,
+                        gap: 8,
+                        marginBottom: 12,
+                        fontSize: 12,
+                        color: COLORS.textMuted,
                       }}
                     >
-                      <ResultBadge result={r.result} />
-                      <div style={{ minWidth: 0, flex: 1 }}>
-                        <div style={{ fontSize: 12.5, color: COLORS.textPrimary, fontWeight: 600 }}>
-                          {r.venue === 'home' ? 'vs' : '@'} {r.opponent}
-                        </div>
-                        <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>
-                          {r.league} · {formatKickoff(r.kickoff)}
-                        </div>
-                      </div>
-                      <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.textPrimary, flexShrink: 0 }}>
-                        {r.goalsFor}-{r.goalsAgainst}
-                      </div>
+                      <span>
+                        <strong style={{ color: COLORS.emerald }}>{teamResult.wins}W</strong>
+                      </span>
+                      <span>
+                        <strong style={{ color: COLORS.amber }}>{teamResult.draws}D</strong>
+                      </span>
+                      <span>
+                        <strong style={{ color: COLORS.red }}>{teamResult.losses}L</strong>
+                      </span>
+                      <span>— last {teamResult.matchesFound} in our data</span>
                     </div>
-                  ))}
-                </div>
-              </div>
+
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {teamResult.recentResults.map((r, idx) => (
+                        <div
+                          key={idx}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 10,
+                            padding: '8px 0',
+                            borderBottom: `1px solid ${COLORS.border}`,
+                          }}
+                        >
+                          <ResultBadge result={r.result} />
+                          <div style={{ minWidth: 0, flex: 1 }}>
+                            <div style={{ fontSize: 12.5, color: COLORS.textPrimary, fontWeight: 600 }}>
+                              {r.venue === 'home' ? 'vs' : '@'} {r.opponent}
+                            </div>
+                            <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>
+                              {r.league} · {formatKickoff(r.kickoff)}
+                            </div>
+                          </div>
+                          <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.textPrimary, flexShrink: 0 }}>
+                            {r.goalsFor}-{r.goalsAgainst}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
             )}
           </>
+        ) : (
+          <>
+            {!hasDateAccess ? (
+              <div
+                style={{
+                  fontSize: 12.5,
+                  color: COLORS.textMuted,
+                  lineHeight: 1.6,
+                  background: COLORS.surfaceAlt,
+                  border: `1px solid ${COLORS.border}`,
+                  borderRadius: 10,
+                  padding: '12px 14px',
+                }}
+              >
+                Searching by date is a subscriber feature — subscribers can look back several days,
+                and admins have unlimited access.
+                <button
+                  onClick={onSubscribe}
+                  style={{
+                    display: 'block',
+                    marginTop: 10,
+                    padding: '9px 0',
+                    width: '100%',
+                    borderRadius: 8,
+                    border: 'none',
+                    background: COLORS.emerald,
+                    color: '#ffffff',
+                    fontFamily: FONT_BODY,
+                    fontWeight: 700,
+                    fontSize: 12.5,
+                    cursor: 'pointer',
+                  }}
+                >
+                  See plans
+                </button>
+              </div>
+            ) : (
+              <>
+                <p style={{ fontSize: 11, color: COLORS.textMuted, margin: '0 0 10px' }}>
+                  {archiveAccess.level === 'admin'
+                    ? 'Admin access — any past day, unrestricted.'
+                    : `Subscriber access — up to the last ${archiveAccess.level === 'subscriber' ? archiveAccess.maxDaysBack : 5} days.`}
+                </p>
+
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
+                  {[
+                    { label: 'Today', daysAgo: 0 },
+                    { label: 'Yesterday', daysAgo: 1 },
+                    { label: '3 days ago', daysAgo: 3 },
+                    { label: '1 week ago', daysAgo: 7 },
+                  ].map((preset) => (
+                    <button
+                      key={preset.label}
+                      onClick={() => quickPick(preset.daysAgo)}
+                      style={{
+                        fontFamily: FONT_BODY,
+                        fontSize: 11,
+                        fontWeight: 700,
+                        padding: '5px 11px',
+                        borderRadius: 999,
+                        border: `1px solid ${COLORS.border}`,
+                        background: 'transparent',
+                        color: COLORS.textMuted,
+                        cursor: 'pointer',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+                  <input
+                    type="date"
+                    value={selectedDateStr}
+                    max={todayStr}
+                    min={minDateStr}
+                    onChange={(e) => setSelectedDateStr(e.target.value)}
+                    style={{
+                      flex: 1,
+                      minWidth: 140,
+                      padding: '9px 10px',
+                      borderRadius: 8,
+                      border: `1px solid ${COLORS.border}`,
+                      background: COLORS.surfaceAlt,
+                      color: COLORS.textPrimary,
+                      fontFamily: FONT_BODY,
+                      fontSize: 13,
+                    }}
+                  />
+                  <select
+                    value={tierFilter}
+                    onChange={(e) => setTierFilter(e.target.value as TicketTier | 'all')}
+                    style={{
+                      padding: '9px 10px',
+                      borderRadius: 8,
+                      border: `1px solid ${COLORS.border}`,
+                      background: COLORS.surfaceAlt,
+                      color: COLORS.textPrimary,
+                      fontFamily: FONT_BODY,
+                      fontSize: 12.5,
+                    }}
+                  >
+                    <option value="all">All tiers</option>
+                    {TIER_CONFIG.map((c) => (
+                      <option key={c.tier} value={c.tier}>
+                        {c.label}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={() => loadDate(selectedDateStr)}
+                    disabled={dateLoading}
+                    style={{
+                      padding: '9px 16px',
+                      borderRadius: 8,
+                      border: 'none',
+                      background: COLORS.emerald,
+                      color: '#ffffff',
+                      fontFamily: FONT_BODY,
+                      fontWeight: 700,
+                      fontSize: 12.5,
+                      cursor: dateLoading ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    {dateLoading ? '...' : 'Search'}
+                  </button>
+                </div>
+
+                {dateLoading && (
+                  <div style={{ fontSize: 12, color: COLORS.textMuted }}>Loading {selectedDateStr}...</div>
+                )}
+
+                {dateLoaded && !dateLoading && filteredDateTickets.length === 0 && (
+                  <div style={{ fontSize: 12, color: COLORS.textMuted }}>
+                    No tickets found for {selectedDateStr}
+                    {tierFilter !== 'all'
+                      ? ` in ${TIER_CONFIG.find((c) => c.tier === tierFilter)?.label ?? tierFilter}`
+                      : ''}
+                    .
+                  </div>
+                )}
+
+                {!dateLoading &&
+                  filteredDateTickets.map((t) => (
+                    <TicketCard
+                      key={t.id}
+                      ticket={t}
+                      trialActive={true}
+                      unlocked={true}
+                      isSignedIn={true}
+                      isAdmin={isAdmin}
+                      hasSaintsLockAccess={true}
+                      onWatchAd={() => {}}
+                      onSubscribe={() => {}}
+                      onPayPerTicket={() => {}}
+                      onSelectMatch={setDateSelectedMatch}
+                      onEditAsAdmin={onEditAsAdmin}
+                    />
+                  ))}
+              </>
+            )}
+          </>
+        )}
+
+        {dateSelectedMatch && (
+          <MatchAnalysisModal match={dateSelectedMatch} onClose={() => setDateSelectedMatch(null)} />
         )}
       </div>
     </div>
@@ -1040,8 +1294,6 @@ function TicketCard({
   isSignedIn,
   isAdmin,
   hasSaintsLockAccess,
-  hasSubscriptionAccess,
-  requestedDateKey,
   onWatchAd,
   onSubscribe,
   onPayPerTicket,
@@ -1054,9 +1306,6 @@ function TicketCard({
   isSignedIn: boolean;
   isAdmin: boolean;
   hasSaintsLockAccess: boolean;
-  hasSubscriptionAccess: boolean;
-  /** UTC day (see ticketDateKey) this feed actually asked for — lets the release badge tell a carried-forward batch apart from a fresh one. */
-  requestedDateKey: string;
   onWatchAd: (ticketId: string) => void;
   onSubscribe: () => void;
   onPayPerTicket: (ticketId: string) => void;
@@ -1073,19 +1322,11 @@ function TicketCard({
   // "administrator can access all tickets without payment." This check
   // comes FIRST and short-circuits everything else below it; nothing else
   // in this function needs to special-case admin once this line is right.
-  //
-  // hasSubscriptionAccess is the fix for a real bug: a successful
-  // subscription payment previously wrote to the `subscribers` table (via
-  // grantAccessForPayment) but nothing on the frontend ever checked that
-  // table for TODAY's feed — `unlocked` was only ever local, session-only
-  // React state set by watching an ad or paying per-ticket. A paying
-  // subscriber's tickets stayed locked exactly as before. See
-  // getSubscriptionAccess() in dataFetcher.ts.
   const isLocked = isAdmin
     ? false
     : isSaintsLock
     ? !hasSaintsLockAccess
-    : !ticket.isFree && !isWeeklyTitanUnlockedForever && !trialActive && !unlocked && !hasSubscriptionAccess;
+    : !ticket.isFree && !isWeeklyTitanUnlockedForever && !trialActive && !unlocked;
 
   const borderColor =
     overallStatus === 'green' ? COLORS.emerald : overallStatus === 'red' ? COLORS.red : COLORS.amber;
@@ -1167,7 +1408,7 @@ function TicketCard({
                     padding: '1px 7px',
                   }}
                 >
-                  Released {formatReleaseLabel(ticket.availableAt, requestedDateKey)}
+                  Released {formatReleaseTime(ticket.availableAt)}
                 </span>
               )}
             </div>
@@ -2598,7 +2839,6 @@ function TicketArchiveModal({
   }, [access]);
 
   const [selectedDateStr, setSelectedDateStr] = useState(yesterdayStr);
-  const [loadedDateStr, setLoadedDateStr] = useState<string | null>(null);
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [loading, setLoading] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -2612,22 +2852,9 @@ function TicketArchiveModal({
     const picked = new Date(`${value}T12:00:00`);
     const result = await fetchTickets(picked);
     setTickets(result);
-    // Tracked separately from selectedDateStr — the picker's value can
-    // change before the user hits Load, but the release badge's
-    // "which day did we actually ask for" comparison must stay pinned to
-    // whatever date `tickets` actually corresponds to.
-    setLoadedDateStr(value);
     setLoading(false);
     setLoaded(true);
   }
-
-  // fetchTickets() never carries a different day forward for an explicit
-  // archive date (see the isTodayUTC check in dataFetcher.ts) — real data
-  // for exactly this day, or mock, never a substitute day. Still passed
-  // through so the badge logic has a consistent UTC key to compare against.
-  const requestedDateKeyForLoadedTickets = loadedDateStr
-    ? ticketDateKey(new Date(`${loadedDateStr}T12:00:00`))
-    : ticketDateKey(new Date());
 
   return (
     <div
@@ -2744,8 +2971,6 @@ function TicketArchiveModal({
               isSignedIn={true}
               isAdmin={isAdmin}
               hasSaintsLockAccess={true}
-              hasSubscriptionAccess={true}
-              requestedDateKey={requestedDateKeyForLoadedTickets}
               onWatchAd={() => {}}
               onSubscribe={() => {}}
               onPayPerTicket={() => {}}
@@ -2767,20 +2992,12 @@ function PricingModal({
   userId,
   userEmail,
   product = 'subscription',
-  ticketId = null,
 }: {
   onClose: () => void;
   userId: string | null;
   userEmail: string | null;
-  /**
-   * 'saints_lock' shows Saint's Lock's own $1.50/day-$7/week-$27/month
-   * plans instead of the standard subscription tiers (see src/lib/plans.ts).
-   * 'ticket_unlock' shows a single flat one-off price for the specific
-   * ticket in `ticketId`, instead of a multi-plan picker.
-   */
-  product?: 'subscription' | 'saints_lock' | 'ticket_unlock';
-  /** Required when product === 'ticket_unlock' — which ticket is being paid for. */
-  ticketId?: string | null;
+  /** 'saints_lock' shows Saint's Lock's own $1.50/day-$7/week-$27/month plans instead of the standard subscription tiers — see src/lib/plans.ts. */
+  product?: 'subscription' | 'saints_lock';
 }) {
   const subscriptionPlans = [
     { id: 'weekly' as const, label: 'Weekly', price: '$2.49', period: '/week' },
@@ -2792,16 +3009,14 @@ function PricingModal({
     { id: 'weekly' as const, label: 'Weekly', price: '$7', period: '/week', highlight: true },
     { id: 'monthly' as const, label: 'Monthly', price: '$27', period: '/month', badge: 'Best value' },
   ];
-  // ticket_unlock has no plan picker — see the flat price line rendered below instead.
-  const plans = product === 'saints_lock' ? saintsLockPlans : product === 'subscription' ? subscriptionPlans : [];
+  const plans = product === 'saints_lock' ? saintsLockPlans : subscriptionPlans;
 
-  // Countries PawaPay's direct mobile-money flow covers — kept in sync
-  // with COUNTRY_CORRESPONDENTS in src/lib/pawapay.ts. This list only
-  // matters when the visitor explicitly opts into mobile money below;
-  // everyone else goes through Pesapal regardless of country.
+  // Kept in sync with COUNTRY_CORRESPONDENTS in src/lib/pawapay.ts — any
+  // country NOT in this list still works, it just falls through to
+  // Pesapal's redirect page on the backend instead of the direct phone-push
+  // flow, which is why phone number isn't required for those.
   const PAWAPAY_COUNTRIES = new Set(['ZM', 'KE', 'UG', 'GH', 'RW', 'TZ', 'MW']);
   const countries = [
-    { code: 'OTHER', label: 'Card / other (Pesapal)' },
     { code: 'ZM', label: 'Zambia' },
     { code: 'KE', label: 'Kenya' },
     { code: 'UG', label: 'Uganda' },
@@ -2809,22 +3024,17 @@ function PricingModal({
     { code: 'RW', label: 'Rwanda' },
     { code: 'TZ', label: 'Tanzania' },
     { code: 'MW', label: 'Malawi' },
+    { code: 'OTHER', label: 'Other / card payment' },
   ];
 
-  const [selectedPlan, setSelectedPlan] = useState<string>(
-    product === 'saints_lock' ? 'weekly' : product === 'subscription' ? 'monthly' : 'single'
-  );
-  // Pesapal is the PRIMARY/DEFAULT checkout provider — country defaults to
-  // the card/Pesapal option, and mobile money is an explicit opt-in below,
-  // never auto-selected just because a country supports it.
-  const [countryCode, setCountryCode] = useState('OTHER');
-  const [useMobileMoney, setUseMobileMoney] = useState(false);
+  const [selectedPlan, setSelectedPlan] = useState<string>(product === 'saints_lock' ? 'weekly' : 'monthly');
+  const [countryCode, setCountryCode] = useState('KE');
   const [phoneNumber, setPhoneNumber] = useState('');
   const [status, setStatus] = useState<'idle' | 'starting' | 'awaiting_approval' | 'error'>('idle');
   const [error, setError] = useState<string | null>(null);
   const [pollDepositId, setPollDepositId] = useState<string | null>(null);
 
-  const needsPhone = useMobileMoney && PAWAPAY_COUNTRIES.has(countryCode);
+  const needsPhone = PAWAPAY_COUNTRIES.has(countryCode);
 
   // Poll PawaPay deposit status once a phone-push payment has been
   // initiated — there's no redirect to bounce back to, so the UI has to
@@ -2836,9 +3046,7 @@ function PricingModal({
     const interval = setInterval(async () => {
       attempts++;
       try {
-        const res = await fetch(
-          `/api/checkout/status?provider=pawapay&depositId=${encodeURIComponent(pollDepositId)}`
-        );
+        const res = await fetch(`/api/checkout/status?depositId=${encodeURIComponent(pollDepositId)}`);
         const data = await res.json();
         if (data.status === 'COMPLETED') {
           clearInterval(interval);
@@ -2866,10 +3074,6 @@ function PricingModal({
       setError('Please sign in first, then come back to subscribe.');
       return;
     }
-    if (product === 'ticket_unlock' && !ticketId) {
-      setError('Missing ticket — please close this and try again.');
-      return;
-    }
     if (needsPhone && !phoneNumber.trim()) {
       setError('Phone number is required for mobile money.');
       return;
@@ -2883,13 +3087,11 @@ function PricingModal({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           product,
-          plan: product === 'ticket_unlock' ? undefined : selectedPlan,
-          ticketId: product === 'ticket_unlock' ? ticketId : undefined,
+          plan: selectedPlan,
           userId,
           email: userEmail,
           countryCode: countryCode === 'OTHER' ? 'XX' : countryCode,
           phoneNumber: needsPhone ? phoneNumber.trim() : undefined,
-          preferMobileMoney: useMobileMoney,
         }),
       });
       const data = await res.json();
@@ -2908,20 +3110,6 @@ function PricingModal({
       setStatus('error');
     }
   }
-
-  const modalTitle =
-    product === 'saints_lock'
-      ? "Get Saint's Lock access"
-      : product === 'ticket_unlock'
-      ? 'Unlock this ticket'
-      : 'Choose your plan';
-
-  const modalSubtitle =
-    product === 'saints_lock'
-      ? 'One ultra-high-confidence pick a day. No free trial applies — pay easily with card or mobile money.'
-      : product === 'ticket_unlock'
-      ? 'A one-time payment unlocks just this ticket — no subscription required.'
-      : 'Unlock every tier, every day — pay easily with card or mobile money.';
 
   return (
     <div
@@ -2977,9 +3165,13 @@ function PricingModal({
             margin: '0 0 4px',
           }}
         >
-          {modalTitle}
+          {product === 'saints_lock' ? "Get Saint's Lock access" : 'Choose your plan'}
         </h2>
-        <p style={{ fontSize: 11.5, color: COLORS.textMuted, margin: '0 0 16px' }}>{modalSubtitle}</p>
+        <p style={{ fontSize: 11.5, color: COLORS.textMuted, margin: '0 0 16px' }}>
+          {product === 'saints_lock'
+            ? "One ultra-high-confidence pick a day. No free trial applies — pay easily with mobile money."
+            : 'Unlock every tier, every day — pay easily with mobile money.'}
+        </p>
 
         {!userId && (
           <div
@@ -3008,130 +3200,77 @@ function PricingModal({
           </div>
         ) : (
           <>
-            {/* Plan picker — skipped entirely for ticket_unlock, which has
-                exactly one flat price. */}
-            {product === 'ticket_unlock' ? (
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  border: `1.5px solid ${COLORS.emerald}`,
-                  background: 'rgba(11,138,79,0.06)',
-                  borderRadius: 10,
-                  padding: '12px 14px',
-                  marginBottom: 16,
-                }}
-              >
-                <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.textPrimary }}>
-                  Single ticket unlock
-                  <div style={{ fontSize: 10.5, color: COLORS.textMuted, fontWeight: 400, marginTop: 2 }}>
-                    One-time payment, this ticket only
-                  </div>
-                </div>
-                <div style={{ fontFamily: FONT_DISPLAY, fontSize: 18, fontWeight: 800, color: COLORS.emerald }}>
-                  $0.99
-                </div>
-              </div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
-                {plans.map((plan) => (
-                  <button
-                    key={plan.id}
-                    onClick={() => setSelectedPlan(plan.id)}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      width: '100%',
-                      textAlign: 'left',
-                      border: `1.5px solid ${selectedPlan === plan.id ? COLORS.emerald : COLORS.border}`,
-                      background: selectedPlan === plan.id ? 'rgba(11,138,79,0.06)' : 'transparent',
-                      borderRadius: 10,
-                      padding: '10px 14px',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    <div>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.textPrimary }}>
-                        {plan.label}
-                        {'badge' in plan && plan.badge && (
-                          <span
-                            style={{
-                              marginLeft: 6,
-                              fontSize: 9.5,
-                              fontWeight: 700,
-                              color: COLORS.emerald,
-                              background: 'rgba(11,138,79,0.1)',
-                              borderRadius: 999,
-                              padding: '2px 6px',
-                            }}
-                          >
-                            {plan.badge}
-                          </span>
-                        )}
-                      </div>
-                      <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>Billed {plan.label.toLowerCase()}</div>
-                    </div>
-                    <div style={{ textAlign: 'right' }}>
-                      <div style={{ fontFamily: FONT_DISPLAY, fontSize: 15, fontWeight: 800, color: COLORS.emerald }}>
-                        {plan.price}
-                      </div>
-                      <div style={{ fontSize: 9.5, color: COLORS.textMuted }}>{plan.period}</div>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {/* Unified checkout form — Pesapal (card/other) is the default;
-                mobile money is an explicit opt-in toggle, never auto-picked
-                by country. */}
-            <label
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                fontSize: 12,
-                color: COLORS.textPrimary,
-                marginBottom: 10,
-                cursor: 'pointer',
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={useMobileMoney}
-                onChange={(e) => {
-                  setUseMobileMoney(e.target.checked);
-                  if (e.target.checked && countryCode === 'OTHER') setCountryCode('KE');
-                  if (!e.target.checked) setCountryCode('OTHER');
-                }}
-              />
-              Pay with mobile money instead of card
-            </label>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14 }}>
-              {useMobileMoney && (
-                <select
-                  value={countryCode}
-                  onChange={(e) => setCountryCode(e.target.value)}
+            {/* Plan picker */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
+              {plans.map((plan) => (
+                <button
+                  key={plan.id}
+                  onClick={() => setSelectedPlan(plan.id)}
                   style={{
-                    padding: '9px 10px',
-                    borderRadius: 8,
-                    border: `1px solid ${COLORS.border}`,
-                    background: COLORS.surfaceAlt,
-                    color: COLORS.textPrimary,
-                    fontFamily: FONT_BODY,
-                    fontSize: 13,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    width: '100%',
+                    textAlign: 'left',
+                    border: `1.5px solid ${selectedPlan === plan.id ? COLORS.emerald : COLORS.border}`,
+                    background: selectedPlan === plan.id ? 'rgba(11,138,79,0.06)' : 'transparent',
+                    borderRadius: 10,
+                    padding: '10px 14px',
+                    cursor: 'pointer',
                   }}
                 >
-                  {countries.filter((c) => c.code !== 'OTHER').map((c) => (
-                    <option key={c.code} value={c.code}>
-                      {c.label}
-                    </option>
-                  ))}
-                </select>
-              )}
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.textPrimary }}>
+                      {plan.label}
+                      {'badge' in plan && plan.badge && (
+                        <span
+                          style={{
+                            marginLeft: 6,
+                            fontSize: 9.5,
+                            fontWeight: 700,
+                            color: COLORS.emerald,
+                            background: 'rgba(11,138,79,0.1)',
+                            borderRadius: 999,
+                            padding: '2px 6px',
+                          }}
+                        >
+                          {plan.badge}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>Billed {plan.label.toLowerCase()}</div>
+                  </div>
+                  <div style={{ textAlign: 'right' }}>
+                    <div style={{ fontFamily: FONT_DISPLAY, fontSize: 15, fontWeight: 800, color: COLORS.emerald }}>
+                      {plan.price}
+                    </div>
+                    <div style={{ fontSize: 9.5, color: COLORS.textMuted }}>{plan.period}</div>
+                  </div>
+                </button>
+              ))}
+            </div>
+
+            {/* Unified checkout form — one screen, backend decides PawaPay vs Pesapal */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14 }}>
+              <select
+                value={countryCode}
+                onChange={(e) => setCountryCode(e.target.value)}
+                style={{
+                  padding: '9px 10px',
+                  borderRadius: 8,
+                  border: `1px solid ${COLORS.border}`,
+                  background: COLORS.surfaceAlt,
+                  color: COLORS.textPrimary,
+                  fontFamily: FONT_BODY,
+                  fontSize: 13,
+                }}
+              >
+                {countries.map((c) => (
+                  <option key={c.code} value={c.code}>
+                    {c.label}
+                  </option>
+                ))}
+              </select>
 
               {needsPhone && (
                 <input
@@ -3186,7 +3325,7 @@ function PricingModal({
             lineHeight: 1.5,
           }}
         >
-          Card and other regions via Pesapal (default) · mobile money via PawaPay when selected above.
+          Mobile money via PawaPay · cards and other regions via Pesapal.
         </div>
       </div>
     </div>
@@ -3346,25 +3485,17 @@ export default function Page() {
   const [anonTrialStart, setAnonTrialStart] = useState<string | null>(null);
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [selectedMatch, setSelectedMatch] = useState<Match | null>(null);
-  const [showTeamSearch, setShowTeamSearch] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
   const [showArchive, setShowArchive] = useState(false);
   const [archiveAccess, setArchiveAccess] = useState<ArchiveAccess>({ level: 'none' });
   const [saintsLockAccess, setSaintsLockAccess] = useState<SaintsLockAccess>({ active: false, expiresAt: null });
-  const [subscriptionAccess, setSubscriptionAccess] = useState<SubscriptionAccess>({
-    active: false,
-    expiresAt: null,
-  });
-  const [paidUnlockedTicketIds, setPaidUnlockedTicketIds] = useState<Set<string>>(new Set());
   const [trialPolicy, setTrialPolicy] = useState<TrialPolicy>({
     anonymousDays: ANONYMOUS_TRIAL_DAYS,
     signedUpDays: SIGNED_UP_TRIAL_DAYS,
     milestoneReached: false,
   });
   const [showPricing, setShowPricing] = useState(false);
-  const [pricingProduct, setPricingProduct] = useState<'subscription' | 'saints_lock' | 'ticket_unlock'>(
-    'subscription'
-  );
-  const [unlockTicketId, setUnlockTicketId] = useState<string | null>(null);
+  const [pricingProduct, setPricingProduct] = useState<'subscription' | 'saints_lock'>('subscription');
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [history, setHistory] = useState<DayPerformance[]>([]);
   const [showHistory, setShowHistory] = useState(false);
@@ -3397,8 +3528,6 @@ export default function Page() {
       setLoading(false);
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
       getSaintsLockAccess(user?.id ?? null).then((a) => mounted && setSaintsLockAccess(a));
-      getSubscriptionAccess(user?.id ?? null).then((a) => mounted && setSubscriptionAccess(a));
-      getUnlockedTicketIds(user?.id ?? null).then((s) => mounted && setPaidUnlockedTicketIds(s));
     });
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
@@ -3408,8 +3537,6 @@ export default function Page() {
       setRegisteredAt(user?.created_at ?? null);
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
       getSaintsLockAccess(user?.id ?? null).then((a) => mounted && setSaintsLockAccess(a));
-      getSubscriptionAccess(user?.id ?? null).then((a) => mounted && setSubscriptionAccess(a));
-      getUnlockedTicketIds(user?.id ?? null).then((s) => mounted && setPaidUnlockedTicketIds(s));
     });
 
     return () => {
@@ -3441,44 +3568,6 @@ export default function Page() {
         // eslint-disable-next-line no-console
         console.error('[Odd Saint] Failed to load trial policy, using defaults:', err);
       });
-  }, []);
-
-  // Pesapal is the PRIMARY checkout provider, but unlike PawaPay it
-  // normally confirms via server-to-server IPN, not a client-visible poll —
-  // so a dropped/misconfigured IPN could otherwise strand a paying
-  // customer with no feedback. Pesapal appends OrderTrackingId to the
-  // callback URL on redirect (see callbackUrl in /api/checkout/route.ts),
-  // so this checks for it once on mount and polls the same generalized
-  // status endpoint PawaPay already used, as an independent safety net
-  // alongside the IPN webhook.
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const params = new URLSearchParams(window.location.search);
-    const orderTrackingId = params.get('OrderTrackingId');
-    if (!orderTrackingId) return;
-
-    let attempts = 0;
-    const maxAttempts = 24; // ~2 minutes at 5s intervals
-    const interval = setInterval(async () => {
-      attempts++;
-      try {
-        const res = await fetch(
-          `/api/checkout/status?provider=pesapal&orderTrackingId=${encodeURIComponent(orderTrackingId)}`
-        );
-        const data = await res.json();
-        if (data.status === 'COMPLETED') {
-          clearInterval(interval);
-          window.location.href = window.location.pathname; // drop the query params, then reload fresh state
-        } else if (data.status === 'FAILED' || data.status === 'REVERSED' || data.status === 'INVALID') {
-          clearInterval(interval);
-        } else if (attempts >= maxAttempts) {
-          clearInterval(interval);
-        }
-      } catch {
-        // transient network hiccup — let the next poll attempt retry
-      }
-    }, 5000);
-    return () => clearInterval(interval);
   }, []);
 
   // Signed-up users get a fresh trial window from their account creation
@@ -3519,20 +3608,13 @@ export default function Page() {
     setAdReady(false);
   }
 
-  // Real pay-per-ticket unlock: opens the pricing modal in 'ticket_unlock'
-  // mode for this specific ticket. Previously this just set local React
-  // state directly and unlocked the ticket for free — see
-  // src/lib/plans.ts (TICKET_UNLOCK_PRICE_USD), src/lib/grantAccess.ts
-  // (the 'ticket_unlock' branch), and supabase/migrations/004_ticket_unlocks.sql
-  // for the real, persisted, paid version.
   function handlePayPerTicket(ticketId: string) {
-    setUnlockTicketId(ticketId);
-    setPricingProduct('ticket_unlock');
-    setShowPricing(true);
+    // Wire this up to your payment provider (Stripe, Paystack, etc.).
+    // On success, mark the ticket unlocked for this session.
+    setUnlocks((prev) => ({ ...prev, [ticketId]: true }));
   }
 
   function handleSubscribe(ticket?: Ticket) {
-    setUnlockTicketId(null);
     setPricingProduct(ticket?.tier === 'saints_lock' ? 'saints_lock' : 'subscription');
     setShowPricing(true);
   }
@@ -3570,11 +3652,6 @@ export default function Page() {
   const bronzeCountToday = tickets.filter((t) => t.tier === 'bronze').length;
   const goldCountToday = tickets.filter((t) => t.tier === 'gold').length;
   const saintsLockTickets = tickets.filter((t) => t.tier === 'saints_lock');
-  // The main feed always requests "today" (UTC) — see fetchTickets()'s
-  // default param in dataFetcher.ts. Computed once per render so the
-  // release badge's carried-forward comparison stays consistent across
-  // every ticket rendered in this pass.
-  const todayKeyUTC = ticketDateKey(new Date());
 
   return (
     <div style={{ minHeight: '100vh', background: COLORS.bg, color: COLORS.textPrimary, paddingBottom: 76 }}>
@@ -3594,8 +3671,8 @@ export default function Page() {
         <Logo light />
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <button
-            onClick={() => setShowTeamSearch(true)}
-            aria-label="Search a team"
+            onClick={() => setShowSearch(true)}
+            aria-label="Search teams or past tickets"
             style={{
               background: 'rgba(255,255,255,0.12)',
               border: '1px solid rgba(255,255,255,0.4)',
@@ -3732,13 +3809,11 @@ export default function Page() {
         >
           {isAdmin
             ? 'Admin account — every ticket, every tier, including Saint\'s Lock, is unlocked for you automatically.'
-            : subscriptionAccess.active
-            ? 'Your subscription is active — every tier is unlocked.'
             : trialActive
             ? userEmail
               ? `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Weekly Titan stays free forever now that you're signed in.`
               : `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Every ticket is unlocked, no account needed.`
-            : 'Your free trial has ended. The Mega Day Ticket stays free forever — unlock premium tiers with an ad, a per-ticket unlock, or a subscription.'}
+            : 'Your free trial has ended. The Mega Day Ticket stays free forever — unlock premium tiers with an ad, a micro-fee, or a subscription.'}
         </div>
 
         {!isAdmin && (
@@ -3787,12 +3862,10 @@ export default function Page() {
               key={item.ticket.id}
               ticket={item.ticket}
               trialActive={trialActive}
-              unlocked={!!unlocks[item.ticket.id] || paidUnlockedTicketIds.has(item.ticket.id)}
+              unlocked={!!unlocks[item.ticket.id]}
               isSignedIn={!!userEmail}
               isAdmin={isAdmin}
               hasSaintsLockAccess={saintsLockAccess.active}
-              hasSubscriptionAccess={subscriptionAccess.active}
-              requestedDateKey={todayKeyUTC}
               onWatchAd={handleWatchAd}
               onSubscribe={() => handleSubscribe(item.ticket)}
               onPayPerTicket={handlePayPerTicket}
@@ -3833,8 +3906,20 @@ export default function Page() {
         <MatchAnalysisModal match={selectedMatch} onClose={() => setSelectedMatch(null)} />
       )}
 
-      {/* Team history search — queries the team_match_history view directly */}
-      {showTeamSearch && <TeamSearchModal onClose={() => setShowTeamSearch(false)} />}
+      {/* Unified search — team lookup (team_match_history view) plus
+          date-based ticket search. Date search reuses the same access rule
+          as the ticket archive (admin unlimited, subscriber lookback
+          window, everyone else sees an upgrade prompt on that tab instead
+          of the tab being hidden) — see SearchModal above. */}
+      {showSearch && (
+        <SearchModal
+          onClose={() => setShowSearch(false)}
+          archiveAccess={archiveAccess}
+          isAdmin={isAdmin}
+          onEditAsAdmin={setEditingTicket}
+          onSubscribe={() => handleSubscribe()}
+        />
+      )}
 
       {/* Ticket archive — trigger only renders for admin/subscriber, but the
           real security boundary is Supabase RLS on the admins/subscribers
@@ -3854,7 +3939,6 @@ export default function Page() {
           userId={userId}
           userEmail={userEmail}
           product={pricingProduct}
-          ticketId={unlockTicketId}
         />
       )}
 
