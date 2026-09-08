@@ -198,20 +198,13 @@ function hashSeed(str: string): number {
 }
 
 /**
- * Calendar date as 'YYYY-MM-DD', used as the root of every day's seed AND
- * as the exact key queried against Supabase's `ticket_date` column.
- *
- * IMPORTANT — this MUST use UTC, not the browser's local timezone.
- * scripts/generate-tickets.mjs writes `ticket_date` using
- * `d.toISOString().slice(0, 10)`, which is a UTC calendar date. Previously
- * this function used local getFullYear()/getMonth()/getDate(), so for any
- * visitor outside UTC+0 there was a multi-hour window around local
- * midnight where the frontend's "today" and the pipeline's "today"
- * disagreed by one day — the Supabase query for real tickets would return
- * nothing, silently falling back to mock data even though real rows
- * existed for the correct (UTC) date. Using UTC here keeps this the single
- * source of truth for "what day is it" across both the query path and the
- * mock generator's seeding, matching the pipeline exactly.
+ * Calendar date as 'YYYY-MM-DD', in UTC — matches how the pipeline writes
+ * ticket_date (scripts/generate-tickets.mjs's dateStr(), which uses
+ * toISOString().slice(0,10), i.e. UTC). MUST stay UTC-based: using local
+ * date methods here caused a real bug — any visitor in a timezone ahead of
+ * UTC (e.g. UTC+3) has their local calendar day roll over before the UTC
+ * day does, so for that window every "today" query asked Supabase for a
+ * ticket_date that didn't exist yet, silently falling back to mock data.
  */
 export function dateKey(date: Date): string {
   const y = date.getUTCFullYear();
@@ -569,23 +562,11 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
 /**
  * Fetch all of today's tickets — real pipeline data if available, mock data
  * otherwise (e.g. before the daily generation job has run for this date).
- *
- * Falls back to the PREVIOUS UTC day's real tickets before giving up to
- * mock data, since the generation pipeline runs on a schedule (06:00 /
- * 14:00 UTC) — there's a real window early in a UTC day where today's
- * batch genuinely hasn't landed yet, and showing yesterday's real, graded
- * tickets is more honest than switching to placeholder mock data.
  */
 export async function fetchTickets(date: Date = new Date()): Promise<Ticket[]> {
   try {
     const real = await fetchRealTicketsForDate(date);
-    if (real) return real;
-
-    const previousDay = new Date(date.getTime() - 24 * 60 * 60 * 1000);
-    const carriedForward = await fetchRealTicketsForDate(previousDay);
-    if (carriedForward) return carriedForward;
-
-    return getTicketsForDate(date);
+    return real ?? getTicketsForDate(date);
   } catch (err) {
     // Last-resort safety net — no matter what goes wrong upstream, the
     // ticket feed should never end up silently empty.
