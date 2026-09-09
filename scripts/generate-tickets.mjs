@@ -124,9 +124,13 @@ export const MAJORS_ID_OFFSET = 10_000_000_000;
 
 // Named priority leagues break ties when ASSEMBLING lengthy-tier tickets
 // from the priced pool — see the final sort at the end of
-// fetchPricedFixtures. Scoped to the LENGTHY pool only now; the majors pool
-// has no equivalent tie-break since all 12 of its competitions are already
-// "priority" by construction.
+// fetchPricedFixtures. ALSO doubles as the cross-pool fallback allowlist
+// (see poolWithFallback below): when a tier's primary pool is too thin to
+// assemble a slip on a given day, only these leagues are eligible to be
+// borrowed from the other pool. Both uses share one list deliberately —
+// "leagues trusted enough to break a tie" and "leagues trusted enough to
+// substitute in in a pinch" should be the same bar, not two lists to keep
+// in sync.
 const PRIORITY_LEAGUE_NAMES = new Set([
   'UEFA Europa League',
   'Scottish Premiership',
@@ -557,7 +561,47 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
 
 const SAINTS_LOCK_MIN_CONFIDENCE = 85;
 
-function buildSaintsLockTickets(majorsPool, usageCount, today, slot) {
+/**
+ * Cross-pool fallback source for a given tier config — used ONLY when the
+ * tier's primary pool can't assemble a valid slip on its own (see
+ * assembleSlipForTier below). Majors tiers may borrow the lengthy pool's
+ * PRIORITY_LEAGUE_NAMES fixtures (the same top-flight leagues already
+ * trusted for tie-breaking); lengthy-daily tiers may borrow the ENTIRE
+ * majors pool, since every majors-pool league is already top-flight by
+ * construction and needs no further filtering. Weekly tiers have no
+ * fallback here — the majors pool only covers today, not the weekly
+ * lookahead window, so it isn't a valid substitute for those dates.
+ */
+function crossPoolFallbackFor(config, majorsPool, lengthyDailyPool) {
+  if (config.pool === 'majors') {
+    return lengthyDailyPool.filter((f) => PRIORITY_LEAGUE_NAMES.has(f.league));
+  }
+  if (config.pool === 'lengthy_daily') {
+    return majorsPool;
+  }
+  return []; // 'lengthy_weekly' — no cross-pool fallback, see comment above
+}
+
+/**
+ * Tries the tier's primary pool first; only if that fails to assemble a
+ * valid slip does it retry once with the primary pool PLUS the restricted
+ * cross-pool fallback set. Returns { picks, usedFallback } so callers can
+ * log when a day's ticket actually depended on the fallback path.
+ */
+function assembleSlipForTier(config, primaryPool, majorsPool, lengthyDailyPool, usageCount, targetRange) {
+  const primaryFiltered = poolForTier(primaryPool, config.tier);
+  let picks = pickFixturesForSlip(primaryFiltered, config.matchCount, usageCount, targetRange);
+  if (picks.length > 0) return { picks, usedFallback: false };
+
+  const fallbackExtra = crossPoolFallbackFor(config, majorsPool, lengthyDailyPool);
+  if (fallbackExtra.length === 0) return { picks: [], usedFallback: false };
+
+  const augmented = poolForTier([...primaryPool, ...fallbackExtra], config.tier);
+  picks = pickFixturesForSlip(augmented, config.matchCount, usageCount, targetRange);
+  return { picks, usedFallback: picks.length > 0 };
+}
+
+function buildSaintsLockTickets(majorsPool, lengthyDailyPool, usageCount, today, slot) {
   const config = TIER_CONFIG.find((c) => c.tier === 'saints_lock');
   const [minOdds, maxOdds] = TIER_ODDS_TARGET.saints_lock;
 
@@ -581,6 +625,21 @@ function buildSaintsLockTickets(majorsPool, usageCount, today, slot) {
         `Saint's Lock: no fixture cleared ${SAINTS_LOCK_MIN_CONFIDENCE}% today — ` +
           `using best available (${fallback[0].confidence}%) to meet the minimum-1-per-day guarantee.`
       );
+    } else {
+      // Majors pool had NOTHING in range at all (not just below the
+      // confidence bar) — try the cross-pool fallback set (the lengthy
+      // pool's PRIORITY_LEAGUE_NAMES leagues only) before giving up.
+      const crossPool = lengthyDailyPool.filter((f) => PRIORITY_LEAGUE_NAMES.has(f.league));
+      const crossPoolFallback = crossPool.filter(inOddsRange).sort((a, b) => b.confidence - a.confidence);
+      if (crossPoolFallback.length > 0) {
+        qualifying = [crossPoolFallback[0]];
+        usedFallback = true;
+        // eslint-disable-next-line no-console
+        console.warn(
+          `Saint's Lock: majors pool empty in odds range — borrowed from the lengthy pool's ` +
+            `predictable-leagues set instead (${crossPoolFallback[0].league}, ${crossPoolFallback[0].confidence}%).`
+        );
+      }
     }
   }
 
@@ -626,7 +685,7 @@ function buildTickets(majorsPool, lengthyDailyPool, lengthyWeeklyPool, slipState
 
   const saintsLockSlot = nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get('saints_lock'));
   if (saintsLockSlot !== null) {
-    const saintsLock = buildSaintsLockTickets(majorsPool, usageCount, today, saintsLockSlot);
+    const saintsLock = buildSaintsLockTickets(majorsPool, lengthyDailyPool, usageCount, today, saintsLockSlot);
     tickets.push(...saintsLock.tickets);
     ticketMatches.push(...saintsLock.ticketMatches);
     saintsLock.fixturesUsed.forEach((f) => fixturesUsed.set(f.fixtureId, f));
@@ -650,13 +709,22 @@ function buildTickets(majorsPool, lengthyDailyPool, lengthyWeeklyPool, slipState
     }
 
     const basePool = poolForConfig(config);
-    const pool = poolForTier(basePool, config.tier);
     const targetRange = TIER_ODDS_TARGET[config.tier] ?? null;
 
-    const picks = pickFixturesForSlip(pool, config.matchCount, usageCount, targetRange);
+    const { picks, usedFallback } = assembleSlipForTier(
+      config,
+      basePool,
+      majorsPool,
+      lengthyDailyPool,
+      usageCount,
+      targetRange
+    );
     if (picks.length === 0) {
       console.log(`${config.label}: couldn't assemble a valid combination this run — skipping this slip.`);
       return;
+    }
+    if (usedFallback) {
+      console.log(`${config.label}: primary pool was too thin — filled using cross-pool fallback (predictable leagues only).`);
     }
 
     picks.forEach((p) => {
