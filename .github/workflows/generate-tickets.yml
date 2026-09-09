@@ -28,6 +28,10 @@ jobs:
 
       - name: Generate today's tickets
         env:
+          # Majors pool (Mega/Bronze/Silver/Gold/Saint's Lock):
+          FOOTBALL_DATA_ORG_TOKEN: ${{ secrets.FOOTBALL_DATA_ORG_TOKEN }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          # Lengthy pool (Platinum/Diamond/Weekly Lite/Weekly Titan) — unchanged:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
