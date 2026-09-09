@@ -278,6 +278,8 @@ async function fetchPricedFixtures(dates, maxOddsLookups) {
 
   for (const d of dates) {
     const fixtures = await getFixturesForDate(d);
+    // eslint-disable-next-line no-console
+    console.log(`API-Football returned ${fixtures.length} raw fixture(s) for ${d} (before league-allowlist filtering, currently ${LEAGUE_ALLOWLIST.size} league(s) in the allowlist).`);
     const eligible = fixtures.filter(
       (f) =>
         LEAGUE_ALLOWLIST.has(f.league?.id) &&
@@ -395,6 +397,9 @@ async function fetchPricedFixturesFromMajors(todayStr) {
     console.warn('football-data.org fixture fetch failed — majors pool will be empty this run:', err.message);
     return [];
   }
+
+  // eslint-disable-next-line no-console
+  console.log(`football-data.org returned ${fdoMatches.length} raw match(es) for ${todayStr} across all 12 competitions.`);
 
   const fdoByCompetition = new Map(); // fdoCode -> matches[]
   fdoMatches.forEach((m) => {
