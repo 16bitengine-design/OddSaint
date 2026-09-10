@@ -13,17 +13,25 @@
 // heuristic derived from bookmaker consensus odds (implied probability,
 // averaged across every bookmaker in the response and de-vigged — see
 // collectConsensusOutcomes in lib/markets.mjs), not a trained model, and not
-// social/public sentiment (this pipeline has no integration with any social
-// or news-sentiment provider — that would be a separate, explicitly-scoped
-// addition). That's a legitimate, defensible basis for a confidence figure —
-// real bookmaker odds reflect real aggregated money, which is the closest
-// honest proxy to "public sentiment" this pipeline has access to — but it's
-// intentionally simple. Tune the SELECTION STRATEGY section below as your
-// picks strategy matures.
+// social/public sentiment (X/Twitter and Reddit's APIs were both checked and
+// ruled out — X's free tier is write-only, Reddit's free tier is explicitly
+// non-commercial-use-only, neither fits a free-tier paid product). That's a
+// legitimate, defensible basis for a confidence figure — real bookmaker odds
+// reflect real aggregated money — but it's intentionally simple.
+//
+// As of this update, bookmaker consensus is also cross-checked against Odd
+// Saint's OWN first-party expected-goals model (see lib/teamModel.mjs),
+// built entirely from graded fixtures already in Supabase — free, and
+// answerable to nobody's pricing page. The own model can only ever FLAG a
+// pick as too uncertain when it disagrees sharply with the bookmaker
+// consensus; it never adds confidence on its own, and it silently steps
+// aside (no effect on the pick) whenever it doesn't have enough graded
+// history for one of the two teams yet. See crossCheckWithOwnModel below.
 // ---------------------------------------------------------------------------
 import { getFixturesForDate, getOddsForFixture } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { collectConsensusOutcomes } from './lib/markets.mjs';
+import { getOwnModelForFixture } from './lib/teamModel.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -264,6 +272,64 @@ function isExcluded(homeTeam, awayTeam) {
   return EXCLUDED_TEAMS.has(homeTeam) || EXCLUDED_TEAMS.has(awayTeam);
 }
 
+// How far apart Odd Saint's own expected-goals model and the bookmaker
+// consensus can sit (in percentage points of implied probability) before
+// the pick is treated as too uncertain and the fixture is skipped. This is
+// the ONLY thing the own model is allowed to do — subtract confidence by
+// flagging disagreement, never add it. Kept as an experiment-tagged
+// constant (like MIN_CONFIDENCE) rather than a guarantee — tune it against
+// scripts/analyze-performance.mjs once enough graded history has
+// accumulated to see whether flagged fixtures actually correlated with
+// real misses.
+const OWN_MODEL_DISAGREEMENT_THRESHOLD = 0.3; // 30 percentage points
+
+/**
+ * Cross-checks a bookmaker-chosen market against Odd Saint's own
+ * first-party expected-goals model (lib/teamModel.mjs) — Option A from the
+ * integration note in that file: a pure cross-check, never a confidence
+ * boost.
+ *
+ * Three possible outcomes, all logged for visibility:
+ *   1. Model has insufficient graded history for one of the two teams
+ *      (the common case, especially early on) → passes through untouched,
+ *      identical behavior to before this existed.
+ *   2. Model agrees with the bookmaker within OWN_MODEL_DISAGREEMENT_THRESHOLD
+ *      → passes, pick proceeds as normal.
+ *   3. Model disagrees sharply → fails, the fixture is skipped entirely
+ *      for this run rather than shipping a pick two independent sources
+ *      can't agree on.
+ */
+async function crossCheckWithOwnModel(supabase, { league, homeTeam, awayTeam, market, bookmakerConfidence }) {
+  const model = await getOwnModelForFixture(supabase, { league, homeTeam, awayTeam });
+  if (!model.available) {
+    return { passed: true, reason: `No own-model data yet: ${model.reason}`, hadModel: false };
+  }
+
+  const modelProbability = model.probabilities[market];
+  if (modelProbability === undefined) {
+    return { passed: true, reason: `Own model has no probability for market "${market}"`, hadModel: false };
+  }
+
+  const bookmakerProbability = bookmakerConfidence / 100;
+  const gap = Math.abs(modelProbability - bookmakerProbability);
+
+  if (gap > OWN_MODEL_DISAGREEMENT_THRESHOLD) {
+    return {
+      passed: false,
+      hadModel: true,
+      reason:
+        `Own model (${Math.round(modelProbability * 100)}%) vs bookmaker consensus (${bookmakerConfidence}%) ` +
+        `disagree by ${Math.round(gap * 100)} points on "${market}" for ${homeTeam} vs ${awayTeam} — skipping.`,
+    };
+  }
+
+  return {
+    passed: true,
+    hadModel: true,
+    reason: `Own model agrees within tolerance (${Math.round(modelProbability * 100)}% vs ${bookmakerConfidence}%)`,
+  };
+}
+
 /**
  * Fetches and prices fixtures for the given dates, spending up to
  * `maxOddsLookups` /odds requests total.
@@ -290,11 +356,17 @@ function isExcluded(homeTeam, awayTeam) {
  * through to pickMarketFromOdds so market selection can favor variety
  * instead of mechanically defaulting to whichever market sorts cheapest —
  * see pickMarketFromOdds for why that mattered.
+ *
+ * `supabase` is threaded through here purely so crossCheckWithOwnModel can
+ * query team_match_history/fixtures for the own-model cross-check — this
+ * function still makes zero writes of its own.
  */
-async function fetchPricedFixtures(dates, maxOddsLookups, marketUsageCount) {
+async function fetchPricedFixtures(supabase, dates, maxOddsLookups, marketUsageCount) {
   const seen = new Map(); // fixtureId -> priced fixture
   let oddsLookupsUsed = 0;
   const leagueBreakdown = new Map(); // league name -> count actually priced (for the run summary log)
+  let ownModelFlaggedCount = 0;
+  let ownModelAvailableCount = 0;
 
   for (const d of dates) {
     const fixtures = await getFixturesForDate(d);
@@ -364,12 +436,31 @@ async function fetchPricedFixtures(dates, maxOddsLookups, marketUsageCount) {
           const picked = pickMarketFromOdds(oddsResponse, marketUsageCount);
           if (!picked) continue; // no usable market for this fixture — skip it
 
+          const league = f.league?.name ?? 'Unknown League';
+          const homeTeam = f.teams?.home?.name ?? 'Home';
+          const awayTeam = f.teams?.away?.name ?? 'Away';
+
+          const crossCheck = await crossCheckWithOwnModel(supabase, {
+            league,
+            homeTeam,
+            awayTeam,
+            market: picked.market,
+            bookmakerConfidence: picked.confidence,
+          });
+          if (crossCheck.hadModel) ownModelAvailableCount++;
+          if (!crossCheck.passed) {
+            ownModelFlaggedCount++;
+            // eslint-disable-next-line no-console
+            console.warn(`Own-model cross-check: ${crossCheck.reason}`);
+            continue; // skip this fixture entirely for this run
+          }
+
           seen.set(fixtureId, {
             fixtureId,
             ticketDate: dateStr(new Date()),
-            league: f.league?.name ?? 'Unknown League',
-            homeTeam: f.teams?.home?.name ?? 'Home',
-            awayTeam: f.teams?.away?.name ?? 'Away',
+            league,
+            homeTeam,
+            awayTeam,
             kickoff: f.fixture?.date,
             market: picked.market,
             odds: picked.odds,
@@ -401,6 +492,13 @@ async function fetchPricedFixtures(dates, maxOddsLookups, marketUsageCount) {
     );
   }
 
+  // eslint-disable-next-line no-console
+  console.log(
+    `Own-model cross-check: had enough graded history to weigh in on ${ownModelAvailableCount} fixture(s) ` +
+      `this run, flagged ${ownModelFlaggedCount} for disagreeing with bookmaker consensus by more than ` +
+      `${Math.round(OWN_MODEL_DISAGREEMENT_THRESHOLD * 100)} points.`
+  );
+
   // Priority leagues still get first billing once fixtures are being
   // assembled into tickets (equal-confidence tie-break) — but every
   // allowlisted league with fixtures today was actually attempted above,
@@ -416,23 +514,21 @@ async function fetchPricedFixtures(dates, maxOddsLookups, marketUsageCount) {
 // A fixture is skipped entirely if nothing viable clears this confidence
 // floor — better to generate one fewer match, or even skip a slip, than to
 // force in a pick the market itself doesn't consider a clear favorite.
-// This is now the ONLY market-worthiness gate — see the "no market
-// restrictions" note below.
+// This is the primary market-worthiness gate; the own-model cross-check
+// above is a second, independent gate applied after this one.
 const MIN_CONFIDENCE = 68;
 
 // An outcome must be priced by at least this many independent bookmakers
 // (after de-vigging — see collectConsensusOutcomes in lib/markets.mjs)
 // before it's treated as "worthy" at all, regardless of how good its
-// number looks. This is deliberately the ONLY market-type gate left in
-// this pipeline: previously RESULT_BASED_MARKETS/WIN_MARKET_MIN_ODDS
-// specifically distrusted certain market TYPES (Home Win, Double Chance)
-// when priced tight — that's gone. Any market in the catalog — Home Win,
-// Double Chance, BTTS, Over/Under, whatever — is equally eligible now,
-// judged only on (a) how many bookmakers actually back that price, and
-// (b) whether the resulting confidence clears MIN_CONFIDENCE. If fewer
-// than this many bookmakers price an outcome, it's excluded regardless of
-// how safe the single number looks — one thin bookmaker's price isn't
-// "worthy" market consensus.
+// number looks. This is the only market-TYPE-agnostic gate in this
+// pipeline: any market in the catalog — Home Win, Double Chance, BTTS,
+// Over/Under, whatever — is equally eligible, judged only on (a) how many
+// bookmakers actually back that price, (b) whether the resulting
+// confidence clears MIN_CONFIDENCE, and (c) whether Odd Saint's own model
+// agrees closely enough (see crossCheckWithOwnModel). If fewer than this
+// many bookmakers price an outcome, it's excluded regardless of how safe
+// the single number looks.
 const MIN_BOOKMAKER_CONSENSUS = 2;
 
 // How far above the single cheapest viable outcome's odds a fixture's
@@ -444,11 +540,11 @@ const MIN_BOOKMAKER_CONSENSUS = 2;
 // fixture's actual scoring profile, simply because it usually sorts
 // first. Widening the comparison to "anything within 20% of the safest
 // odds" lets genuinely comparable options (BTTS, Under markets, Home Win,
-// Double Chance — no market type is excluded anymore) compete on MARKET
-// VARIETY instead of losing by a few odds-points every single time.
+// Double Chance — no market type is excluded) compete on MARKET VARIETY
+// instead of losing by a few odds-points every single time.
 const MARKET_DIVERSITY_TOLERANCE = 0.2;
 
-/** Sorts consensus outcomes by (least-used market first, then cheapest odds) — this is the diversity tie-break, applied uniformly across every market type now that none are excluded. */
+/** Sorts consensus outcomes by (least-used market first, then cheapest odds) — the diversity tie-break, applied uniformly across every market type since none are excluded. */
 function pickLeastUsedMarket(candidates, marketUsageCount) {
   return [...candidates].sort((a, b) => {
     const usedA = marketUsageCount.get(a.market) ?? 0;
@@ -463,19 +559,16 @@ function pickLeastUsedMarket(candidates, marketUsageCount) {
  * Builds a de-vigged, multi-bookmaker consensus for every market in the
  * shared catalog (Match Winner, Goals Over/Under, Both Teams Score, Double
  * Chance) against this fixture's odds — see collectConsensusOutcomes in
- * lib/markets.mjs. NO market type is excluded or specially distrusted here
- * anymore: a fixture can be picked on Home Win, Double Chance, BTTS,
- * Over/Under, or anything else in the catalog, as long as it's backed by
- * enough independent bookmakers (MIN_BOOKMAKER_CONSENSUS) and clears
- * MIN_CONFIDENCE. Among outcomes within MARKET_DIVERSITY_TOLERANCE of the
- * single cheapest one — i.e. everything the market itself considers
- * roughly equally safe for THIS fixture — picks whichever market type has
- * been used least so far this run, tie-broken by odds. That's what stops
- * the pipeline from mechanically defaulting to the same market (previously
- * almost always Over 1.5 Goals) regardless of a given league/team's actual
- * scoring tendency: real, consensus-vetted bookmaker pricing still gates
- * what's "viable" per fixture — diversity only decides among options the
- * market already confirmed are comparably safe and comparably well-backed.
+ * lib/markets.mjs. No market type is excluded or specially distrusted:
+ * a fixture can be picked on Home Win, Double Chance, BTTS, Over/Under, or
+ * anything else in the catalog, as long as it's backed by enough
+ * independent bookmakers (MIN_BOOKMAKER_CONSENSUS) and clears
+ * MIN_CONFIDENCE — and, one step later, survives the own-model cross-check
+ * (see crossCheckWithOwnModel). Among outcomes within
+ * MARKET_DIVERSITY_TOLERANCE of the single cheapest one — i.e. everything
+ * the market itself considers roughly equally safe for THIS fixture —
+ * picks whichever market type has been used least so far this run,
+ * tie-broken by odds.
  */
 function pickMarketFromOdds(oddsResponse, marketUsageCount) {
   const bookmakers = oddsResponse?.[0]?.bookmakers;
@@ -807,11 +900,11 @@ async function main() {
   const marketUsageCount = new Map();
 
   console.log('Fetching daily fixture pool...');
-  const dailyPool = await fetchPricedFixtures(dailyDates, MAX_ODDS_LOOKUPS_PER_RUN, marketUsageCount);
+  const dailyPool = await fetchPricedFixtures(supabase, dailyDates, MAX_ODDS_LOOKUPS_PER_RUN, marketUsageCount);
   console.log(`Priced ${dailyPool.length} fixtures for today.`);
 
   console.log('Fetching weekly fixture pool (for Weekly Lite / Weekly Titan)...');
-  const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN, marketUsageCount);
+  const weeklyPool = await fetchPricedFixtures(supabase, weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN, marketUsageCount);
   console.log(`Priced ${weeklyPool.length} fixtures for the week ahead.`);
 
   const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, slipState);
