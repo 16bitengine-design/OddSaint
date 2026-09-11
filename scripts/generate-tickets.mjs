@@ -19,14 +19,22 @@
 // legitimate, defensible basis for a confidence figure — real bookmaker odds
 // reflect real aggregated money — but it's intentionally simple.
 //
-// As of this update, bookmaker consensus is also cross-checked against Odd
-// Saint's OWN first-party expected-goals model (see lib/teamModel.mjs),
-// built entirely from graded fixtures already in Supabase — free, and
-// answerable to nobody's pricing page. The own model can only ever FLAG a
-// pick as too uncertain when it disagrees sharply with the bookmaker
-// consensus; it never adds confidence on its own, and it silently steps
-// aside (no effect on the pick) whenever it doesn't have enough graded
-// history for one of the two teams yet. See crossCheckWithOwnModel below.
+// Bookmaker consensus is also cross-checked against Odd Saint's OWN
+// first-party expected-goals model (see lib/teamModel.mjs), built entirely
+// from graded fixtures + proactively-backfilled team history already in
+// Supabase (see supabase/migrations/004_team_identity.sql and
+// scripts/backfill-team-history.mjs) — free, and answerable to nobody's
+// pricing page. The own model can only ever FLAG a pick as too uncertain
+// when it disagrees sharply with the bookmaker consensus; it never adds
+// confidence on its own, and it silently steps aside (no effect on the
+// pick) whenever it doesn't have enough history for one of the two teams
+// yet. See crossCheckWithOwnModel below.
+//
+// TEAM IDENTITY: every fixture priced here carries API-Football's own
+// stable numeric team IDs (f.teams.home.id / f.teams.away.id) alongside
+// team names, both persisted to Supabase's `fixtures` table. The own model
+// looks teams up by this ID, not by name text — see lib/teamModel.mjs for
+// why that distinction matters.
 // ---------------------------------------------------------------------------
 import { getFixturesForDate, getOddsForFixture } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
@@ -285,22 +293,28 @@ const OWN_MODEL_DISAGREEMENT_THRESHOLD = 0.3; // 30 percentage points
 
 /**
  * Cross-checks a bookmaker-chosen market against Odd Saint's own
- * first-party expected-goals model (lib/teamModel.mjs) — Option A from the
- * integration note in that file: a pure cross-check, never a confidence
- * boost.
+ * first-party expected-goals model (lib/teamModel.mjs) — a pure
+ * cross-check, never a confidence boost.
  *
  * Three possible outcomes, all logged for visibility:
- *   1. Model has insufficient graded history for one of the two teams
- *      (the common case, especially early on) → passes through untouched,
- *      identical behavior to before this existed.
+ *   1. Model has insufficient graded/backfilled history for one of the two
+ *      teams (still common while scripts/backfill-team-history.mjs works
+ *      through its gradual cycle) → passes through untouched, identical
+ *      behavior to before the own model existed.
  *   2. Model agrees with the bookmaker within OWN_MODEL_DISAGREEMENT_THRESHOLD
  *      → passes, pick proceeds as normal.
  *   3. Model disagrees sharply → fails, the fixture is skipped entirely
  *      for this run rather than shipping a pick two independent sources
  *      can't agree on.
  */
-async function crossCheckWithOwnModel(supabase, { league, homeTeam, awayTeam, market, bookmakerConfidence }) {
-  const model = await getOwnModelForFixture(supabase, { league, homeTeam, awayTeam });
+async function crossCheckWithOwnModel(supabase, { league, homeTeamId, awayTeamId, homeTeam, awayTeam, market, bookmakerConfidence }) {
+  const model = await getOwnModelForFixture(supabase, {
+    league,
+    homeTeamId,
+    awayTeamId,
+    homeTeamName: homeTeam,
+    awayTeamName: awayTeam,
+  });
   if (!model.available) {
     return { passed: true, reason: `No own-model data yet: ${model.reason}`, hadModel: false };
   }
@@ -439,9 +453,13 @@ async function fetchPricedFixtures(supabase, dates, maxOddsLookups, marketUsageC
           const league = f.league?.name ?? 'Unknown League';
           const homeTeam = f.teams?.home?.name ?? 'Home';
           const awayTeam = f.teams?.away?.name ?? 'Away';
+          const homeTeamId = f.teams?.home?.id ?? null;
+          const awayTeamId = f.teams?.away?.id ?? null;
 
           const crossCheck = await crossCheckWithOwnModel(supabase, {
             league,
+            homeTeamId,
+            awayTeamId,
             homeTeam,
             awayTeam,
             market: picked.market,
@@ -461,6 +479,8 @@ async function fetchPricedFixtures(supabase, dates, maxOddsLookups, marketUsageC
             league,
             homeTeam,
             awayTeam,
+            homeTeamId,
+            awayTeamId,
             kickoff: f.fixture?.date,
             market: picked.market,
             odds: picked.odds,
@@ -494,7 +514,7 @@ async function fetchPricedFixtures(supabase, dates, maxOddsLookups, marketUsageC
 
   // eslint-disable-next-line no-console
   console.log(
-    `Own-model cross-check: had enough graded history to weigh in on ${ownModelAvailableCount} fixture(s) ` +
+    `Own-model cross-check: had enough history to weigh in on ${ownModelAvailableCount} fixture(s) ` +
       `this run, flagged ${ownModelFlaggedCount} for disagreeing with bookmaker consensus by more than ` +
       `${Math.round(OWN_MODEL_DISAGREEMENT_THRESHOLD * 100)} points.`
   );
@@ -920,6 +940,8 @@ async function main() {
     league: f.league,
     home_team: f.homeTeam,
     away_team: f.awayTeam,
+    home_team_id: f.homeTeamId ?? null,
+    away_team_id: f.awayTeamId ?? null,
     kickoff: f.kickoff,
     market: f.market,
     odds: f.odds,
