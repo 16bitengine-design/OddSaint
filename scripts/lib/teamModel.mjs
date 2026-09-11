@@ -6,9 +6,19 @@
 // Reddit's free tier is explicitly non-commercial-use-only, which rules it
 // out for a paid product regardless of rate limits. This module is the
 // honest alternative: a real statistical signal built entirely from data
-// Odd Saint already owns (graded fixtures in Supabase), costing nothing,
-// answerable to nobody's pricing page, and growing more reliable every day
-// the pipeline runs.
+// Odd Saint already owns (graded fixtures + backfilled team history in
+// Supabase — see supabase/migrations/004_team_identity.sql and
+// scripts/backfill-team-history.mjs), costing nothing, answerable to
+// nobody's pricing page, and growing more reliable every day the pipeline
+// runs.
+//
+// TEAM IDENTITY: every lookup here is keyed by API-Football's own stable
+// numeric team ID (see migration 004), not by team name text. Name
+// matching is fragile — "Manchester United" vs "Man United" vs "Man
+// Utd" would silently under-count a team's real history — while the ID is
+// the same one API-Football uses across fixtures, odds, and team
+// endpoints, so it's the honest "unique identifier that works across any
+// site/page" this module needs.
 //
 // METHOD: classic expected-goals (xG) modeling via the Poisson distribution
 // — a transparent, well-established technique (not a trained/black-box
@@ -16,7 +26,7 @@
 // heuristic" positioning (see the HONEST SCOPE NOTE in generate-tickets.mjs).
 //
 //   1. Each team's recent goal-scoring/conceding rate is read from
-//      `team_match_history` (already split by home/away venue).
+//      `team_match_history` by team_id (already split by home/away venue).
 //   2. The league's own baseline goals-per-game is computed from graded
 //      fixtures in that league.
 //   3. Each team's rate is expressed relative to that baseline (its
@@ -26,17 +36,23 @@
 //      probabilities for Over/Under lines, BTTS, and Home/Draw/Away.
 //
 // HONEST LIMITATIONS (read before wiring this into generation):
-//   - `team_match_history` only covers teams that have actually appeared in
-//      a generated ticket before — coverage is partial, especially early
-//      in the product's life or for newly-added regional leagues.
+//   - `team_match_history` combines two sources: fixtures the pipeline has
+//      actually ticketed and graded, plus proactively backfilled results
+//      from scripts/backfill-team-history.mjs. Coverage still grows over
+//      time rather than being complete from day one — see
+//      backfill-team-history.mjs's BUDGET WARNING for why the backfill is
+//      deliberately gradual, not instant.
 //   - Small samples produce unstable estimates. This module refuses to
 //      return a confident model for either team below MIN_SAMPLE_MATCHES —
 //      it returns `null` rather than fabricating a number from 2-3 games.
+//   - If a fixture's team_id is missing (e.g. an older, pre-migration row,
+//      or a data source that didn't supply one), this module returns
+//      unavailable rather than falling back to name matching — the whole
+//      point of the ID-based approach is not reintroducing that fragility.
 //   - This model has NO knowledge of injuries, suspensions, lineup news,
 //      weather, or anything a bookmaker's live market pricing already
 //      accounts for. It should supplement bookmaker consensus, not
-//      override it — see the integration note at the bottom of this file
-//      before wiring it into generate-tickets.mjs.
+//      override it — see the integration note at the bottom of this file.
 // ---------------------------------------------------------------------------
 
 // A team needs at least this many graded matches (at the relevant venue —
@@ -47,7 +63,7 @@ const MIN_SAMPLE_MATCHES = 5;
 
 // How far back to look for both the team's own profile and the league
 // baseline — recent form matters more than a full season, and this keeps
-// query size bounded as fixtures accumulate over time.
+// query size bounded as history accumulates over time.
 const TEAM_LOOKBACK_MATCHES = 15;
 const LEAGUE_BASELINE_LOOKBACK_DAYS = 120;
 
@@ -66,19 +82,22 @@ function poissonPMF(k, lambda) {
 
 /**
  * Reads a team's goal-scoring profile at a specific venue from the
- * `team_match_history` view (see supabase/schema.sql) — most recent
- * TEAM_LOOKBACK_MATCHES games at that venue only, since home and away
- * scoring rates are genuinely different and shouldn't be blended.
+ * `team_match_history` view (see supabase/migrations/004_team_identity.sql)
+ * — most recent TEAM_LOOKBACK_MATCHES games at that venue only, since home
+ * and away scoring rates are genuinely different and shouldn't be blended.
+ * Queried by team_id, NOT team name — see the TEAM IDENTITY note above.
  *
- * Returns null if fewer than MIN_SAMPLE_MATCHES are on record — the
- * caller must treat that as "no model available for this fixture," not
- * as zero goals.
+ * Returns null if teamId is missing, or fewer than MIN_SAMPLE_MATCHES are
+ * on record — the caller must treat that as "no model available for this
+ * fixture," not as zero goals.
  */
-async function getTeamVenueProfile(supabase, teamName, venue) {
+async function getTeamVenueProfile(supabase, teamId, venue) {
+  if (!teamId) return null;
+
   const { data, error } = await supabase
     .from('team_match_history')
     .select('goals_for, goals_against')
-    .eq('team', teamName)
+    .eq('team_id', teamId)
     .eq('venue', venue)
     .order('kickoff', { ascending: false })
     .limit(TEAM_LOOKBACK_MATCHES);
@@ -177,19 +196,33 @@ function probabilitiesFromExpectedGoals(homeXG, awayXG) {
  *
  * `available: false` is the expected, normal outcome for most fixtures
  * early on — most teams simply won't have MIN_SAMPLE_MATCHES of graded
- * home/away history yet. Callers MUST treat that as "no second opinion for
- * this fixture," not as a signal to skip the fixture — the bookmaker
+ * home/away history yet, and the backfill (scripts/backfill-team-history.mjs)
+ * is deliberately gradual. Callers MUST treat that as "no second opinion
+ * for this fixture," not as a signal to skip the fixture — the bookmaker
  * consensus in lib/markets.mjs remains fully sufficient on its own.
+ *
+ * `homeTeamId`/`awayTeamId` MUST be API-Football's own numeric team IDs
+ * (see f.teams.home.id / f.teams.away.id in a /fixtures response) — not
+ * team names. If either is missing, this returns unavailable rather than
+ * falling back to name matching.
  */
-export async function getOwnModelForFixture(supabase, { league, homeTeam, awayTeam }) {
+export async function getOwnModelForFixture(supabase, { league, homeTeamId, awayTeamId, homeTeamName, awayTeamName }) {
+  if (!homeTeamId || !awayTeamId) {
+    return { available: false, reason: 'Missing team ID for one or both sides — cannot look up history reliably.' };
+  }
+
   const [homeProfile, awayProfile, baseline] = await Promise.all([
-    getTeamVenueProfile(supabase, homeTeam, 'home'),
-    getTeamVenueProfile(supabase, awayTeam, 'away'),
+    getTeamVenueProfile(supabase, homeTeamId, 'home'),
+    getTeamVenueProfile(supabase, awayTeamId, 'away'),
     getLeagueBaseline(supabase, league),
   ]);
 
-  if (!homeProfile) return { available: false, reason: `Insufficient home-venue history for ${homeTeam}` };
-  if (!awayProfile) return { available: false, reason: `Insufficient away-venue history for ${awayTeam}` };
+  if (!homeProfile) {
+    return { available: false, reason: `Insufficient home-venue history for ${homeTeamName ?? `team ${homeTeamId}`}` };
+  }
+  if (!awayProfile) {
+    return { available: false, reason: `Insufficient away-venue history for ${awayTeamName ?? `team ${awayTeamId}`}` };
+  }
 
   // Attack/defense strength relative to the league's own baseline — e.g. a
   // home team that scores 30% more than the league's home-scoring average
@@ -222,32 +255,12 @@ export async function getOwnModelForFixture(supabase, { league, homeTeam, awayTe
 }
 
 // ---------------------------------------------------------------------------
-// INTEGRATION NOTE — not wired into generate-tickets.mjs yet, deliberately.
-//
-// This changes what paying subscribers see as "confident" picks, so it
-// needs your sign-off on the blend approach before it goes live, not just
-// a silent drop-in. Two reasonable ways to use it once you're ready:
-//
-//   A) CROSS-CHECK ONLY (safer): after pickMarketFromOdds chooses a market
-//      from bookmaker consensus, call getOwnModelForFixture and compare its
-//      probability for that SAME market against the bookmaker figure. If
-//      they're wildly apart (e.g. the model says 40% but the bookmaker
-//      consensus implies 75%), treat that as a red flag and either skip the
-//      fixture or log it for review — the model never adds confidence on
-//      its own, it only ever subtracts it. Lowest risk, easiest to reason
-//      about, doesn't change the current confidence math when the model
-//      isn't available.
-//
-//   B) BLENDED CONFIDENCE: average the bookmaker's de-vigged probability
-//      with the model's probability (e.g. 75% bookmaker weight / 25% model
-//      weight) when both are available for the chosen market, and fall
-//      back to pure bookmaker consensus when the model returns
-//      `available: false`. More like a genuine "second opinion" but a
-//      bigger behavior change — worth backtesting against
-//      scripts/analyze-performance.mjs before trusting it live, the same
-//      way you'd backtest a MIN_CONFIDENCE change.
-//
-// Recommend starting with (A) for a few weeks, then deciding on (B) once
-// there's real graded-outcome data to check whether the model's flags
-// actually correlated with real misses.
+// INTEGRATION NOTE — already wired into generate-tickets.mjs as a
+// cross-check (Option A: the own model can only flag a bookmaker-chosen
+// pick as too uncertain, never add confidence on its own — see
+// crossCheckWithOwnModel in generate-tickets.mjs). Once enough graded
+// history has accumulated, scripts/analyze-performance.mjs is the place to
+// check whether flagged fixtures actually correlated with real misses,
+// before considering the blended-confidence approach (Option B) described
+// in earlier notes.
 // ---------------------------------------------------------------------------
