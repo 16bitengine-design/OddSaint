@@ -1,0 +1,34 @@
+name: Odd Saint — Self-Tune (Bounded Auto-Adjust)
+
+# Weekly, after a full week of new graded results has accumulated —
+# Sunday 05:00 UTC. Can also be triggered manually from the Actions tab.
+#
+# This job only ever writes to Supabase's `tuning_state` / `tuning_log`
+# tables (see scripts/self-tune.mjs and supabase/migrations/
+# 004_self_improvement.sql) — it never touches git, so it needs no
+# `contents: write` permission and can never fail a build or open a PR.
+on:
+  schedule:
+    - cron: '0 5 * * 0'
+  workflow_dispatch: {}
+
+jobs:
+  self-tune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run bounded auto-tuning
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/self-tune.mjs

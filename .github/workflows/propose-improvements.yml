@@ -1,0 +1,65 @@
+name: Odd Saint — Self-Improvement Proposals
+
+# Monthly (1st of the month, 04:00 UTC) — there's no reason to re-propose
+# structural changes more often than that when self-tune.mjs is already
+# handling the fast-moving, safe adjustments in between. Can also be
+# triggered manually from the Actions tab.
+#
+# Writes PROPOSALS.md and opens it as a pull request for review — same
+# bounded, human-gated pattern as ai-self-evolution.yml's dependency
+# update PRs. This workflow makes NO changes to generate-tickets.mjs,
+# markets.mjs, or any other pipeline file — the PR body/diff is the
+# entire proposal, nothing merges without a human choosing to merge it.
+on:
+  schedule:
+    - cron: '0 4 1 * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Avoids actions/checkout persisting an Authorization extraheader
+          # that collides with peter-evans/create-pull-request's own auth —
+          # paired with the explicit git config unset step below.
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate proposals
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/propose-improvements.mjs
+
+      - name: Clear stale git auth header
+        run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
+
+      - name: Open a pull request with the proposals
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: 'chore: monthly self-improvement proposals'
+          title: 'Self-improvement proposals — review needed'
+          body: |
+            Automated evidence report from `scripts/propose-improvements.mjs` — see PROPOSALS.md
+            in this PR's diff for the full breakdown.
+
+            This PR changes nothing in the actual ticket-generation pipeline. It's a report for you
+            to read and decide whether to act on — merge it to keep PROPOSALS.md as a historical
+            record, or close it without merging if there's nothing worth acting on this round.
+          branch: chore/self-improvement-proposals
+          delete-branch: true
