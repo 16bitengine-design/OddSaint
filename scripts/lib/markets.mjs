@@ -8,6 +8,17 @@
 // Each outcome has its own sane odds band (oddsMin/oddsMax). A "Double
 // Chance" pick and a "Home Win" pick have very different natural odds
 // ranges, so a single global range doesn't fit every market well.
+//
+// NOTE ON BANDS AFTER THE CONSENSUS-PRICING UPDATE BELOW: oddsMin/oddsMax
+// were originally calibrated against a single raw bookmaker price. Vig-
+// corrected consensus odds (see collectConsensusOutcomes) run somewhat
+// longer/more generous than any one bookmaker's quoted price, since the
+// bookmaker's margin has been removed — so these bands may now filter
+// slightly differently than before. This is a "watch the data, don't
+// guess" situation: scripts/self-tune.mjs and scripts/propose-
+// improvements.mjs already backtest against real graded results, so let
+// evidence decide if these need retuning rather than adjusting them
+// blindly here.
 // ---------------------------------------------------------------------------
 
 export const MARKET_CATALOG = [
@@ -58,14 +69,15 @@ export function settleMarket(marketLabel, homeScore, awayScore) {
 }
 
 /**
- * LEGACY — single-bookmaker viable-outcome collector. Superseded by
- * collectConsensusOutcomes below (which aggregates across every bookmaker
- * in the response instead of trusting whichever one happens to be first),
- * but left here in case anything still needs a raw single-bookmaker read.
- * generate-tickets.mjs no longer calls this.
- *
  * Given one bookmaker's `bets` array from an API-Football /odds response,
- * returns every outcome that's both offered and within its sane odds band.
+ * returns every outcome that's both offered and within its sane odds
+ * band, priced at that ONE bookmaker's raw quote.
+ *
+ * SUPERSEDED for real selection by collectConsensusOutcomes() below,
+ * which averages across every bookmaker and removes the vig — kept here
+ * (unused by generate-tickets.mjs as of this update) only in case
+ * something else in the repo still depends on the single-bookmaker
+ * behavior. Safe to remove once confirmed nothing else calls it.
  */
 export function collectViableOutcomes(bookmakerBets) {
   const viable = [];
@@ -86,83 +98,114 @@ export function collectViableOutcomes(bookmakerBets) {
   return viable;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-bookmaker, vig-corrected consensus pricing
+//
+// A single bookmaker's quoted odds bake in that bookmaker's own margin
+// (the "vig") and can be noisy on lower-liquidity regional leagues. This
+// removes the vig from EACH bookmaker's own odds set independently
+// (proportional devigging: normalize that bookmaker's implied
+// probabilities so they sum to 1 — i.e. remove exactly its margin, no
+// more), then averages the resulting fair probabilities across every
+// bookmaker that priced the fixture. The result is a real consensus
+// probability estimate, not one bookmaker's marked-up price.
+// ---------------------------------------------------------------------------
+
+// Outcomes backed by fewer than this many bookmakers are still returned
+// (discarding a whole fixture on a thin-liquidity league would undo the
+// point of doing this at all) but the caller gets bookmakerCount so it's
+// visible downstream, including in the fixtures table for later analysis.
+export const MIN_BOOKMAKERS_FOR_CONSENSUS = 2;
+
 /**
- * Multi-bookmaker consensus, with vig (bookmaker margin) removed before
- * averaging.
+ * Removes the vig from ONE bookmaker's odds for a single bet (e.g. every
+ * price in "Match Winner": Home/Draw/Away) via proportional devigging —
+ * each outcome's fair probability is its own implied probability (1/odds)
+ * divided by the sum of ALL implied probabilities in that bet. Outcomes
+ * this catalog doesn't track (e.g. Draw, which isn't a selectable market
+ * here) still have to be included in the sum, since they're still part of
+ * that bookmaker's overround and skipping them would under-correct the
+ * vig for the outcomes that ARE tracked.
  *
- * WHY THIS EXISTS: a single bookmaker's odds always imply slightly more
- * than 100% total probability across a bet's outcomes — that extra
- * percentage is the house's built-in margin ("the vig"), not a real signal
- * about the match. Reading only one bookmaker (the previous behavior —
- * `oddsResponse[0].bookmakers[0]`) bakes that margin straight into the
- * displayed confidence figure, and the distortion is worse for thinner,
- * lower-liquidity regional-league books where margins run wider.
+ * Returns null if the bet's odds are malformed (can't produce a sane
+ * positive total) — that bookmaker is simply skipped for this bet rather
+ * than polluting the average with garbage.
+ */
+function devigBetValues(betValues) {
+  const impliedProbs = (betValues ?? [])
+    .map((v) => ({ value: v.value, odd: parseFloat(v.odd) }))
+    .filter((v) => Number.isFinite(v.odd) && v.odd > 0)
+    .map((v) => ({ value: v.value, implied: 1 / v.odd }));
+
+  const total = impliedProbs.reduce((acc, v) => acc + v.implied, 0);
+  if (!Number.isFinite(total) || total <= 0) return null;
+
+  return impliedProbs.map((v) => ({ value: v.value, fairProb: v.implied / total }));
+}
+
+/**
+ * Given the FULL `bookmakers` array from one fixture's API-Football
+ * /odds response (i.e. `oddsResponse[0].bookmakers`, not a single
+ * bookmaker's `.bets`), returns every catalog outcome offered by at
+ * least one bookmaker, priced as a vig-corrected CONSENSUS:
  *
- * This function instead:
- *   1. For each bookmaker, computes that bookmaker's own overround (the
- *      sum of 1/odds across all outcomes of a given bet type) and divides
- *      it back out — so each bookmaker's own probabilities now genuinely
- *      sum to 100% before anything is combined across bookmakers.
- *   2. Averages the de-vigged probability for each outcome across every
- *      bookmaker that offers it.
- *   3. Converts the averaged probability back into a "fair odds" figure.
+ *   - fairProb        — average of that outcome's devigged fair
+ *                        probability across every bookmaker that priced
+ *                        its market
+ *   - odds             — 1 / fairProb, the consensus's own fair price
+ *                        (always somewhat longer than any individual
+ *                        bookmaker's raw quote, since margin is removed)
+ *   - bookmakerCount   — how many bookmakers contributed to the average
  *
- * The result is the closest honest reading available of "what does the
- * combined betting market actually believe," independent of any single
- * bookmaker's margin — the nearest real proxy this pipeline has for
- * aggregated public sentiment, since bookmaker lines move in response to
- * where real money (i.e. real people) is being placed.
- *
- * Returns: [{ market, odds, bookmakerCount }] — bookmakerCount is how many
- * independent bookmakers actually priced that outcome, which the caller
- * uses as a market-vetting floor (an outcome only one thin bookmaker
- * offers isn't "worthy" just because its number looks safe).
+ * Still filtered against each outcome's oddsMin/oddsMax band (see the
+ * file header note on why these bands may now behave slightly
+ * differently than before).
  */
 export function collectConsensusOutcomes(bookmakers) {
-  const agg = new Map(); // marketLabel -> { probSum, count }
+  if (!Array.isArray(bookmakers) || bookmakers.length === 0) return [];
 
-  for (const bookmaker of bookmakers ?? []) {
+  // marketLabel -> { probSum, count }
+  const accum = new Map();
+
+  for (const bookmaker of bookmakers) {
     for (const betDef of MARKET_CATALOG) {
       const bet = bookmaker.bets?.find((b) => b.name === betDef.betName);
-      if (!bet) continue;
+      if (!bet || !Array.isArray(bet.values) || bet.values.length === 0) continue;
 
-      // Raw implied probabilities across the FULL bet type (not just the
-      // outcomes inside our odds bands) — the overround has to be computed
-      // from everything this bookmaker offers on this bet, or the
-      // de-vig math is wrong.
-      const rawProbs = [];
+      const devigged = devigBetValues(bet.values);
+      if (!devigged) continue;
+
       for (const outcome of betDef.outcomes) {
-        const value = bet.values?.find((v) => v.value === outcome.apiValue);
-        const odds = value ? parseFloat(value.odd) : NaN;
-        if (Number.isFinite(odds) && odds > 0) {
-          rawProbs.push({ outcome, prob: 1 / odds });
-        }
-      }
-      if (rawProbs.length === 0) continue;
+        const match = devigged.find((v) => v.value === outcome.apiValue);
+        if (!match) continue;
 
-      const overround = rawProbs.reduce((sum, r) => sum + r.prob, 0);
-      if (overround <= 0) continue;
-
-      rawProbs.forEach(({ outcome, prob }) => {
-        const deviggedProb = prob / overround; // this bookmaker's own outcomes now sum to 1.0
-        const impliedFairOdds = 1 / deviggedProb;
-        if (impliedFairOdds < outcome.oddsMin || impliedFairOdds > outcome.oddsMax) return;
-
-        const key = outcome.marketLabel;
-        const entry = agg.get(key) ?? { probSum: 0, count: 0 };
-        entry.probSum += deviggedProb;
+        const entry = accum.get(outcome.marketLabel) ?? { probSum: 0, count: 0 };
+        entry.probSum += match.fairProb;
         entry.count += 1;
-        agg.set(key, entry);
+        accum.set(outcome.marketLabel, entry);
+      }
+    }
+  }
+
+  const consensus = [];
+  for (const betDef of MARKET_CATALOG) {
+    for (const outcome of betDef.outcomes) {
+      const entry = accum.get(outcome.marketLabel);
+      if (!entry || entry.count === 0) continue;
+
+      const fairProb = entry.probSum / entry.count;
+      if (!Number.isFinite(fairProb) || fairProb <= 0 || fairProb >= 1) continue;
+
+      const odds = Math.round((1 / fairProb) * 100) / 100;
+      if (odds < outcome.oddsMin || odds > outcome.oddsMax) continue;
+
+      consensus.push({
+        market: outcome.marketLabel,
+        odds,
+        bookmakerCount: entry.count,
       });
     }
   }
 
-  return Array.from(agg.entries()).map(([market, { probSum, count }]) => {
-    const avgProb = probSum / count;
-    return {
-      market,
-      odds: Math.round((1 / avgProb) * 100) / 100, // de-vigged consensus "fair odds"
-      bookmakerCount: count,
-    };
-  });
+  return consensus;
 }
