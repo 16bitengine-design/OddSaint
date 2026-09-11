@@ -1,0 +1,45 @@
+name: Odd Saint — Backfill Team History
+
+# Runs weekly (Sunday 02:00 UTC) to gradually cycle through every known
+# team's recent result history, MAX_TEAMS_PER_RUN teams at a time (see
+# scripts/backfill-team-history.mjs) — deliberately NOT daily, to stay
+# clear of API-Football's request budget alongside the twice-daily
+# generation job and the every-3-hours grading job. Can also be triggered
+# manually to speed through the initial cycle across the whole team pool.
+on:
+  schedule:
+    - cron: '0 2 * * 0'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Backfill team history
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/backfill-team-history.mjs
+
+      - name: Commit updated backfill progress
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/lib/backfillProgress.json
+          git diff --staged --quiet || git commit -m "chore: update team history backfill progress"
+          git push

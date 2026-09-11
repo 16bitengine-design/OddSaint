@@ -1,0 +1,40 @@
+name: Odd Saint — Resolve Team IDs
+
+# Manual trigger ONLY — no schedule. Depends on scripts/lib/leagues.json
+# already existing (run "Resolve League IDs" first if it doesn't). Costs
+# ~1 API request per resolved league — cheap, but run occasionally (e.g.
+# once when first setting this up, or whenever leagues.json changes), not
+# on every push.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Resolve team IDs from API-Football
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+        run: node scripts/resolve-teams.mjs
+
+      - name: Commit updated team list
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/lib/teams.json
+          git diff --staged --quiet || git commit -m "chore: refresh resolved team IDs"
+          git push
