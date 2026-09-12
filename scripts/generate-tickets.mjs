@@ -29,7 +29,7 @@
 import { getFixturesForDate, getOddsForFixture } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { collectViableOutcomes } from './lib/markets.mjs';
-import { notifySaintsLockReady, notifyWeeklyTicketReady } from './lib/notifyTicketReady.mjs';
+import { notifySaintsLockReady, notifyWeeklyTicketReady } from './lib/lifecycleEmail.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
