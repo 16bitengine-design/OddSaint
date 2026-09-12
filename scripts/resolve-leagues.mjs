@@ -21,6 +21,7 @@ import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { getLeaguesByCountry } from './lib/apiFootball.mjs';
+import { isWomensCompetition } from './lib/womensLeagueFilter.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_PATH = join(__dirname, 'lib', 'leagues.json');
@@ -52,15 +53,18 @@ const TARGET_COUNTRIES = {
  * Which league "types" to keep from each country's response. API-Football
  * returns both league competitions (what we want) and cup competitions
  * (knockout tournaments — excluded here since their format doesn't suit
- * this product's accumulator-style tickets).
+ * this product's accumulator-style tickets). Women's competitions are also
+ * excluded — see scripts/lib/womensLeagueFilter.mjs — OddSaint currently
+ * covers men's football only, a deliberate product decision.
  */
 function isUsableLeague(entry) {
-  return entry.league?.type === 'League';
+  return entry.league?.type === 'League' && !isWomensCompetition(entry.league?.name);
 }
 
 async function main() {
   const resolved = []; // { id, name, country, region }
   const emptyCountries = [];
+  let womensExcludedCount = 0;
 
   for (const [region, countries] of Object.entries(TARGET_COUNTRIES)) {
     for (const country of countries) {
@@ -71,6 +75,10 @@ async function main() {
         console.warn(`Failed to fetch leagues for ${country}:`, err.message);
         continue;
       }
+
+      womensExcludedCount += leagues.filter(
+        (entry) => entry.league?.type === 'League' && isWomensCompetition(entry.league?.name)
+      ).length;
 
       const usable = leagues.filter(isUsableLeague);
       if (usable.length === 0) {
@@ -91,6 +99,10 @@ async function main() {
     }
   }
 
+  if (womensExcludedCount > 0) {
+    console.log(`Excluded ${womensExcludedCount} women's competition(s) — men's-only coverage per product decision.`);
+  }
+
   if (emptyCountries.length > 0) {
     console.warn(
       '\nThese countries resolved to 0 leagues — likely a country-name spelling ' +
@@ -107,4 +119,3 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
-

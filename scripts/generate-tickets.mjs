@@ -3,20 +3,10 @@
 // Pulls real fixtures + bookmaker odds from API-Football, turns them into
 // tickets for every tier, and writes them to Supabase. Runs TWICE a day via
 // .github/workflows/generate-tickets.yml (06:00 and 14:00 UTC) so each
-// STAGGERED tier's daily tickets release in two batches rather than all at
-// once — see fetchTodaysSlipState/nextSlotFor below.
-//
-// WEEKLY-CADENCE TIERS (weekly_lite, weekly_titan, weekend) are handled
-// separately from the staggered daily tiers — see WEEKLY_CADENCE_TIERS /
-// fetchLastReleaseByTier / isWeeklyCadenceTierDue below. They produce at
-// most ONE ticket per ~7 days, regardless of how many times a day this
-// script runs, and are never subject to the 2-slips-per-day staggered
-// release logic that mega/bronze/silver/gold/platinum/diamond use.
-//
-// EVENT-TRIGGERED NOTIFICATIONS: right after Saint's Lock or any
-// weekly-cadence ticket is actually written THIS run, notifyTicketReady.mjs
-// is called to email interested users. This is separate from the hourly
-// per-timezone nudge emails in send-lifecycle-emails.mjs.
+// tier's daily tickets release in two staggered batches rather than all at
+// once — see fetchTodaysSlipState/nextSlotFor below for how a given run
+// decides whether it's producing today's 1st or 2nd slip for a tier, or
+// skipping that tier entirely because it already has both.
 //
 // HONEST SCOPE NOTE (read this before treating the output as a finished
 // prediction engine): the "AI Confidence Index" here is a simple, transparent
@@ -29,7 +19,7 @@
 import { getFixturesForDate, getOddsForFixture } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { collectViableOutcomes } from './lib/markets.mjs';
-import { notifySaintsLockReady, notifyWeeklyTicketReady } from './lib/lifecycleEmail.mjs';
+import { isWomensCompetition } from './lib/womensLeagueFilter.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -81,11 +71,12 @@ function loadLeagueAllowlist() {
 
 const LEAGUE_ALLOWLIST = loadLeagueAllowlist();
 
-// Caps how many /odds requests we make per pool (daily, then weekly, then
-// weekend on the runs where it's due). Kept modest because the free plan
-// enforces both a 10-requests/minute throttle (handled in apiFootball.mjs)
-// AND a daily request cap — this leaves headroom for the separate grading
-// job, which runs several times the same day.
+// Caps how many /odds requests we make per pool (daily, then weekly — so a
+// full run uses at most ~2x this many, plus a couple of /fixtures calls).
+// Kept modest because the free plan enforces both a 10-requests/minute
+// throttle (handled in apiFootball.mjs) AND a daily request cap — this
+// leaves headroom for the separate grading job, which runs several times
+// the same day, and for this script now running twice a day itself.
 const MAX_ODDS_LOOKUPS_PER_RUN = 25;
 
 // Named priority leagues break ties when ASSEMBLING tickets from the priced
@@ -156,26 +147,15 @@ const TIER_CONFIG = [
   { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
   { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
   { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
-  // Platinum/Diamond match counts are each ONE FEWER than the "standard"
-  // tier size (10/15) — a deliberate reduction to raise real-world win
-  // probability by cutting one compounding leg of bookmaker margin per
-  // ticket. Must stay in sync with TIER_CONFIG in src/lib/dataFetcher.ts.
+  // Platinum/Diamond/Weekly Lite/Weekly Titan match counts are each ONE
+  // FEWER than the "standard" tier size (10/15/20/30) — a deliberate
+  // reduction to raise real-world win probability by cutting one
+  // compounding leg of bookmaker margin per ticket. Must stay in sync with
+  // TIER_CONFIG in src/lib/dataFetcher.ts.
   { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
   { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
   { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
-  // Weekend accumulator — Friday through Sunday's fixtures, variable leg
-  // count (18-30) rather than a fixed ceiling. Once-per-week cadence, same
-  // as weekly_lite/weekly_titan — see WEEKLY_CADENCE_TIERS below.
-  {
-    tier: 'weekend',
-    label: "The Saint's Gauntlet",
-    matchCount: 30,
-    minMatchCount: 18,
-    maxMatchCount: 30,
-    oddsRange: 'Mixed',
-    alwaysFree: false,
-  },
   // Single-match, ultra-high-confidence category. Only ever one match —
   // the single most confident pick available that day, and only ever
   // included if it clears SAINTS_LOCK_MIN_CONFIDENCE (see below), well
@@ -188,8 +168,8 @@ const TIER_CONFIG = [
 // above. These are ACTUALLY ENFORCED during slip assembly (see
 // pickFixturesForSlip) — previously oddsRange was just a display string
 // with nothing checking whether a ticket's real combined odds landed
-// inside it. Weekly Lite/Titan and the weekend ticket are intentionally
-// left unset ("Mixed" by design, no fixed target).
+// inside it. Weekly Lite/Titan are intentionally left unset ("Mixed" by
+// design, no fixed target).
 const TIER_ODDS_TARGET = {
   mega: [1.5, 3],
   bronze: [2, 3],
@@ -204,74 +184,63 @@ function dateStr(d) {
   return d.toISOString().slice(0, 10);
 }
 
-// --- Weekly-cadence tiers: at most one ticket every ~7 days -----------------
+// --- Staggered release: figure out which slot (if any) this run should fill ---
 
-// weekly_lite / weekly_titan / weekend all share this cadence model instead
-// of the staggered 2-slips-per-day model used by the other tiers. Slightly
-// under 7 days so scheduling jitter (a run firing a few hours early one
-// week) can't push the cadence later and later over time.
-const WEEKLY_CADENCE_TIERS = new Set(['weekly_lite', 'weekly_titan', 'weekend']);
-const WEEKLY_COOLDOWN_DAYS = 6;
+// Every category caps at 2 tickets/day (down from 3) — see product
+// direction: max 2/category/day, released at staggered times rather than
+// all at once, so users never see multiple slips for the same tier appear
+// simultaneously (avoids an "illusion of choice" where every option shows
+// up at the same moment with no real signal about which is fresher).
+const MAX_TICKETS_PER_CATEGORY = 2;
+
+// Minimum real-world gap enforced between a tier's slot-0 and slot-1
+// ticket on the same day. Exists so a manual re-run, a delayed cron, or
+// GitHub Actions scheduling jitter can never produce both of a tier's
+// daily slips back-to-back — the two staggered releases stay meaningfully
+// spread out regardless of exactly when this workflow happens to fire.
+// Matches the two 06:00/14:00 UTC cron triggers (8h apart) with headroom.
+const MIN_HOURS_BETWEEN_SLOTS = 6;
 
 /**
- * Looks up the most recent `available_at` for each of the given tiers,
- * across ALL history (not just today) — this is the actual fix for weekly
- * tiers previously regenerating every single day: the old code
- * (fetchTodaysSlipState) only ever checked "does a row already exist for
- * TODAY'S date", which is always false for a brand-new day even if a
- * weekly ticket was written three days ago.
+ * Reads how many slips already exist today per tier, and when the most
+ * recent one for each tier was released — this is what makes slot
+ * placement idempotent and safe to call from either of the day's two
+ * scheduled runs (or a manual re-run) without ever overproducing.
  */
-async function fetchLastReleaseByTier(supabase, tiers) {
-  if (tiers.length === 0) return new Map();
+async function fetchTodaysSlipState(supabase, today) {
   const { data, error } = await supabase
     .from('tickets')
-    .select('tier, available_at')
-    .in('tier', tiers)
-    .order('available_at', { ascending: false });
+    .select('tier, release_slot, available_at')
+    .eq('ticket_date', today);
   if (error) throw error;
 
-  const lastByTier = new Map();
+  const byTier = new Map(); // tier -> { count, lastAvailableAt }
   (data ?? []).forEach((row) => {
-    if (!lastByTier.has(row.tier)) lastByTier.set(row.tier, row.available_at); // first seen per tier = most recent, since already sorted desc
+    const existing = byTier.get(row.tier) ?? { count: 0, lastAvailableAt: null };
+    existing.count += 1;
+    if (!existing.lastAvailableAt || row.available_at > existing.lastAvailableAt) {
+      existing.lastAvailableAt = row.available_at;
+    }
+    byTier.set(row.tier, existing);
   });
-  return lastByTier;
-}
-
-function isWeeklyCadenceTierDue(lastAvailableAt) {
-  if (!lastAvailableAt) return true; // never produced before
-  const daysSince = (Date.now() - new Date(lastAvailableAt).getTime()) / 86_400_000;
-  return daysSince >= WEEKLY_COOLDOWN_DAYS;
+  return byTier;
 }
 
 /**
- * Returns the YYYY-MM-DD dates of the current/upcoming Friday-Saturday-
- * Sunday window, restricted to today-or-later (no point requesting a date
- * that's already passed). If this run happens to fire on a Friday, that's
- * [Fri, Sat, Sun]; if it fires on a Saturday (e.g. a retried/late run),
- * that's [Sat, Sun] — fewer days, so pickFixturesForRangeSlip naturally
- * has a smaller pool to work with and may fall short of the 18-match
- * minimum, in which case the ticket is simply skipped this run (see
- * buildTickets) rather than forced with too few legs.
+ * Decides whether THIS run should produce the tier's next slip, and if so
+ * which slot index (0 or 1) it fills. Returns null when the tier already
+ * has its daily cap, or when the minimum gap since its last slip hasn't
+ * elapsed yet — in either case the tier is simply skipped this run, and
+ * whatever it already has stays on display untouched (nothing here ever
+ * deletes or overwrites a previous slip).
  */
-function getWeekendDates(today) {
-  const day = today.getUTCDay(); // 0=Sun..6=Sat
-  let fridayOffset;
-  if (day === 5) fridayOffset = 0;       // today is Friday
-  else if (day === 6) fridayOffset = -1; // today is Saturday
-  else if (day === 0) fridayOffset = -2; // today is Sunday
-  else fridayOffset = 5 - day;           // Mon(1)->4, Tue(2)->3, Wed(3)->2, Thu(4)->1
-
-  const friday = new Date(today);
-  friday.setUTCDate(friday.getUTCDate() + fridayOffset);
-
-  const dates = [0, 1, 2].map((offset) => {
-    const d = new Date(friday);
-    d.setUTCDate(friday.getUTCDate() + offset);
-    return dateStr(d);
-  });
-
-  const todayStr = dateStr(today);
-  return dates.filter((d) => d >= todayStr);
+function nextSlotFor(maxSlipsToday, slipState) {
+  const state = slipState ?? { count: 0, lastAvailableAt: null };
+  if (state.count >= maxSlipsToday) return null; // already at today's cap for this tier
+  if (state.count === 0) return 0; // first slip of the day — always fine
+  const hoursSinceLast = (Date.now() - new Date(state.lastAvailableAt).getTime()) / 3_600_000;
+  if (hoursSinceLast < MIN_HOURS_BETWEEN_SLOTS) return null; // too soon — this run isn't the 2nd slot's time yet
+  return state.count; // e.g. 1 for the 2nd slip of the day
 }
 
 // --- Fetch + price fixtures ---------------------------------------------------
@@ -295,13 +264,6 @@ function isExcluded(homeTeam, awayTeam) {
  * Fetches and prices fixtures for the given dates, spending up to
  * `maxOddsLookups` /odds requests total.
  *
- * DATE-LEVEL RESILIENCE: each date's /fixtures lookup is now individually
- * try/caught. This matters most for the weekend ticket, whose date window
- * can reach 2 days out (e.g. Sunday from a Friday run) — outside
- * API-Football's free-plan window in some cases. A failed date is logged
- * and skipped rather than crashing the whole run; the caller (buildTickets)
- * already treats "not enough fixtures" as a normal skip-this-run outcome.
- *
  * FLEXIBLE LEAGUE ROTATION (this is the fix for "glued to particular
  * leagues"): fixtures are grouped by league, then priced in a round-robin
  * rotation — named priority leagues go first each round, but only
@@ -309,6 +271,15 @@ function isExcluded(homeTeam, awayTeam) {
  * moves on to the next league (priority or not) that still has fixtures
  * queued. The rotation repeats until either the budget runs out or every
  * league's queue is empty.
+ *
+ * The old behavior sorted ALL priority-league fixtures ahead of ALL other
+ * fixtures, so a single busy priority league could consume the entire
+ * day's odds-lookup budget before any other league was even attempted —
+ * including on days where that league's matches were mostly unpredictable
+ * coin-flips that would go on to fail MIN_CONFIDENCE anyway. The rotation
+ * below means every allowlisted league with fixtures today gets looked at,
+ * not just the named priority set — "priority" now only breaks ties once
+ * fixtures are being assembled into tickets (see the final sort below).
  */
 async function fetchPricedFixtures(dates, maxOddsLookups) {
   const seen = new Map(); // fixtureId -> priced fixture
@@ -316,21 +287,11 @@ async function fetchPricedFixtures(dates, maxOddsLookups) {
   const leagueBreakdown = new Map(); // league name -> count actually priced (for the run summary log)
 
   for (const d of dates) {
-    let fixtures;
-    try {
-      fixtures = await getFixturesForDate(d);
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `Fixture lookup failed for date ${d} (may be outside the API plan's allowed date window):`,
-        err.message
-      );
-      continue; // skip this date, keep going with whatever other dates are in range
-    }
-
+    const fixtures = await getFixturesForDate(d);
     const eligible = fixtures.filter(
       (f) =>
         LEAGUE_ALLOWLIST.has(f.league?.id) &&
+        !isWomensCompetition(f.league?.name) &&
         !isBigClash(f.teams?.home?.name, f.teams?.away?.name) &&
         !isExcluded(f.teams?.home?.name, f.teams?.away?.name)
     );
@@ -350,6 +311,9 @@ async function fetchPricedFixtures(dates, maxOddsLookups) {
     // Rotation order: named priority leagues first (so they still get
     // first look each round), then every other league that actually has
     // fixtures today, in the order first encountered in the API response.
+    // This is a per-round ordering, not an allowlist — a non-priority
+    // league with fixtures today is never excluded from pricing, only
+    // queued behind the priority set within a given round.
     const leagueOrder = [
       ...PRIORITY_LEAGUE_NAMES,
       ...Array.from(byLeague.keys()).filter((name) => !PRIORITY_LEAGUE_NAMES.has(name)),
@@ -376,7 +340,7 @@ async function fetchPricedFixtures(dates, maxOddsLookups) {
           if (queue.length > 0) anyQueueHasFixtures = true;
 
           const fixtureId = f.fixture.id;
-          if (seen.has(fixtureId)) continue; // already priced (e.g. weekly/weekend pool overlapping today's date)
+          if (seen.has(fixtureId)) continue; // already priced (e.g. weekly pool overlapping today's date)
 
           oddsLookupsUsed++;
           let oddsResponse;
@@ -418,6 +382,10 @@ async function fetchPricedFixtures(dates, maxOddsLookups) {
     );
   }
 
+  // Priority leagues still get first billing once fixtures are being
+  // assembled into tickets (equal-confidence tie-break) — but every
+  // allowlisted league with fixtures today was actually attempted above,
+  // so a non-priority league's picks are never excluded from this pool.
   return Array.from(seen.values()).sort((a, b) => {
     const aPriority = PRIORITY_LEAGUE_NAMES.has(a.league) ? 1 : 0;
     const bPriority = PRIORITY_LEAGUE_NAMES.has(b.league) ? 1 : 0;
@@ -505,10 +473,9 @@ function poolForTier(pool, tier) {
 }
 
 // No single match can appear in more than this many of the day's tickets,
-// across every tier combined (including the weekly-cadence tiers, when
-// they're active in a given run). Without this cap, a small fixture pool
-// can end up reused in nearly every ticket — meaning one unexpected result
-// takes down the whole slate at once instead of just a few tickets.
+// across every tier combined. Without this cap, a small fixture pool can
+// end up reused in nearly every ticket — meaning one unexpected result
+// takes down the whole day's slate at once instead of just a few tickets.
 const MAX_FIXTURE_APPEARANCES_PER_DAY = 3;
 
 function computeTotalOdds(picks) {
@@ -607,28 +574,6 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
   return picks;
 }
 
-/**
- * Selection for the weekend ticket ("The Saint's Gauntlet") — no fixed
- * odds target (like weekly_lite/titan), but a variable leg count between
- * minCount and maxCount instead of a single fixed ceiling. Takes the
- * least-used, then safest fixtures up to maxCount; returns [] if the pool
- * can't even supply minCount, so the ticket is simply skipped this run
- * rather than shipped under-sized.
- */
-function pickFixturesForRangeSlip(pool, minCount, maxCount, usageCount) {
-  const eligible = pool.filter((f) => (usageCount.get(f.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY);
-  if (eligible.length < minCount) return [];
-
-  const ranked = [...eligible].sort((a, b) => {
-    const usedA = usageCount.get(a.fixtureId) ?? 0;
-    const usedB = usageCount.get(b.fixtureId) ?? 0;
-    if (usedA !== usedB) return usedA - usedB;
-    return a.odds - b.odds;
-  });
-
-  return ranked.slice(0, Math.min(maxCount, ranked.length));
-}
-
 // Saint's Lock demands a far higher confidence bar than any other tier —
 // "next to impossible to get wrong" framing means this should almost never
 // miss. Well above the standard MIN_CONFIDENCE floor (68) used everywhere
@@ -643,13 +588,9 @@ const SAINTS_LOCK_MIN_CONFIDENCE = 85;
  * strictly the highest-confidence qualifying fixtures in the whole day's
  * pool, filtered to the 1.5–2.0 odds band and the much higher confidence
  * floor above. Respects the same staggered-release slot logic as every
- * other daily tier (see nextSlotFor) — at most one new Saint's Lock ticket
- * is produced per run, honoring the min-1/max-2-per-day guarantee across
- * the day's two scheduled runs. NOTE ON PRICING: a customer's Saint's Lock
- * pass (daily/weekly/monthly — see saints_lock_access + plans.ts) is
- * time-window-based, not per-ticket, so if a 2nd slip is produced the same
- * day, an already-active pass automatically covers it too — no separate
- * charge, nothing extra needed here.
+ * other tier (see nextSlotFor) — at most one new Saint's Lock ticket is
+ * produced per run, honoring the min-1/max-2-per-day guarantee across the
+ * day's two scheduled runs rather than both at once.
  */
 function buildSaintsLockTickets(dailyPool, usageCount, today, slot) {
   const config = TIER_CONFIG.find((c) => c.tier === 'saints_lock');
@@ -710,51 +651,18 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot) {
   return { tickets, ticketMatches, fixturesUsed: [pick], usedFallback };
 }
 
-// --- Staggered daily release (mega/bronze/silver/gold/platinum/diamond) ------
-
-const MAX_TICKETS_PER_CATEGORY = 2;
-const MIN_HOURS_BETWEEN_SLOTS = 6;
-
-async function fetchTodaysSlipState(supabase, today) {
-  const { data, error } = await supabase
-    .from('tickets')
-    .select('tier, release_slot, available_at')
-    .eq('ticket_date', today);
-  if (error) throw error;
-
-  const byTier = new Map();
-  (data ?? []).forEach((row) => {
-    const existing = byTier.get(row.tier) ?? { count: 0, lastAvailableAt: null };
-    existing.count += 1;
-    if (!existing.lastAvailableAt || row.available_at > existing.lastAvailableAt) {
-      existing.lastAvailableAt = row.available_at;
-    }
-    byTier.set(row.tier, existing);
-  });
-  return byTier;
-}
-
-function nextSlotFor(maxSlipsToday, slipState) {
-  const state = slipState ?? { count: 0, lastAvailableAt: null };
-  if (state.count >= maxSlipsToday) return null;
-  if (state.count === 0) return 0;
-  const hoursSinceLast = (Date.now() - new Date(state.lastAvailableAt).getTime()) / 3_600_000;
-  if (hoursSinceLast < MIN_HOURS_BETWEEN_SLOTS) return null;
-  return state.count;
-}
-
-// --- Build all tickets for this run -------------------------------------------
-
-function buildTickets(dailyPool, weeklyPool, weekendPool, slipState, weeklyCadenceDue) {
+function buildTickets(dailyPool, weeklyPool, slipState) {
   const now = new Date();
   const today = dateStr(now);
   const nowIso = now.toISOString();
   const tickets = [];
   const ticketMatches = [];
   const fixturesUsed = new Map();
-  const usageCount = new Map(); // shared across every tier/slip for the run
+  const usageCount = new Map(); // shared across every tier/slip for the day
 
-  // Saint's Lock — own dedicated selection, own staggered-slot logic.
+  // Saint's Lock uses its own dedicated selection (see buildSaintsLockTickets)
+  // rather than the generic per-tier loop below — it's held to a much
+  // stricter confidence bar than every other category.
   const saintsLockSlot = nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get('saints_lock'));
   if (saintsLockSlot !== null) {
     const saintsLock = buildSaintsLockTickets(dailyPool, usageCount, today, saintsLockSlot);
@@ -768,69 +676,21 @@ function buildTickets(dailyPool, weeklyPool, weekendPool, slipState, weeklyCaden
   TIER_CONFIG.forEach((config) => {
     if (config.tier === 'saints_lock') return; // handled above
 
-    // --- Weekly-cadence tiers: weekly_lite, weekly_titan, weekend -------
-    if (WEEKLY_CADENCE_TIERS.has(config.tier)) {
-      if (!weeklyCadenceDue.get(config.tier)) {
-        console.log(`${config.label}: not due yet this week — skipping this run.`);
-        return;
-      }
-
-      const isWeekend = config.tier === 'weekend';
-      const basePool = isWeekend ? weekendPool : weeklyPool;
-
-      const picks = isWeekend
-        ? pickFixturesForRangeSlip(basePool, config.minMatchCount, config.maxMatchCount, usageCount)
-        : pickFixturesForSlip(basePool, config.matchCount, usageCount, null);
-
-      if (picks.length === 0) {
-        const need = isWeekend ? config.minMatchCount : config.matchCount;
-        console.log(
-          `${config.label}: couldn't assemble enough fixtures this run (need ${need}+, pool had ${basePool.length}) — skipping, will retry next scheduled run.`
-        );
-        return;
-      }
-
-      picks.forEach((p) => {
-        fixturesUsed.set(p.fixtureId, p);
-        usageCount.set(p.fixtureId, (usageCount.get(p.fixtureId) ?? 0) + 1);
-      });
-
-      const totalOdds = computeTotalOdds(picks);
-      const ticketId = `${today}-${config.tier}-0`;
-
-      tickets.push({
-        id: ticketId,
-        ticket_date: today,
-        tier: config.tier,
-        slip_label: null,
-        match_count: picks.length,
-        odds_range: config.oddsRange,
-        total_odds: totalOdds,
-        is_free: config.alwaysFree,
-        release_slot: 0,
-        available_at: nowIso,
-      });
-
-      picks.forEach((p, idx) => {
-        ticketMatches.push({ ticket_id: ticketId, fixture_id: p.fixtureId, sort_order: idx });
-      });
-      return;
-    }
-
-    // --- Standard staggered daily tiers ---------------------------------
     const slot = nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get(config.tier));
     if (slot === null) {
       console.log(`${config.label}: already at today's cap, or too soon since the last slip — skipping this run.`);
       return;
     }
 
-    const pool = poolForTier(dailyPool, config.tier);
+    const isWeekly = config.tier === 'weekly_lite' || config.tier === 'weekly_titan';
+    const basePool = isWeekly ? weeklyPool : dailyPool;
+    const pool = poolForTier(basePool, config.tier);
     const targetRange = TIER_ODDS_TARGET[config.tier] ?? null;
 
     const picks = pickFixturesForSlip(pool, config.matchCount, usageCount, targetRange);
     if (picks.length === 0) {
       console.log(`${config.label}: couldn't assemble a valid combination this run — skipping this slip.`);
-      return;
+      return; // couldn't assemble a valid combination today — skip this slip rather than force it
     }
 
     picks.forEach((p) => {
@@ -838,8 +698,13 @@ function buildTickets(dailyPool, weeklyPool, weekendPool, slipState, weeklyCaden
       usageCount.set(p.fixtureId, (usageCount.get(p.fixtureId) ?? 0) + 1);
     });
 
-    const totalOdds = computeTotalOdds(picks);
+    const totalOdds = Math.round(picks.reduce((acc, p) => acc * p.odds, 1) * 100) / 100;
     const ticketId = `${today}-${config.tier}-${slot}`;
+    // Both of a tier's daily slips are real, equally-curated tickets
+    // released at different times — not simultaneous alternatives — so
+    // "Slip 1 of 2" phrasing (which implies picking between options
+    // available right now) is deliberately dropped in favor of a plain
+    // release-time label shown by the frontend instead.
     const slipLabel = null;
 
     tickets.push({
@@ -847,7 +712,7 @@ function buildTickets(dailyPool, weeklyPool, weekendPool, slipState, weeklyCaden
       ticket_date: today,
       tier: config.tier,
       slip_label: slipLabel,
-      match_count: picks.length,
+      match_count: picks.length, // actual legs used — may be fewer than config.matchCount's ceiling
       odds_range: config.oddsRange,
       total_odds: totalOdds,
       is_free: config.alwaysFree,
@@ -878,23 +743,14 @@ async function main() {
 
   const supabase = getSupabaseAdmin();
 
-  console.log("Checking today's existing slips (staggered-release state)...");
+  console.log('Checking today\'s existing slips (staggered-release state)...');
   const slipState = await fetchTodaysSlipState(supabase, todayStr);
 
-  console.log('Checking weekly-cadence tiers (weekly_lite, weekly_titan, weekend)...');
-  const lastReleaseByTier = await fetchLastReleaseByTier(supabase, Array.from(WEEKLY_CADENCE_TIERS));
-  const weeklyCadenceDue = new Map();
-  WEEKLY_CADENCE_TIERS.forEach((tier) => {
-    weeklyCadenceDue.set(tier, isWeeklyCadenceTierDue(lastReleaseByTier.get(tier)));
-  });
-
-  const dailyTierSlotAvailable = TIER_CONFIG.map((c) => c.tier)
-    .filter((tier) => !WEEKLY_CADENCE_TIERS.has(tier))
-    .some((tier) => nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get(tier)) !== null);
-  const anyWeeklyCadenceDue = Array.from(weeklyCadenceDue.values()).some(Boolean);
-
-  if (!dailyTierSlotAvailable && !anyWeeklyCadenceDue) {
-    console.log("Every category is already at today's cap or this week's cadence, or within the min-gap window — nothing to do this run.");
+  const anySlotAvailable = [...TIER_CONFIG.map((c) => c.tier)].some(
+    (tier) => nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get(tier)) !== null
+  );
+  if (!anySlotAvailable) {
+    console.log('Every category is already at today\'s cap, or within the min-gap window — nothing to do this run.');
     return;
   }
 
@@ -906,27 +762,7 @@ async function main() {
   const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN);
   console.log(`Priced ${weeklyPool.length} fixtures for the week ahead.`);
 
-  let weekendPool = [];
-  if (weeklyCadenceDue.get('weekend')) {
-    const weekendDates = getWeekendDates(today);
-    if (weekendDates.length === 0) {
-      console.log("Weekend ticket: this weekend's window has already fully passed — skipping this run.");
-    } else {
-      console.log(`Fetching weekend fixture pool (${weekendDates.join(', ')}) for The Saint's Gauntlet...`);
-      weekendPool = await fetchPricedFixtures(weekendDates, MAX_ODDS_LOOKUPS_PER_RUN);
-      console.log(`Priced ${weekendPool.length} fixtures for the weekend window.`);
-    }
-  } else {
-    console.log("The Saint's Gauntlet: not due yet this week — skipping the weekend fixture pool fetch entirely.");
-  }
-
-  const { tickets, ticketMatches, fixturesUsed } = buildTickets(
-    dailyPool,
-    weeklyPool,
-    weekendPool,
-    slipState,
-    weeklyCadenceDue
-  );
+  const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, slipState);
 
   if (tickets.length === 0) {
     console.warn('No tickets could be assembled this run — not enough priced fixtures, or every eligible category was skipped. Nothing written.');
@@ -957,29 +793,6 @@ async function main() {
   if (linksErr) throw linksErr;
 
   console.log(`Wrote ${tickets.length} new ticket(s), ${fixtureRows.length} fixture(s). Previous slips today are untouched and remain visible.`);
-
-  // -------------------------------------------------------------------
-  // Event-triggered "ticket ready" notifications — fire only for tickets
-  // actually written THIS run. Failures here are caught and logged, never
-  // thrown: a Brevo outage must never make the ticket-generation job
-  // report failure, since the tickets themselves already wrote
-  // successfully above.
-  // -------------------------------------------------------------------
-  const saintsLockTicket = tickets.find((t) => t.tier === 'saints_lock');
-  if (saintsLockTicket) {
-    await notifySaintsLockReady(supabase, saintsLockTicket.id).catch((err) =>
-      console.error("Saint's Lock ready notification failed (tickets were still written successfully):", err)
-    );
-  }
-  for (const weeklyTier of ['weekly_lite', 'weekly_titan', 'weekend']) {
-    const t = tickets.find((tk) => tk.tier === weeklyTier);
-    if (t) {
-      const label = TIER_CONFIG.find((c) => c.tier === weeklyTier)?.label ?? weeklyTier;
-      await notifyWeeklyTicketReady(supabase, t.id, label).catch((err) =>
-        console.error(`${label} ready notification failed (ticket was still written successfully):`, err)
-      );
-    }
-  }
 }
 
 main().catch((err) => {
