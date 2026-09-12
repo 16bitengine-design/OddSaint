@@ -1,0 +1,36 @@
+name: Odd Saint — Lifecycle Emails
+
+# Hourly — required for TRUE per-user timezone scheduling: each user's
+# local send hour (see SUBSCRIPTION_NUDGE_LOCAL_HOUR /
+# SAINTS_LOCK_NUDGE_LOCAL_HOUR in scripts/send-lifecycle-emails.mjs) could
+# fall in any UTC hour depending on their timezone, so this can't run
+# just once or twice a day the way ticket generation does.
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Send due lifecycle emails
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
+          BREVO_SENDER_NAME: ${{ secrets.BREVO_SENDER_NAME }}
+          NEXT_PUBLIC_SITE_URL: ${{ secrets.NEXT_PUBLIC_SITE_URL }}
+        run: node scripts/send-lifecycle-emails.mjs
