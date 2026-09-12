@@ -42,7 +42,7 @@ import {
   type FeedbackRow,
 } from '@/lib/feedback';
 import { adminGrantAccess, type GrantableProduct } from '@/lib/adminGrant';
-import { syncUserTimezone } from '@/lib/timezoneSync';
+import { syncUserTimezone } from '@/lib/lifecycleEmail';
 
 // ---------------------------------------------------------------------------
 // Color tokens — Odd Saint brand
