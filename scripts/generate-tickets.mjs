@@ -71,13 +71,29 @@ function loadLeagueAllowlist() {
 
 const LEAGUE_ALLOWLIST = loadLeagueAllowlist();
 
-// Caps how many /odds requests we make per pool (daily, then weekly — so a
-// full run uses at most ~2x this many, plus a couple of /fixtures calls).
-// Kept modest because the free plan enforces both a 10-requests/minute
-// throttle (handled in apiFootball.mjs) AND a daily request cap — this
-// leaves headroom for the separate grading job, which runs several times
-// the same day, and for this script now running twice a day itself.
-const MAX_ODDS_LOOKUPS_PER_RUN = 25;
+// Caps how many /odds requests the DAILY pool spends (mega/bronze/silver/
+// gold/saints_lock all draw from this pool). Kept modest — even with the
+// tightened MAX_FIXTURE_APPEARANCES_PER_DAY = 2 reuse cap, the daily-pool
+// tiers only need a combined ~20 leg-slots per run (4+3+5+7+1), so this
+// has headroom without over-spending the free-plan request budget.
+const MAX_ODDS_LOOKUPS_PER_RUN_DAILY = 30;
+
+// Caps how many /odds requests the WEEKLY pool spends (weekly_lite /
+// weekly_titan). Raised well above the daily budget because Weekly Titan
+// alone needs 29 successfully-priced legs (fixtures that clear
+// MIN_CONFIDENCE and have a usable market) — under the OLD shared budget
+// of 25, Weekly Titan could NEVER generate: pickFixturesForSlip's
+// no-target-range branch requires ranked.length >= maxMatchCount (29),
+// which a 25-lookup pool can never reach even under perfect conditions.
+// This was a structural bug, not bad luck.
+//
+// COST TRADE-OFF: this roughly doubles the /odds requests spent on the
+// weekly-pool fetch versus the old shared constant. That's more
+// API-Football requests per run (this pool is fetched once per
+// generate-tickets run, i.e. twice a day) — worth watching against your
+// plan's daily request cap. If you hit it, lower this constant and/or
+// weekly_titan's matchCount below (keep dataFetcher.ts's copy in sync).
+const MAX_ODDS_LOOKUPS_PER_RUN_WEEKLY = 45;
 
 // Named priority leagues break ties when ASSEMBLING tickets from the priced
 // pool (see the final sort at the end of fetchPricedFixtures, and
@@ -107,13 +123,13 @@ const PRIORITY_LEAGUE_NAMES = new Set([
 // How many odds lookups a single league can consume in one rotation pass
 // before yielding to the next league in line. This is the actual fix for
 // "glued to particular leagues": without a per-round cap, a priority
-// league with a full fixture list would consume the entire
-// MAX_ODDS_LOOKUPS_PER_RUN budget before any other league — including
-// other priority leagues further down the list — ever got a single odds
-// lookup, even on a day where that first league's matches were all
-// unpredictable coin-flips that would fail MIN_CONFIDENCE anyway. Kept
-// small (not 1) so a league with genuinely strong, easy fixtures can still
-// contribute more than a token pick per round.
+// league with a full fixture list would consume the entire odds-lookup
+// budget before any other league — including other priority leagues
+// further down the list — ever got a single odds lookup, even on a day
+// where that first league's matches were all unpredictable coin-flips
+// that would fail MIN_CONFIDENCE anyway. Kept small (not 1) so a league
+// with genuinely strong, easy fixtures can still contribute more than a
+// token pick per round.
 const PER_LEAGUE_LOOKUPS_PER_ROUND = 3;
 
 // How many extra days ahead to pull fixtures for the two "Weekly" tiers.
@@ -142,18 +158,23 @@ function isBigClash(homeTeam, awayTeam) {
   return BIG_CLUBS.has(homeTeam) && BIG_CLUBS.has(awayTeam);
 }
 
+// Platinum and Diamond were removed from the product lineup — they were
+// also the two hardest tiers to reliably assemble (25-300x and 300+x
+// cumulative odds need either huge leg counts or extreme long-shot legs),
+// so dropping them also frees up odds-lookup budget and fixture-pool
+// headroom for the remaining tiers. Existing historical Platinum/Diamond
+// rows in Supabase are untouched (no CHECK constraint on tickets.tier) —
+// only new generation stops. MUST stay in sync with TIER_CONFIG in
+// src/lib/dataFetcher.ts.
 const TIER_CONFIG = [
   { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
   { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
   { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
   { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
-  // Platinum/Diamond/Weekly Lite/Weekly Titan match counts are each ONE
-  // FEWER than the "standard" tier size (10/15/20/30) — a deliberate
-  // reduction to raise real-world win probability by cutting one
-  // compounding leg of bookmaker margin per ticket. Must stay in sync with
-  // TIER_CONFIG in src/lib/dataFetcher.ts.
-  { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
-  { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
+  // Weekly Lite/Titan match counts are each ONE FEWER than the "standard"
+  // tier size (20/30) — a deliberate reduction to raise real-world win
+  // probability by cutting one compounding leg of bookmaker margin per
+  // ticket. Must stay in sync with TIER_CONFIG in src/lib/dataFetcher.ts.
   { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
   // Single-match, ultra-high-confidence category. Only ever one match —
@@ -175,8 +196,6 @@ const TIER_ODDS_TARGET = {
   bronze: [2, 3],
   silver: [3, 5],
   gold: [5, 10],
-  platinum: [25, 300],
-  diamond: [300, Infinity],
   saints_lock: [1.5, 2],
 };
 
@@ -241,6 +260,33 @@ function nextSlotFor(maxSlipsToday, slipState) {
   const hoursSinceLast = (Date.now() - new Date(state.lastAvailableAt).getTime()) / 3_600_000;
   if (hoursSinceLast < MIN_HOURS_BETWEEN_SLOTS) return null; // too soon — this run isn't the 2nd slot's time yet
   return state.count; // e.g. 1 for the 2nd slip of the day
+}
+
+/**
+ * Reads how many times each fixture ID already appears across TODAY's
+ * existing ticket_matches (i.e. across BOTH of today's runs combined, not
+ * just this one) — seeded into usageCount at the start of buildTickets so
+ * MAX_FIXTURE_APPEARANCES_PER_DAY actually holds for the whole day.
+ *
+ * BUG THIS FIXES: usageCount used to start as an empty Map() every run,
+ * so the appearance cap only held WITHIN a single script execution. A
+ * fixture already used up to the cap in the 06:00 UTC run could then be
+ * picked again in the 14:00 UTC run, silently exceeding the intended
+ * per-day limit — which is exactly the "same match keeps showing up"
+ * symptom. Seeding from Supabase here closes that gap.
+ */
+async function fetchTodaysFixtureUsage(supabase, today) {
+  const { data, error } = await supabase
+    .from('ticket_matches')
+    .select('fixture_id, tickets!inner(ticket_date)')
+    .eq('tickets.ticket_date', today);
+  if (error) throw error;
+
+  const usage = new Map(); // fixtureId -> count of today's tickets it already appears on
+  (data ?? []).forEach((row) => {
+    usage.set(row.fixture_id, (usage.get(row.fixture_id) ?? 0) + 1);
+  });
+  return usage;
 }
 
 // --- Fetch + price fixtures ---------------------------------------------------
@@ -473,10 +519,13 @@ function poolForTier(pool, tier) {
 }
 
 // No single match can appear in more than this many of the day's tickets,
-// across every tier combined. Without this cap, a small fixture pool can
-// end up reused in nearly every ticket — meaning one unexpected result
-// takes down the whole day's slate at once instead of just a few tickets.
-const MAX_FIXTURE_APPEARANCES_PER_DAY = 3;
+// across every tier combined AND across both of today's runs (see
+// fetchTodaysFixtureUsage, which seeds usageCount at the start of each
+// run) — lowered from 3 to 2 per product direction. Without this cap, a
+// small fixture pool can end up reused in nearly every ticket — meaning
+// one unexpected result takes down a large chunk of the day's slate at
+// once instead of just one or two tickets.
+const MAX_FIXTURE_APPEARANCES_PER_DAY = 2;
 
 function computeTotalOdds(picks) {
   return Math.round(picks.reduce((acc, p) => acc * p.odds, 1) * 100) / 100;
@@ -605,20 +654,24 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot) {
     .filter((p) => inOddsRange(p) && p.confidence >= SAINTS_LOCK_MIN_CONFIDENCE)
     .sort((a, b) => b.confidence - a.confidence);
 
-  // Minimum 1/day guarantee: if nothing clears the strict 85% bar on the
-  // FIRST slip of the day, relax to the single best-available fixture in
-  // the odds range rather than shipping zero. Still quality-first — this
-  // only ever applies to slot 0, since a second slot at reduced confidence
-  // would defeat the "next to impossible" positioning.
+  // Minimum 1/day guarantee: if nothing clears the strict 85% bar, relax
+  // to the single best-available fixture in the odds range rather than
+  // shipping zero. Applied on EITHER slot now (previously slot 0 only) —
+  // a slot-0 miss used to mean the whole day could go without a Saint's
+  // Lock ticket if slot 1 also failed to clear 85%, since slot 1 never
+  // got the relaxed fallback. This does mean a below-85% "best available"
+  // pick can now appear on the second release too, not just the first —
+  // a deliberate loosening in favor of reliably generating a ticket, at
+  // some cost to the "next to impossible to get wrong" premium framing.
   let usedFallback = false;
-  if (qualifying.length === 0 && slot === 0) {
+  if (qualifying.length === 0) {
     const fallback = dailyPool.filter(inOddsRange).sort((a, b) => b.confidence - a.confidence);
     if (fallback.length > 0) {
       qualifying = [fallback[0]];
       usedFallback = true;
       // eslint-disable-next-line no-console
       console.warn(
-        `Saint's Lock: no fixture cleared ${SAINTS_LOCK_MIN_CONFIDENCE}% today — ` +
+        `Saint's Lock: no fixture cleared ${SAINTS_LOCK_MIN_CONFIDENCE}% today (slot ${slot}) — ` +
           `using best available (${fallback[0].confidence}%) to meet the minimum-1-per-day guarantee.`
       );
     }
@@ -651,14 +704,17 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot) {
   return { tickets, ticketMatches, fixturesUsed: [pick], usedFallback };
 }
 
-function buildTickets(dailyPool, weeklyPool, slipState) {
+function buildTickets(dailyPool, weeklyPool, slipState, seededUsage) {
   const now = new Date();
   const today = dateStr(now);
   const nowIso = now.toISOString();
   const tickets = [];
   const ticketMatches = [];
   const fixturesUsed = new Map();
-  const usageCount = new Map(); // shared across every tier/slip for the day
+  // Seeded from today's existing ticket_matches (see
+  // fetchTodaysFixtureUsage) so MAX_FIXTURE_APPEARANCES_PER_DAY holds
+  // across BOTH of today's runs, not just within this single execution.
+  const usageCount = new Map(seededUsage);
 
   // Saint's Lock uses its own dedicated selection (see buildSaintsLockTickets)
   // rather than the generic per-tier loop below — it's held to a much
@@ -754,15 +810,18 @@ async function main() {
     return;
   }
 
+  console.log("Checking today's existing fixture usage (cross-run appearance cap)...");
+  const seededUsage = await fetchTodaysFixtureUsage(supabase, todayStr);
+
   console.log('Fetching daily fixture pool...');
-  const dailyPool = await fetchPricedFixtures(dailyDates, MAX_ODDS_LOOKUPS_PER_RUN);
+  const dailyPool = await fetchPricedFixtures(dailyDates, MAX_ODDS_LOOKUPS_PER_RUN_DAILY);
   console.log(`Priced ${dailyPool.length} fixtures for today.`);
 
   console.log('Fetching weekly fixture pool (for Weekly Lite / Weekly Titan)...');
-  const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN);
+  const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN_WEEKLY);
   console.log(`Priced ${weeklyPool.length} fixtures for the week ahead.`);
 
-  const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, slipState);
+  const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, slipState, seededUsage);
 
   if (tickets.length === 0) {
     console.warn('No tickets could be assembled this run — not enough priced fixtures, or every eligible category was skipped. Nothing written.');
