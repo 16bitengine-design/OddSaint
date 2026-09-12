@@ -137,7 +137,16 @@ create policy "admins update tickets" on tickets for update to authenticated
 -- match either team has ever played. It's real history, just partial
 -- coverage, since `fixtures` only stores fixtures the pipeline selected.
 -- ---------------------------------------------------------------------------
-create or replace view team_match_history as
+-- DROP + CREATE rather than CREATE OR REPLACE: Postgres rejects
+-- CREATE OR REPLACE VIEW (error 42P16) whenever the new column list
+-- doesn't exactly match whatever is currently stored for this view name —
+-- including cases where the live definition drifted from what's in this
+-- file (a different column order from an earlier hand-edit, etc.). Drop
+-- first sidesteps that unconditionally. Safe here because nothing else in
+-- this schema references team_match_history, so there's nothing to CASCADE.
+drop view if exists team_match_history;
+
+create view team_match_history as
   select
     home_team as team,
     away_team as opponent,
