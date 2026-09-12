@@ -42,6 +42,7 @@ import {
   type FeedbackRow,
 } from '@/lib/feedback';
 import { adminGrantAccess, type GrantableProduct } from '@/lib/adminGrant';
+import { syncUserTimezone } from '@/lib/timezoneSync';
 
 // ---------------------------------------------------------------------------
 // Color tokens — Odd Saint brand
@@ -546,90 +547,22 @@ function ResultBadge({ result }: { result: 'W' | 'D' | 'L' }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Unified search — "By team" plus "By date" (search for tickets generated
-// or available on a particular day). Date search reuses the EXACT same
-// access rule as the ticket archive (admin: unlimited, subscriber: their
-// own maxDaysBack, everyone else: none) rather than introducing a second,
-// inconsistent access check — see getArchiveAccess in
-// src/lib/dataFetcher.ts for where that rule actually lives.
-// ---------------------------------------------------------------------------
-
-function SearchModal({
-  onClose,
-  archiveAccess,
-  isAdmin,
-  onEditAsAdmin,
-  onSubscribe,
-}: {
-  onClose: () => void;
-  archiveAccess: ArchiveAccess;
-  isAdmin: boolean;
-  onEditAsAdmin: (ticket: Ticket) => void;
-  onSubscribe: () => void;
-}) {
-  const [tab, setTab] = useState<'team' | 'date'>('team');
-
-  // --- Search by team (unchanged behavior) ---
+function TeamSearchModal({ onClose }: { onClose: () => void }) {
   const [query, setQuery] = useState('');
   const [searchedTeam, setSearchedTeam] = useState<string | null>(null);
-  const [teamResult, setTeamResult] = useState<TeamFormSummary | null>(null);
-  const [teamLoading, setTeamLoading] = useState(false);
+  const [result, setResult] = useState<TeamFormSummary | null>(null);
+  const [loading, setLoading] = useState(false);
 
-  async function handleTeamSearch(e: FormEvent) {
+  async function handleSearch(e: FormEvent) {
     e.preventDefault();
     const trimmed = query.trim();
     if (!trimmed) return;
-    setTeamLoading(true);
+    setLoading(true);
     setSearchedTeam(trimmed);
     const history = await fetchTeamHistory(trimmed);
-    setTeamResult(history);
-    setTeamLoading(false);
+    setResult(history);
+    setLoading(false);
   }
-
-  // --- Search by date ---
-  const todayStr = dateKey(new Date());
-  const hasDateAccess = archiveAccess.level !== 'none';
-  const minDateStr = useMemo(() => {
-    if (archiveAccess.level !== 'subscriber') return undefined;
-    const oldest = new Date();
-    oldest.setDate(oldest.getDate() - archiveAccess.maxDaysBack);
-    return dateKey(oldest);
-  }, [archiveAccess]);
-
-  const [selectedDateStr, setSelectedDateStr] = useState(todayStr);
-  const [tierFilter, setTierFilter] = useState<TicketTier | 'all'>('all');
-  const [dateTickets, setDateTickets] = useState<Ticket[]>([]);
-  const [dateLoading, setDateLoading] = useState(false);
-  const [dateLoaded, setDateLoaded] = useState(false);
-  const [dateSelectedMatch, setDateSelectedMatch] = useState<Match | null>(null);
-
-  async function loadDate(value: string) {
-    if (!hasDateAccess) return;
-    setDateLoading(true);
-    setDateLoaded(false);
-    // Anchor at noon to avoid a date-input string landing on the wrong
-    // calendar day when parsed near a timezone boundary.
-    const picked = new Date(`${value}T12:00:00`);
-    const result = await fetchTickets(picked);
-    setDateTickets(result);
-    setDateLoading(false);
-    setDateLoaded(true);
-  }
-
-  // "Any other search means" — quick presets instead of always typing an
-  // exact date, plus the tier filter below narrows a day's results further.
-  function quickPick(daysAgo: number) {
-    const d = new Date();
-    d.setDate(d.getDate() - daysAgo);
-    const key = dateKey(d);
-    if (minDateStr && key < minDateStr) return; // outside this account's lookback window
-    setSelectedDateStr(key);
-    loadDate(key);
-  }
-
-  const filteredDateTickets =
-    tierFilter === 'all' ? dateTickets : dateTickets.filter((t) => t.tier === tierFilter);
 
   return (
     <div
@@ -653,8 +586,8 @@ function SearchModal({
           borderRadius: 14,
           padding: 22,
           width: '100%',
-          maxWidth: 460,
-          maxHeight: '80vh',
+          maxWidth: 420,
+          maxHeight: '75vh',
           overflowY: 'auto',
           boxShadow: '0 20px 60px -20px rgba(0,0,0,0.35)',
           position: 'relative',
@@ -686,356 +619,147 @@ function SearchModal({
             margin: '0 0 14px',
           }}
         >
-          Search
+          Search a team
         </h2>
 
-        <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-          <button
-            onClick={() => setTab('team')}
+        <form onSubmit={handleSearch} style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="e.g. Arsenal"
             style={{
               flex: 1,
-              fontFamily: FONT_BODY,
-              fontSize: 12.5,
-              fontWeight: 700,
-              padding: '8px 0',
+              padding: '10px 12px',
               borderRadius: 8,
-              border: tab === 'team' ? 'none' : `1px solid ${COLORS.border}`,
-              background: tab === 'team' ? COLORS.emerald : 'transparent',
-              color: tab === 'team' ? '#ffffff' : COLORS.textMuted,
+              border: `1px solid ${COLORS.border}`,
+              background: COLORS.surfaceAlt,
+              color: COLORS.textPrimary,
+              fontFamily: FONT_BODY,
+              fontSize: 13,
+              boxSizing: 'border-box',
+            }}
+          />
+          <button
+            type="submit"
+            style={{
+              padding: '10px 16px',
+              borderRadius: 8,
+              border: 'none',
+              background: COLORS.emerald,
+              color: '#ffffff',
+              fontFamily: FONT_BODY,
+              fontSize: 13,
+              fontWeight: 700,
               cursor: 'pointer',
             }}
           >
-            By team
+            Search
           </button>
-          <button
-            onClick={() => setTab('date')}
-            style={{
-              flex: 1,
-              fontFamily: FONT_BODY,
-              fontSize: 12.5,
-              fontWeight: 700,
-              padding: '8px 0',
-              borderRadius: 8,
-              border: tab === 'date' ? 'none' : `1px solid ${COLORS.border}`,
-              background: tab === 'date' ? COLORS.emerald : 'transparent',
-              color: tab === 'date' ? '#ffffff' : COLORS.textMuted,
-              cursor: 'pointer',
-            }}
-          >
-            By date
-          </button>
-        </div>
+        </form>
 
-        {tab === 'team' ? (
+        {searchedTeam && (
           <>
-            <form onSubmit={handleTeamSearch} style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-              <input
-                type="text"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="e.g. Arsenal"
-                style={{
-                  flex: 1,
-                  padding: '10px 12px',
-                  borderRadius: 8,
-                  border: `1px solid ${COLORS.border}`,
-                  background: COLORS.surfaceAlt,
-                  color: COLORS.textPrimary,
-                  fontFamily: FONT_BODY,
-                  fontSize: 13,
-                  boxSizing: 'border-box',
-                }}
-              />
-              <button
-                type="submit"
-                style={{
-                  padding: '10px 16px',
-                  borderRadius: 8,
-                  border: 'none',
-                  background: COLORS.emerald,
-                  color: '#ffffff',
-                  fontFamily: FONT_BODY,
-                  fontSize: 13,
-                  fontWeight: 700,
-                  cursor: 'pointer',
-                }}
-              >
-                Search
-              </button>
-            </form>
+            {/* External search — opens a real web search in a new tab. This
+                app has no backend to safely hold a live news-API key, so
+                this is the honest, zero-cost way to surface outside
+                information rather than faking it inline. */}
+            <a
+              href={webSearchUrlForTeam(searchedTeam)}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: 'block',
+                fontSize: 12,
+                color: COLORS.emerald,
+                fontWeight: 700,
+                marginBottom: 16,
+                textDecoration: 'underline',
+                textUnderlineOffset: 3,
+              }}
+            >
+              Search the web for {searchedTeam} news →
+            </a>
 
-            {searchedTeam && (
-              <>
-                {/* External search — opens a real web search in a new tab. This
-                    app has no backend to safely hold a live news-API key, so
-                    this is the honest, zero-cost way to surface outside
-                    information rather than faking it inline. */}
-                <a
-                  href={webSearchUrlForTeam(searchedTeam)}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  style={{
-                    display: 'block',
-                    fontSize: 12,
-                    color: COLORS.emerald,
-                    fontWeight: 700,
-                    marginBottom: 16,
-                    textDecoration: 'underline',
-                    textUnderlineOffset: 3,
-                  }}
-                >
-                  Search the web for {searchedTeam} news →
-                </a>
+            <div
+              style={{
+                fontFamily: FONT_BODY,
+                fontSize: 11,
+                fontWeight: 700,
+                color: COLORS.textMuted,
+                textTransform: 'uppercase',
+                letterSpacing: '0.06em',
+                marginBottom: 8,
+              }}
+            >
+              Match history in our data
+            </div>
 
+            {loading && (
+              <div style={{ fontSize: 12.5, color: COLORS.textMuted }}>Searching…</div>
+            )}
+
+            {!loading && !result && (
+              <div style={{ fontSize: 12.5, color: COLORS.textMuted, lineHeight: 1.5 }}>
+                No history found for "{searchedTeam}" yet — we only have data for teams that have
+                appeared in a generated ticket so far. Try the web search link above for outside
+                information.
+              </div>
+            )}
+
+            {!loading && result && (
+              <div>
                 <div
                   style={{
-                    fontFamily: FONT_BODY,
-                    fontSize: 11,
-                    fontWeight: 700,
+                    display: 'flex',
+                    gap: 8,
+                    marginBottom: 12,
+                    fontSize: 12,
                     color: COLORS.textMuted,
-                    textTransform: 'uppercase',
-                    letterSpacing: '0.06em',
-                    marginBottom: 8,
                   }}
                 >
-                  Match history in our data
+                  <span>
+                    <strong style={{ color: COLORS.emerald }}>{result.wins}W</strong>
+                  </span>
+                  <span>
+                    <strong style={{ color: COLORS.amber }}>{result.draws}D</strong>
+                  </span>
+                  <span>
+                    <strong style={{ color: COLORS.red }}>{result.losses}L</strong>
+                  </span>
+                  <span>— last {result.matchesFound} in our data</span>
                 </div>
 
-                {teamLoading && (
-                  <div style={{ fontSize: 12.5, color: COLORS.textMuted }}>Searching…</div>
-                )}
-
-                {!teamLoading && !teamResult && (
-                  <div style={{ fontSize: 12.5, color: COLORS.textMuted, lineHeight: 1.5 }}>
-                    No history found for "{searchedTeam}" yet — we only have data for teams that have
-                    appeared in a generated ticket so far. Try the web search link above for outside
-                    information.
-                  </div>
-                )}
-
-                {!teamLoading && teamResult && (
-                  <div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {result.recentResults.map((r, idx) => (
                     <div
+                      key={idx}
                       style={{
                         display: 'flex',
-                        gap: 8,
-                        marginBottom: 12,
-                        fontSize: 12,
-                        color: COLORS.textMuted,
+                        alignItems: 'center',
+                        gap: 10,
+                        padding: '8px 0',
+                        borderBottom: `1px solid ${COLORS.border}`,
                       }}
                     >
-                      <span>
-                        <strong style={{ color: COLORS.emerald }}>{teamResult.wins}W</strong>
-                      </span>
-                      <span>
-                        <strong style={{ color: COLORS.amber }}>{teamResult.draws}D</strong>
-                      </span>
-                      <span>
-                        <strong style={{ color: COLORS.red }}>{teamResult.losses}L</strong>
-                      </span>
-                      <span>— last {teamResult.matchesFound} in our data</span>
-                    </div>
-
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                      {teamResult.recentResults.map((r, idx) => (
-                        <div
-                          key={idx}
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: 10,
-                            padding: '8px 0',
-                            borderBottom: `1px solid ${COLORS.border}`,
-                          }}
-                        >
-                          <ResultBadge result={r.result} />
-                          <div style={{ minWidth: 0, flex: 1 }}>
-                            <div style={{ fontSize: 12.5, color: COLORS.textPrimary, fontWeight: 600 }}>
-                              {r.venue === 'home' ? 'vs' : '@'} {r.opponent}
-                            </div>
-                            <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>
-                              {r.league} · {formatKickoff(r.kickoff)}
-                            </div>
-                          </div>
-                          <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.textPrimary, flexShrink: 0 }}>
-                            {r.goalsFor}-{r.goalsAgainst}
-                          </div>
+                      <ResultBadge result={r.result} />
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div style={{ fontSize: 12.5, color: COLORS.textPrimary, fontWeight: 600 }}>
+                          {r.venue === 'home' ? 'vs' : '@'} {r.opponent}
                         </div>
-                      ))}
+                        <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>
+                          {r.league} · {formatKickoff(r.kickoff)}
+                        </div>
+                      </div>
+                      <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.textPrimary, flexShrink: 0 }}>
+                        {r.goalsFor}-{r.goalsAgainst}
+                      </div>
                     </div>
-                  </div>
-                )}
-              </>
-            )}
-          </>
-        ) : (
-          <>
-            {!hasDateAccess ? (
-              <div
-                style={{
-                  fontSize: 12.5,
-                  color: COLORS.textMuted,
-                  lineHeight: 1.6,
-                  background: COLORS.surfaceAlt,
-                  border: `1px solid ${COLORS.border}`,
-                  borderRadius: 10,
-                  padding: '12px 14px',
-                }}
-              >
-                Searching by date is a subscriber feature — subscribers can look back several days,
-                and admins have unlimited access.
-                <button
-                  onClick={onSubscribe}
-                  style={{
-                    display: 'block',
-                    marginTop: 10,
-                    padding: '9px 0',
-                    width: '100%',
-                    borderRadius: 8,
-                    border: 'none',
-                    background: COLORS.emerald,
-                    color: '#ffffff',
-                    fontFamily: FONT_BODY,
-                    fontWeight: 700,
-                    fontSize: 12.5,
-                    cursor: 'pointer',
-                  }}
-                >
-                  See plans
-                </button>
+                  ))}
+                </div>
               </div>
-            ) : (
-              <>
-                <p style={{ fontSize: 11, color: COLORS.textMuted, margin: '0 0 10px' }}>
-                  {archiveAccess.level === 'admin'
-                    ? 'Admin access — any past day, unrestricted.'
-                    : `Subscriber access — up to the last ${archiveAccess.level === 'subscriber' ? archiveAccess.maxDaysBack : 5} days.`}
-                </p>
-
-                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
-                  {[
-                    { label: 'Today', daysAgo: 0 },
-                    { label: 'Yesterday', daysAgo: 1 },
-                    { label: '3 days ago', daysAgo: 3 },
-                    { label: '1 week ago', daysAgo: 7 },
-                  ].map((preset) => (
-                    <button
-                      key={preset.label}
-                      onClick={() => quickPick(preset.daysAgo)}
-                      style={{
-                        fontFamily: FONT_BODY,
-                        fontSize: 11,
-                        fontWeight: 700,
-                        padding: '5px 11px',
-                        borderRadius: 999,
-                        border: `1px solid ${COLORS.border}`,
-                        background: 'transparent',
-                        color: COLORS.textMuted,
-                        cursor: 'pointer',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {preset.label}
-                    </button>
-                  ))}
-                </div>
-
-                <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
-                  <input
-                    type="date"
-                    value={selectedDateStr}
-                    max={todayStr}
-                    min={minDateStr}
-                    onChange={(e) => setSelectedDateStr(e.target.value)}
-                    style={{
-                      flex: 1,
-                      minWidth: 140,
-                      padding: '9px 10px',
-                      borderRadius: 8,
-                      border: `1px solid ${COLORS.border}`,
-                      background: COLORS.surfaceAlt,
-                      color: COLORS.textPrimary,
-                      fontFamily: FONT_BODY,
-                      fontSize: 13,
-                    }}
-                  />
-                  <select
-                    value={tierFilter}
-                    onChange={(e) => setTierFilter(e.target.value as TicketTier | 'all')}
-                    style={{
-                      padding: '9px 10px',
-                      borderRadius: 8,
-                      border: `1px solid ${COLORS.border}`,
-                      background: COLORS.surfaceAlt,
-                      color: COLORS.textPrimary,
-                      fontFamily: FONT_BODY,
-                      fontSize: 12.5,
-                    }}
-                  >
-                    <option value="all">All tiers</option>
-                    {TIER_CONFIG.map((c) => (
-                      <option key={c.tier} value={c.tier}>
-                        {c.label}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    onClick={() => loadDate(selectedDateStr)}
-                    disabled={dateLoading}
-                    style={{
-                      padding: '9px 16px',
-                      borderRadius: 8,
-                      border: 'none',
-                      background: COLORS.emerald,
-                      color: '#ffffff',
-                      fontFamily: FONT_BODY,
-                      fontWeight: 700,
-                      fontSize: 12.5,
-                      cursor: dateLoading ? 'not-allowed' : 'pointer',
-                    }}
-                  >
-                    {dateLoading ? '...' : 'Search'}
-                  </button>
-                </div>
-
-                {dateLoading && (
-                  <div style={{ fontSize: 12, color: COLORS.textMuted }}>Loading {selectedDateStr}...</div>
-                )}
-
-                {dateLoaded && !dateLoading && filteredDateTickets.length === 0 && (
-                  <div style={{ fontSize: 12, color: COLORS.textMuted }}>
-                    No tickets found for {selectedDateStr}
-                    {tierFilter !== 'all'
-                      ? ` in ${TIER_CONFIG.find((c) => c.tier === tierFilter)?.label ?? tierFilter}`
-                      : ''}
-                    .
-                  </div>
-                )}
-
-                {!dateLoading &&
-                  filteredDateTickets.map((t) => (
-                    <TicketCard
-                      key={t.id}
-                      ticket={t}
-                      trialActive={true}
-                      unlocked={true}
-                      isSignedIn={true}
-                      isAdmin={isAdmin}
-                      hasSaintsLockAccess={true}
-                      onWatchAd={() => {}}
-                      onSubscribe={() => {}}
-                      onPayPerTicket={() => {}}
-                      onSelectMatch={setDateSelectedMatch}
-                      onEditAsAdmin={onEditAsAdmin}
-                    />
-                  ))}
-              </>
             )}
           </>
-        )}
-
-        {dateSelectedMatch && (
-          <MatchAnalysisModal match={dateSelectedMatch} onClose={() => setDateSelectedMatch(null)} />
         )}
       </div>
     </div>
@@ -2732,7 +2456,7 @@ function PerformanceHistory({ history }: { history: DayPerformance[] }) {
         Last {history.length} days
       </div>
 
-      {/* Tier filter tabs — horizontally scrollable so all 9 fit on mobile */}
+      {/* Tier filter tabs — horizontally scrollable so all tiers fit on mobile */}
       <div
         style={{
           display: 'flex',
@@ -3485,7 +3209,7 @@ export default function Page() {
   const [anonTrialStart, setAnonTrialStart] = useState<string | null>(null);
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [selectedMatch, setSelectedMatch] = useState<Match | null>(null);
-  const [showSearch, setShowSearch] = useState(false);
+  const [showTeamSearch, setShowTeamSearch] = useState(false);
   const [showArchive, setShowArchive] = useState(false);
   const [archiveAccess, setArchiveAccess] = useState<ArchiveAccess>({ level: 'none' });
   const [saintsLockAccess, setSaintsLockAccess] = useState<SaintsLockAccess>({ active: false, expiresAt: null });
@@ -3528,6 +3252,11 @@ export default function Page() {
       setLoading(false);
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
       getSaintsLockAccess(user?.id ?? null).then((a) => mounted && setSaintsLockAccess(a));
+      // Capture the visitor's browser timezone into user_profiles the
+      // moment we know who's signed in, so the lifecycle-email sender
+      // (scripts/send-lifecycle-emails.mjs) can schedule daily nudges at
+      // THIS person's actual local hour rather than a single global time.
+      if (user?.id) syncUserTimezone(user.id, user.email ?? null);
     });
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
@@ -3537,6 +3266,10 @@ export default function Page() {
       setRegisteredAt(user?.created_at ?? null);
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
       getSaintsLockAccess(user?.id ?? null).then((a) => mounted && setSaintsLockAccess(a));
+      // Same capture on every subsequent sign-in/sign-out/token-refresh
+      // event — covers OAuth sign-ins too, not just the initial magic-link
+      // session picked up above.
+      if (user?.id) syncUserTimezone(user.id, user.email ?? null);
     });
 
     return () => {
@@ -3671,8 +3404,8 @@ export default function Page() {
         <Logo light />
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <button
-            onClick={() => setShowSearch(true)}
-            aria-label="Search teams or past tickets"
+            onClick={() => setShowTeamSearch(true)}
+            aria-label="Search a team"
             style={{
               background: 'rgba(255,255,255,0.12)',
               border: '1px solid rgba(255,255,255,0.4)',
@@ -3906,20 +3639,8 @@ export default function Page() {
         <MatchAnalysisModal match={selectedMatch} onClose={() => setSelectedMatch(null)} />
       )}
 
-      {/* Unified search — team lookup (team_match_history view) plus
-          date-based ticket search. Date search reuses the same access rule
-          as the ticket archive (admin unlimited, subscriber lookback
-          window, everyone else sees an upgrade prompt on that tab instead
-          of the tab being hidden) — see SearchModal above. */}
-      {showSearch && (
-        <SearchModal
-          onClose={() => setShowSearch(false)}
-          archiveAccess={archiveAccess}
-          isAdmin={isAdmin}
-          onEditAsAdmin={setEditingTicket}
-          onSubscribe={() => handleSubscribe()}
-        />
-      )}
+      {/* Team history search — queries the team_match_history view directly */}
+      {showTeamSearch && <TeamSearchModal onClose={() => setShowTeamSearch(false)} />}
 
       {/* Ticket archive — trigger only renders for admin/subscriber, but the
           real security boundary is Supabase RLS on the admins/subscribers
