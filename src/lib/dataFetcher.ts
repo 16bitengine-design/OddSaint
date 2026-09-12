@@ -5,9 +5,8 @@
 // If no real data exists yet for a given day — e.g. before the pipeline's
 // first run, or a day it couldn't assemble enough fixtures — this falls
 // back to a lightweight, DETERMINISTIC mock generator so the UI never
-// breaks. Every mock ticket is seeded from its calendar date (or, for
-// weekly-cadence tiers, its calendar WEEK) + tier + slip number, so
-// calling the same day/week twice always returns identical results.
+// breaks. Every mock ticket is seeded from its calendar date + tier + slip
+// number, so calling the same day twice always returns identical results.
 //
 // IMPORTANT: the mock generator's outcome probabilities are PLACEHOLDER
 // constants for demo/fallback purposes only — not a real track record.
@@ -24,11 +23,8 @@ export type TicketTier =
   | 'bronze'
   | 'silver'
   | 'gold'
-  | 'platinum'
-  | 'diamond'
   | 'weekly_lite'
   | 'weekly_titan'
-  | 'weekend'
   | 'saints_lock';
 
 export interface Match {
@@ -66,72 +62,57 @@ export interface TierConfig {
   tier: TicketTier;
   label: string;
   matchCount: number;
-  /** Only set for tiers with a variable leg count (currently just 'weekend') — see maxMatchCount. */
-  minMatchCount?: number;
-  /** Only set for tiers with a variable leg count (currently just 'weekend'). matchCount above is used as the display/mock ceiling when this is unset. */
-  maxMatchCount?: number;
   oddsRange: string;
   alwaysFree: boolean;
 }
 
 // Tier definitions per the product spec.
 //
-// Platinum/Diamond match counts are each ONE FEWER than their "standard"
-// size (10/15) — a deliberate reduction to raise real-world win probability
-// by cutting one compounding leg of bookmaker margin per ticket. MUST stay
-// in sync with TIER_CONFIG in scripts/generate-tickets.mjs.
+// Platinum and Diamond were removed from the product lineup — they were
+// also the two hardest tiers to reliably assemble (25-300x and 300+x
+// cumulative odds need either huge leg counts or extreme long-shot legs).
+// Existing historical Platinum/Diamond ticket rows in Supabase are left
+// untouched (no CHECK constraint on tickets.tier) — the archive can still
+// display them, they just fall back to their raw tier string as a label
+// since TIER_CONFIG no longer has a matching entry. MUST stay in sync with
+// TIER_CONFIG in scripts/generate-tickets.mjs.
 //
-// weekly_lite / weekly_titan / weekend are WEEKLY-CADENCE tiers — at most
-// one ticket per ~7 days, not one per day like every other tier. See
-// getWeeklyCadenceSlipCount / weekKey below for how the mock generator
-// mirrors that, and WEEKLY_CADENCE_TIERS in scripts/generate-tickets.mjs
-// for the real pipeline's equivalent.
+// Weekly Lite/Titan match counts are each ONE FEWER than their "standard"
+// size (20/30) — a deliberate reduction to raise real-world win
+// probability by cutting one compounding leg of bookmaker margin per
+// ticket.
 export const TIER_CONFIG: TierConfig[] = [
   { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
   { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
   { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
   { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
-  { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
-  { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
   { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
-  // Weekend accumulator, Friday–Sunday's fixtures, 18-30 legs (variable,
-  // not fixed). Once a week, same cadence family as weekly_lite/titan.
-  {
-    tier: 'weekend',
-    label: "The Saint's Gauntlet",
-    matchCount: 24, // display/mock midpoint — real leg count varies 18-30, see minMatchCount/maxMatchCount
-    minMatchCount: 18,
-    maxMatchCount: 30,
-    oddsRange: 'Mixed',
-    alwaysFree: false,
-  },
   { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2', alwaysFree: false },
 ];
 
 // ---------------------------------------------------------------------------
-// Daily slip volume + staggered release (mega/bronze/silver/gold/platinum/diamond)
+// Daily slip volume + staggered release
 // ---------------------------------------------------------------------------
+// Every category caps at 2 tickets/day (down from 3) — mirrors
+// MAX_TICKETS_PER_CATEGORY in scripts/generate-tickets.mjs. The two daily
+// slots release at different times (see RELEASE_SLOT_HOURS_UTC, matching
+// the two cron triggers in generate-tickets.yml) rather than simultaneously
+// — a tier's 2nd slip is a genuinely fresh batch released later in the day,
+// not an alternative shown alongside the 1st, so there's no "which of
+// these do I pick right now" moment for users to be confused by. Whatever
+// batch is currently on Supabase simply stays on screen until the next
+// scheduled slot writes a new row — nothing here ever deletes a previous
+// slip, so "previous batch stays visible until the next one lands" falls
+// out of the read path for free.
 const MAX_TICKETS_PER_CATEGORY = 2;
 
 /** UTC hours the two daily release slots fire at — must match the cron schedule in .github/workflows/generate-tickets.yml. */
 export const RELEASE_SLOT_HOURS_UTC = [6, 14];
 
-// Tiers that release at most once per ~7 days rather than daily — mirrors
-// WEEKLY_CADENCE_TIERS in scripts/generate-tickets.mjs. The mock generator
-// below seeds these off the calendar WEEK (see weekKey), not the calendar
-// day, so — same as the real pipeline — a visitor sees the same weekly
-// ticket all week rather than a new one appearing every time they reload.
-const WEEKLY_CADENCE_TIERS = new Set<TicketTier>(['weekly_lite', 'weekly_titan', 'weekend']);
-
-function isWeeklyCadenceTier(tier: TicketTier): boolean {
-  return WEEKLY_CADENCE_TIERS.has(tier);
-}
-
 function getDailySlipCount(tier: TicketTier, day: string, date: Date): number {
   if (tier === 'saints_lock') return Math.min(MAX_TICKETS_PER_CATEGORY, 2); // min 1/max 2 guaranteed by the real pipeline; see SAINTS_LOCK_MIN_CONFIDENCE
-  if (isWeeklyCadenceTier(tier)) return 1; // one slip per WEEK, not per day — see getTicketsForDate's use of weekKey for these tiers
-  if (tier === 'platinum' || tier === 'diamond') {
+  if (tier === 'weekly_lite' || tier === 'weekly_titan') {
     return 1; // large accumulators — one curated slip a day
   }
   // mega / bronze / silver / gold: scale with a deterministic "busyness"
@@ -144,10 +125,7 @@ function getDailySlipCount(tier: TicketTier, day: string, date: Date): number {
  * Given "today" in the visitor's local view, returns a human label for
  * when the tier's NEXT release slot lands — used by the frontend so users
  * know when to check back rather than risk missing a batch. Purely a
- * display helper; it does not affect what data gets fetched. Applies only
- * to the STAGGERED daily tiers — weekly-cadence tiers have their own
- * "released this week" framing, shown elsewhere (see the ticket's own
- * availableAt/releasedThisWeek info on the card itself).
+ * display helper; it does not affect what data gets fetched.
  */
 export function getNextReleaseLabel(now: Date = new Date()): { label: string; hasReleasedToday: boolean } {
   const nowUTCHours = now.getUTCHours() + now.getUTCMinutes() / 60;
@@ -204,8 +182,7 @@ const GRADE_BUFFER_MS = 2.5 * 60 * 60 * 1000;
 
 function seededRandom(seed: number) {
   // Deterministic pseudo-random generator — same seed always produces the
-  // same sequence, which is what makes a given day's (or week's) tickets
-  // stable.
+  // same sequence, which is what makes a given day's tickets stable.
   let s = seed;
   return () => {
     s = (s * 9301 + 49297) % 233280;
@@ -228,43 +205,6 @@ export function dateKey(date: Date): string {
   const m = String(date.getMonth() + 1).padStart(2, '0');
   const d = String(date.getDate()).padStart(2, '0');
   return `${y}-${m}-${d}`;
-}
-
-/**
- * ISO-8601 week identifier ('YYYY-Www'), used as the seed root for
- * weekly-cadence tiers (weekly_lite, weekly_titan, weekend) instead of
- * dateKey — this is what makes the mock generator produce the SAME
- * weekly ticket for every day within that week, mirroring how the real
- * pipeline only writes one row per tier per ~7 days (see
- * WEEKLY_CADENCE_TIERS in scripts/generate-tickets.mjs). Monday is treated
- * as the start of the week, per ISO-8601.
- */
-export function weekKey(date: Date): string {
-  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
-  const dayNum = (d.getUTCDay() + 6) % 7; // Mon=0 .. Sun=6
-  d.setUTCDate(d.getUTCDate() - dayNum + 3); // shift to the Thursday of this ISO week
-  const isoYearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
-  const weekNum = 1 + Math.round(((d.getTime() - isoYearStart.getTime()) / 86400000 - 3 + ((isoYearStart.getUTCDay() + 6) % 7)) / 7);
-  return `${d.getUTCFullYear()}-W${String(weekNum).padStart(2, '0')}`;
-}
-
-/**
- * The Friday that starts the given date's Fri-Sun window (this week's if
- * `date` falls Fri/Sat/Sun, otherwise the upcoming one) — used to anchor
- * the weekend ticket's mock kickoffs and availableAt timestamp so they
- * land on a plausible Fri/Sat/Sun date rather than the arbitrary day the
- * visitor happens to load the page on.
- */
-function getWeekendFriday(date: Date): Date {
-  const day = date.getDay(); // 0=Sun..6=Sat, local time is fine for a display-only mock anchor
-  let offset: number;
-  if (day === 5) offset = 0;
-  else if (day === 6) offset = -1;
-  else if (day === 0) offset = -2;
-  else offset = 5 - day;
-  const friday = new Date(date);
-  friday.setDate(friday.getDate() + offset);
-  return friday;
 }
 
 /**
@@ -389,16 +329,14 @@ function buildMatch(
 }
 
 // Numeric cumulative-odds targets matching each tier's oddsRange label.
-// Mirrors TIER_ODDS_TARGET in scripts/generate-tickets.mjs. Weekly
-// Lite/Titan and the weekend ticket are intentionally left unset ("Mixed"
-// by design, no fixed target).
+// Mirrors TIER_ODDS_TARGET in scripts/generate-tickets.mjs — mock data
+// should behave the same way real data does. Weekly Lite/Titan
+// intentionally left unset ("Mixed" by design, no fixed target).
 const TIER_ODDS_TARGET: Partial<Record<TicketTier, [number, number]>> = {
   mega: [1.5, 3],
   bronze: [2, 3],
   silver: [3, 5],
   gold: [5, 10],
-  platinum: [25, 300],
-  diamond: [300, Infinity],
 };
 
 /**
@@ -416,7 +354,7 @@ function adjustOddsToTarget(matches: Match[], targetRange: [number, number] | un
     if (total >= minTotal && total <= maxTotal) return;
 
     const target = total < minTotal ? minTotal : maxTotal;
-    if (!Number.isFinite(target)) return; // diamond's upper bound is Infinity — nothing to scale toward
+    if (!Number.isFinite(target)) return; // an unbounded (Infinity) upper target — nothing to scale toward
     const factorPerLeg = Math.pow(target / total, 1 / matches.length);
 
     matches.forEach((m) => {
@@ -426,23 +364,10 @@ function adjustOddsToTarget(matches: Match[], targetRange: [number, number] | un
   }
 }
 
-/**
- * Decide the overall ticket outcome first, then build per-match statuses
- * consistent with it. `anchorDay` is the calendar day mock kickoffs are
- * spread across — normally the ticket's own date, but for the weekend
- * tier this is the Friday of its Fri-Sun window (see getWeekendFriday)
- * rather than "today", so mock kickoffs land on a plausible weekend date
- * regardless of which day of the week a visitor happens to load the page.
- */
-function buildTicket(config: TierConfig, seed: number, anchorDay: Date, releaseSlot: number): Ticket {
+/** Decide the overall ticket outcome first, then build per-match statuses consistent with it. */
+function buildTicket(config: TierConfig, seed: number, day: Date, releaseSlot: number): Ticket {
   const rand = seededRandom(seed);
-
-  // Variable leg count for the weekend tier (18-30) — every other tier
-  // uses a fixed matchCount.
-  const n = config.minMatchCount && config.maxMatchCount
-    ? config.minMatchCount + Math.floor(rand() * (config.maxMatchCount - config.minMatchCount + 1))
-    : config.matchCount;
-
+  const n = config.matchCount;
   const maxOdds = n < 7 ? SMALL_TICKET_MAX_ODDS : 3.8;
 
   const outcomeRoll = rand();
@@ -469,21 +394,7 @@ function buildTicket(config: TierConfig, seed: number, anchorDay: Date, releaseS
   // overall === 'green' → statuses stays all-green (subject to the
   // played/not-played gate applied per match inside buildMatch).
 
-  // For the weekend tier, spread matches across all 3 days of the Fri-Sun
-  // window (not just one calendar day) — every 1-in-3 matches lands on
-  // Friday/Saturday/Sunday respectively, cycling by index.
-  const isWeekend = !!(config.minMatchCount && config.maxMatchCount);
-  const matches = Array.from({ length: n }, (_, i) => {
-    const matchDay = isWeekend
-      ? (() => {
-          const d = new Date(anchorDay);
-          d.setDate(d.getDate() + (i % 3));
-          return d;
-        })()
-      : anchorDay;
-    return buildMatch(rand, i, seed, statuses[i], matchDay, maxOdds);
-  });
-
+  const matches = Array.from({ length: n }, (_, i) => buildMatch(rand, i, seed, statuses[i], day, maxOdds));
   adjustOddsToTarget(matches, TIER_ODDS_TARGET[config.tier], 1.3, maxOdds);
   const totalOdds = Math.round(matches.reduce((acc, m) => acc * m.odds, 1) * 100) / 100;
 
@@ -493,7 +404,7 @@ function buildTicket(config: TierConfig, seed: number, anchorDay: Date, releaseS
   // "just released."
   const slotHour = RELEASE_SLOT_HOURS_UTC[releaseSlot] ?? RELEASE_SLOT_HOURS_UTC[0];
   const availableAt = new Date(
-    Date.UTC(anchorDay.getFullYear(), anchorDay.getMonth(), anchorDay.getDate(), slotHour, 0)
+    Date.UTC(day.getFullYear(), day.getMonth(), day.getDate(), slotHour, 0)
   ).toISOString();
 
   return {
@@ -526,10 +437,6 @@ export function getTicketStatus(ticket: Ticket): MatchStatus {
 /**
  * Generates every ticket for a given calendar day — deterministically, so
  * the same date always regenerates identical tickets and outcomes.
- * WEEKLY-CADENCE TIERS (weekly_lite, weekly_titan, weekend) are seeded off
- * the calendar WEEK instead of the day (see weekKey), so the same weekly
- * ticket shows up for every day within that week — mirroring how the real
- * pipeline only writes one row per tier per ~7 days rather than per day.
  *
  * Replace this with a real Supabase query once tickets are graded and
  * stored server-side, e.g.:
@@ -541,18 +448,13 @@ export function getTicketStatus(ticket: Ticket): MatchStatus {
  */
 export function getTicketsForDate(date: Date): Ticket[] {
   const day = dateKey(date);
-  const week = weekKey(date);
   const tickets: Ticket[] = [];
 
   TIER_CONFIG.forEach((config) => {
-    const weekly = isWeeklyCadenceTier(config.tier);
     const count = getDailySlipCount(config.tier, day, date);
-    const anchorDay = config.tier === 'weekend' ? getWeekendFriday(date) : date;
-
     for (let i = 0; i < count; i++) {
-      const seedKey = weekly ? `${week}-${config.tier}-${i}` : `${day}-${config.tier}-${i}`;
-      const seed = hashSeed(seedKey);
-      tickets.push(buildTicket(config, seed, anchorDay, i));
+      const seed = hashSeed(`${day}-${config.tier}-${i}`);
+      tickets.push(buildTicket(config, seed, date, i));
     }
   });
 
@@ -564,18 +466,6 @@ export function getTicketsForDate(date: Date): Ticket[] {
  * Returns null (rather than an empty array) when there's nothing real to
  * show yet, so the caller can fall back to mock data instead of rendering
  * an empty feed.
- *
- * NOTE: weekly-cadence tickets (weekly_lite, weekly_titan, weekend) are
- * written by the real pipeline with today's `ticket_date` only on the run
- * that actually produces them — on the other 6 days of the week this
- * query correctly returns nothing NEW for those tiers, same as any other
- * un-generated slip. The frontend keeps showing the last real ticket it
- * already has in state rather than re-querying "today" for a tier that
- * hasn't refreshed — see reloadTickets/fetchTickets in page.tsx, which
- * always fetches by the CURRENT date, so for a full week-accurate feed the
- * archive view (fetchTickets(pastDate)) is what shows a tier's actual
- * `ticket_date` history, and the live feed simply shows whatever the most
- * recent real row is once one exists for today or was carried forward.
  */
 async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
   const day = dateKey(date);
@@ -634,6 +524,13 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
 
     return {
       id: row.id,
+      // NOTE: a historical Platinum/Diamond row's `tier` string won't
+      // match any TicketTier union member anymore — this cast is
+      // permissive at compile time but the value itself is just whatever
+      // string is in the database. tierLabel() below falls back to that
+      // raw string when TIER_CONFIG has no matching entry, so an old
+      // Platinum/Diamond ticket still renders (with its raw tier name as
+      // the label) instead of breaking.
       tier: row.tier as TicketTier,
       label: tierLabel(row.tier),
       slipLabel: row.slip_label ?? undefined,
@@ -650,7 +547,9 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
   // Previous batches stay visible alongside the newest one — sort order
   // just needs to be stable and tier-grouped; nothing here filters out an
   // earlier release_slot, so both of a tier's slips for the day (if both
-  // exist yet) show up until superseded tomorrow.
+  // exist yet) show up until superseded tomorrow. A historical
+  // Platinum/Diamond row (tier not in tierOrder) sorts after every known
+  // tier via indexOf's -1 fallback, then by id.
   tickets.sort(
     (a, b) =>
       tierOrder.indexOf(a.tier) - tierOrder.indexOf(b.tier) ||
