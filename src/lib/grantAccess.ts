@@ -1,8 +1,11 @@
 import { getSupabaseAdmin } from '@/lib/supabaseAdmin';
 import { PLANS, isValidPlanId, SAINTS_LOCK_PLANS, isValidSaintsLockPlanId } from '@/lib/plans';
-import { sendBrevoEmail } from '@/lib/brevo';
-import { tryClaimNotification } from '@/lib/notificationLog';
-import { welcomeSubscriptionEmail, welcomeSaintsLockEmail } from '@/lib/emailTemplates';
+import {
+  sendBrevoEmail,
+  tryClaimNotification,
+  welcomeSubscriptionEmail,
+  welcomeSaintsLockEmail,
+} from '@/lib/lifecycleEmail';
 
 // ---------------------------------------------------------------------------
 // Grants access after a verified successful payment. Used by both the
