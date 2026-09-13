@@ -1,0 +1,33 @@
+name: Odd Saint — Yearly Audit Report
+
+# Scheduled January 2nd at 07:00 UTC (a day after the quarterly report's
+# Jan 1 run, so the two don't race) — can also be triggered manually from
+# the Actions tab. REPORT ONLY: reads Supabase + GA4, writes to this run's
+# step summary, changes nothing automatically.
+on:
+  schedule:
+    - cron: '0 7 2 1 *'
+  workflow_dispatch: {}
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build yearly audit report
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GA4_PROPERTY_ID: ${{ secrets.GA4_PROPERTY_ID }}
+          GA4_SERVICE_ACCOUNT_KEY: ${{ secrets.GA4_SERVICE_ACCOUNT_KEY }}
+        run: node scripts/audit-yearly.mjs

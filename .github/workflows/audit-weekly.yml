@@ -1,0 +1,36 @@
+name: Odd Saint — Weekly Audit Report
+
+# Scheduled every Monday at 05:00 UTC (after the Sunday grading cycle has
+# settled most of the weekend's fixtures) — can also be triggered manually
+# from the Actions tab for an ad-hoc check. REPORT ONLY: reads Supabase +
+# GA4, writes to this run's step summary, changes nothing automatically.
+on:
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch: {}
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build weekly audit report
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Optional — GA4 traffic/location/age sections are skipped
+          # gracefully if these two secrets aren't set yet. See
+          # scripts/lib/ga4.mjs for one-time setup steps.
+          GA4_PROPERTY_ID: ${{ secrets.GA4_PROPERTY_ID }}
+          GA4_SERVICE_ACCOUNT_KEY: ${{ secrets.GA4_SERVICE_ACCOUNT_KEY }}
+        run: node scripts/audit-weekly.mjs
