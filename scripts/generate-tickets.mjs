@@ -8,6 +8,12 @@
 // decides whether it's producing today's 1st or 2nd slip for a tier, or
 // skipping that tier entirely because it already has both.
 //
+// API-FOOTBALL FREE PLAN BUDGET (confirmed): 100 requests/day total, 10/min,
+// resetting at 00:00 UTC with no rollover. EVERY endpoint call counts
+// against the same 100 — fixtures, odds, leagues, all of it. This script's
+// pricing step is built around that hard ceiling — see the budget comment
+// on MAX_NEW_ODDS_LOOKUPS_PER_RUN below for the actual daily arithmetic.
+//
 // HONEST SCOPE NOTE (read this before treating the output as a finished
 // prediction engine): the "AI Confidence Index" here is a simple, transparent
 // heuristic derived from bookmaker consensus odds (implied probability),
@@ -35,6 +41,12 @@ const LEAGUES_JSON_PATH = join(__dirname, 'lib', 'leagues.json');
 // scripts/lib/leagues.json. One /fixtures?date= call already returns every
 // league for that date regardless of allowlist size — filtering here
 // doesn't cost extra API requests either way.
+//
+// NOTE: resolve-leagues.mjs spends roughly 1 request per country it checks
+// (~60 requests for the full list) — it's manual-trigger-only specifically
+// so it never collides with the 100/day budget this file depends on. Avoid
+// running it on a day you also need generate-tickets to have its full
+// pricing budget.
 const DEFAULT_LEAGUE_ALLOWLIST = new Set([
   39,  // Premier League
   140, // La Liga
@@ -71,32 +83,31 @@ function loadLeagueAllowlist() {
 
 const LEAGUE_ALLOWLIST = loadLeagueAllowlist();
 
-// Caps how many /odds requests the DAILY pool spends (mega/bronze/silver/
-// gold/saints_lock all draw from this pool). Kept modest — even with the
-// tightened MAX_FIXTURE_APPEARANCES_PER_DAY = 2 reuse cap, the daily-pool
-// tiers only need a combined ~20 leg-slots per run (4+3+5+7+1), so this
-// has headroom without over-spending the free-plan request budget.
-const MAX_ODDS_LOOKUPS_PER_RUN_DAILY = 30;
-
-// Caps how many /odds requests the WEEKLY pool spends (weekly_lite /
-// weekly_titan). Raised well above the daily budget because Weekly Titan
-// alone needs 29 successfully-priced legs (fixtures that clear
-// MIN_CONFIDENCE and have a usable market) — under the OLD shared budget
-// of 25, Weekly Titan could NEVER generate: pickFixturesForSlip's
-// no-target-range branch requires ranked.length >= maxMatchCount (29),
-// which a 25-lookup pool can never reach even under perfect conditions.
-// This was a structural bug, not bad luck.
+// ---------------------------------------------------------------------------
+// BUDGET: this is the single most important constant in this file.
 //
-// COST TRADE-OFF: this roughly doubles the /odds requests spent on the
-// weekly-pool fetch versus the old shared constant. That's more
-// API-Football requests per run (this pool is fetched once per
-// generate-tickets run, i.e. twice a day) — worth watching against your
-// plan's daily request cap. If you hit it, lower this constant and/or
-// weekly_titan's matchCount below (keep dataFetcher.ts's copy in sync).
-const MAX_ODDS_LOOKUPS_PER_RUN_WEEKLY = 45;
+// API-Football's free plan allows exactly 100 requests/day, resetting at
+// 00:00 UTC, with NO rollover of unused requests. Every automated consumer
+// of that quota, worst case, per day:
+//
+//   Fixture-list calls   : 2 dates (today + tomorrow) x 2 runs/day  =  4
+//   Odds lookups         : MAX_NEW_ODDS_LOOKUPS_PER_RUN x 2 runs    = 80  (at 40/run)
+//   Grading              : <=1 request x 8 runs/day (every 3h)     =  8
+//                                                                   ----
+//                                                             Total = 92  (8-request margin)
+//
+// The 80 in that table is a WORST CASE that assumes zero reuse between the
+// day's two generate-tickets runs — in practice the second run reuses
+// whatever the first run already priced today (see fetchAlreadyPricedFixturesToday
+// / buildPricedPool below), so real spend should land noticeably under 92.
+// Raising MAX_NEW_ODDS_LOOKUPS_PER_RUN past 40 shrinks that margin — do the
+// arithmetic above again before changing it, and remember resolve-leagues.mjs
+// (manual, ~60 requests) and any manual re-runs also draw from the same
+// 100/day pool on whatever day they're triggered.
+const MAX_NEW_ODDS_LOOKUPS_PER_RUN = 40;
 
 // Named priority leagues break ties when ASSEMBLING tickets from the priced
-// pool (see the final sort at the end of fetchPricedFixtures, and
+// pool (see the final sort at the end of buildPricedPool, and
 // poolForTier/pickFixturesForSlip below) — and get first look in each
 // round of the odds-lookup rotation (see PER_LEAGUE_LOOKUPS_PER_ROUND).
 // They are NOT an exclusive gate on which leagues get priced: on a day
@@ -137,7 +148,8 @@ const PER_LEAGUE_LOOKUPS_PER_ROUND = 3;
 // today (typically yesterday through tomorrow) — requesting further out
 // returns a "Free plans do not have access to this date" error. Set to 1
 // to stay within that window; if you upgrade your API plan later, this can
-// go back up to pull a genuine week's worth of fixtures.
+// go back up to pull a genuine week's worth of fixtures (and the budget
+// arithmetic above will need revisiting).
 const WEEKLY_LOOKAHEAD_DAYS = 1;
 
 // A curated set of marquee clubs across the covered leagues. Fixtures where
@@ -175,6 +187,15 @@ const TIER_CONFIG = [
   // tier size (20/30) — a deliberate reduction to raise real-world win
   // probability by cutting one compounding leg of bookmaker margin per
   // ticket. Must stay in sync with TIER_CONFIG in src/lib/dataFetcher.ts.
+  //
+  // HONEST LIMIT: Weekly Titan needs 29 successfully-priced legs. Even
+  // with the same-day pricing cache below, a day with genuinely few
+  // eligible fixtures (quiet midweek slate, thin leagues) may still not
+  // reach 29 — this is an inherent limit of a free, rate-limited data
+  // source, not a bug. If Titan skips more often than you'd like, the
+  // levers are: raise MAX_NEW_ODDS_LOOKUPS_PER_RUN (re-check the budget
+  // arithmetic above first), or lower matchCount here and in
+  // dataFetcher.ts.
   { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
   // Single-match, ultra-high-confidence category. Only ever one match —
@@ -289,6 +310,39 @@ async function fetchTodaysFixtureUsage(supabase, today) {
   return usage;
 }
 
+/**
+ * Reads every fixture already priced today (from EITHER of today's runs so
+ * far) straight from Supabase — no API-Football cost at all, this is our
+ * own database. This is what lets the 14:00 UTC run reuse the 06:00 UTC
+ * run's pricing work for free instead of re-spending the odds-lookup
+ * budget on the same matches twice in one day. See the budget comment on
+ * MAX_NEW_ODDS_LOOKUPS_PER_RUN for why this matters under a 100-request/day
+ * ceiling.
+ */
+async function fetchAlreadyPricedFixturesToday(supabase, today) {
+  const { data, error } = await supabase
+    .from('fixtures')
+    .select('id, league, home_team, away_team, kickoff, market, odds, confidence')
+    .eq('ticket_date', today);
+  if (error) throw error;
+
+  const cache = new Map(); // fixtureId -> priced fixture shape (see buildPricedPool)
+  (data ?? []).forEach((row) => {
+    cache.set(row.id, {
+      fixtureId: row.id,
+      ticketDate: today,
+      league: row.league,
+      homeTeam: row.home_team,
+      awayTeam: row.away_team,
+      kickoff: row.kickoff,
+      market: row.market,
+      odds: row.odds,
+      confidence: row.confidence,
+    });
+  });
+  return cache;
+}
+
 // --- Fetch + price fixtures ---------------------------------------------------
 
 // Empty by default — add exact team names here (matching API-Football's
@@ -306,49 +360,71 @@ function isExcluded(homeTeam, awayTeam) {
   return EXCLUDED_TEAMS.has(homeTeam) || EXCLUDED_TEAMS.has(awayTeam);
 }
 
+function isEligibleFixture(f) {
+  return (
+    LEAGUE_ALLOWLIST.has(f.league?.id) &&
+    !isWomensCompetition(f.league?.name) &&
+    !isBigClash(f.teams?.home?.name, f.teams?.away?.name) &&
+    !isExcluded(f.teams?.home?.name, f.teams?.away?.name)
+  );
+}
+
 /**
- * Fetches and prices fixtures for the given dates, spending up to
- * `maxOddsLookups` /odds requests total.
+ * Prices fixtures across every date in `fixturesByDate` (a Map of
+ * dateStr -> raw fixtures array, already fetched by the caller so each
+ * date's /fixtures endpoint is only ever called once per run — see
+ * main()). Spends up to `maxNewLookups` FRESH /odds requests total;
+ * anything already present in `alreadyPricedCache` (today's earlier run)
+ * is reused at zero API cost instead of being re-fetched.
  *
- * FLEXIBLE LEAGUE ROTATION (this is the fix for "glued to particular
- * leagues"): fixtures are grouped by league, then priced in a round-robin
- * rotation — named priority leagues go first each round, but only
- * PER_LEAGUE_LOOKUPS_PER_ROUND lookups at a time, before the rotation
- * moves on to the next league (priority or not) that still has fixtures
- * queued. The rotation repeats until either the budget runs out or every
- * league's queue is empty.
+ * SINGLE COMBINED POOL: previously the daily and weekly pools were built
+ * by two separate calls to this function, each with its own budget and
+ * its own 'seen' map — meaning a fixture kicking off today (eligible for
+ * BOTH pools) got priced and paid for TWICE per run, and the "today"
+ * fixture list itself was fetched twice too. Building one combined pool
+ * here and splitting it into dailyPool/weeklyPool by kickoff date
+ * afterward (see main()) eliminates both of those duplicate spends.
  *
- * The old behavior sorted ALL priority-league fixtures ahead of ALL other
- * fixtures, so a single busy priority league could consume the entire
- * day's odds-lookup budget before any other league was even attempted —
- * including on days where that league's matches were mostly unpredictable
- * coin-flips that would go on to fail MIN_CONFIDENCE anyway. The rotation
- * below means every allowlisted league with fixtures today gets looked at,
- * not just the named priority set — "priority" now only breaks ties once
- * fixtures are being assembled into tickets (see the final sort below).
+ * FLEXIBLE LEAGUE ROTATION (fix for "glued to particular leagues"):
+ * fixtures still needing a fresh price are grouped by league, then priced
+ * in a round-robin rotation — named priority leagues go first each round,
+ * but only PER_LEAGUE_LOOKUPS_PER_ROUND lookups at a time, before the
+ * rotation moves on to the next league (priority or not) that still has
+ * fixtures queued. The rotation repeats until either the budget runs out
+ * or every league's queue is empty.
  */
-async function fetchPricedFixtures(dates, maxOddsLookups) {
-  const seen = new Map(); // fixtureId -> priced fixture
-  let oddsLookupsUsed = 0;
-  const leagueBreakdown = new Map(); // league name -> count actually priced (for the run summary log)
+async function buildPricedPool(fixturesByDate, maxNewLookups, alreadyPricedCache) {
+  const seen = new Map(); // fixtureId -> priced fixture (cache hits + fresh lookups this run)
+  let newLookupsUsed = 0;
+  let cacheHits = 0;
+  const leagueBreakdown = new Map(); // league name -> count freshly priced this run (for the run summary log)
 
-  for (const d of dates) {
-    const fixtures = await getFixturesForDate(d);
-    const eligible = fixtures.filter(
-      (f) =>
-        LEAGUE_ALLOWLIST.has(f.league?.id) &&
-        !isWomensCompetition(f.league?.name) &&
-        !isBigClash(f.teams?.home?.name, f.teams?.away?.name) &&
-        !isExcluded(f.teams?.home?.name, f.teams?.away?.name)
-    );
-
+  for (const [, fixtures] of fixturesByDate) {
+    const eligible = fixtures.filter(isEligibleFixture);
     if (eligible.length === 0) continue;
 
-    // Group today's eligible fixtures by league so the rotation below can
-    // give each league with fixtures today a fair, repeated turn instead
-    // of exhausting the budget on whichever league sorts first.
-    const byLeague = new Map(); // league name -> fixture queue (FIFO)
+    // Serve anything already priced earlier today straight from the cache,
+    // at zero API cost, before doing any rotation/lookup work for it.
+    const stillNeedsPricing = [];
     eligible.forEach((f) => {
+      const fixtureId = f.fixture.id;
+      if (seen.has(fixtureId)) return; // already resolved earlier in this same pass
+      const cached = alreadyPricedCache.get(fixtureId);
+      if (cached) {
+        seen.set(fixtureId, cached);
+        cacheHits++;
+      } else {
+        stillNeedsPricing.push(f);
+      }
+    });
+
+    if (stillNeedsPricing.length === 0) continue;
+
+    // Group by league so the rotation below gives each league with
+    // fixtures today a fair, repeated turn instead of exhausting the
+    // budget on whichever league sorts first.
+    const byLeague = new Map(); // league name -> fixture queue (FIFO)
+    stillNeedsPricing.forEach((f) => {
       const name = f.league?.name ?? 'Unknown League';
       if (!byLeague.has(name)) byLeague.set(name, []);
       byLeague.get(name).push(f);
@@ -366,11 +442,11 @@ async function fetchPricedFixtures(dates, maxOddsLookups) {
     ].filter((name) => byLeague.has(name));
 
     let anyQueueHasFixtures = true;
-    while (anyQueueHasFixtures && oddsLookupsUsed < maxOddsLookups) {
+    while (anyQueueHasFixtures && newLookupsUsed < maxNewLookups) {
       anyQueueHasFixtures = false;
 
       for (const leagueName of leagueOrder) {
-        if (oddsLookupsUsed >= maxOddsLookups) break;
+        if (newLookupsUsed >= maxNewLookups) break;
 
         const queue = byLeague.get(leagueName);
         if (!queue || queue.length === 0) continue;
@@ -379,16 +455,16 @@ async function fetchPricedFixtures(dates, maxOddsLookups) {
         while (
           takenThisRound < PER_LEAGUE_LOOKUPS_PER_ROUND &&
           queue.length > 0 &&
-          oddsLookupsUsed < maxOddsLookups
+          newLookupsUsed < maxNewLookups
         ) {
           const f = queue.shift();
           takenThisRound++;
           if (queue.length > 0) anyQueueHasFixtures = true;
 
           const fixtureId = f.fixture.id;
-          if (seen.has(fixtureId)) continue; // already priced (e.g. weekly pool overlapping today's date)
+          if (seen.has(fixtureId)) continue; // already resolved (cache hit or earlier in this pass)
 
-          oddsLookupsUsed++;
+          newLookupsUsed++;
           let oddsResponse;
           try {
             oddsResponse = await getOddsForFixture(fixtureId);
@@ -421,12 +497,15 @@ async function fetchPricedFixtures(dates, maxOddsLookups) {
   if (leagueBreakdown.size > 0) {
     // eslint-disable-next-line no-console
     console.log(
-      'Priced fixtures by league this run: ' +
+      'Freshly priced fixtures by league this run: ' +
         Array.from(leagueBreakdown.entries())
           .map(([name, count]) => `${name}: ${count}`)
           .join(', ')
     );
   }
+  console.log(
+    `Fixture pricing: ${cacheHits} reused from earlier today (free), ${newLookupsUsed} fresh /odds request(s) spent this run.`
+  );
 
   // Priority leagues still get first billing once fixtures are being
   // assembled into tickets (equal-confidence tie-break) — but every
@@ -789,37 +868,55 @@ function buildTickets(dailyPool, weeklyPool, slipState, seededUsage) {
 async function main() {
   const today = new Date();
   const todayStr = dateStr(today);
-  const dailyDates = [todayStr];
-  const weeklyDates = [todayStr];
+  const neededDates = [todayStr];
   for (let i = 1; i <= WEEKLY_LOOKAHEAD_DAYS; i++) {
     const d = new Date(today);
     d.setDate(d.getDate() + i);
-    weeklyDates.push(dateStr(d));
+    neededDates.push(dateStr(d));
   }
 
   const supabase = getSupabaseAdmin();
 
-  console.log('Checking today\'s existing slips (staggered-release state)...');
+  console.log("Checking today's existing slips (staggered-release state)...");
   const slipState = await fetchTodaysSlipState(supabase, todayStr);
 
   const anySlotAvailable = [...TIER_CONFIG.map((c) => c.tier)].some(
     (tier) => nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get(tier)) !== null
   );
   if (!anySlotAvailable) {
-    console.log('Every category is already at today\'s cap, or within the min-gap window — nothing to do this run.');
+    console.log("Every category is already at today's cap, or within the min-gap window — nothing to do this run.");
     return;
   }
 
   console.log("Checking today's existing fixture usage (cross-run appearance cap)...");
   const seededUsage = await fetchTodaysFixtureUsage(supabase, todayStr);
 
-  console.log('Fetching daily fixture pool...');
-  const dailyPool = await fetchPricedFixtures(dailyDates, MAX_ODDS_LOOKUPS_PER_RUN_DAILY);
-  console.log(`Priced ${dailyPool.length} fixtures for today.`);
+  console.log("Checking which fixtures are already priced from earlier today (avoids re-spending API-Football's 100/day quota)...");
+  const alreadyPricedCache = await fetchAlreadyPricedFixturesToday(supabase, todayStr);
 
-  console.log('Fetching weekly fixture pool (for Weekly Lite / Weekly Titan)...');
-  const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN_WEEKLY);
-  console.log(`Priced ${weeklyPool.length} fixtures for the week ahead.`);
+  // Each needed date's /fixtures list is fetched ONCE here and shared
+  // between the daily and weekly pools below — previously "today" was
+  // fetched twice per run (once building the daily pool, once building the
+  // weekly pool), silently doubling that request every run.
+  console.log(`Fetching fixture list(s) for: ${neededDates.join(', ')}...`);
+  const fixturesByDate = new Map();
+  for (const d of neededDates) {
+    fixturesByDate.set(d, await getFixturesForDate(d));
+  }
+
+  console.log('Pricing fixtures (reusing anything already priced today; spending fresh /odds requests only where needed)...');
+  const combinedPool = await buildPricedPool(fixturesByDate, MAX_NEW_ODDS_LOOKUPS_PER_RUN, alreadyPricedCache);
+
+  // Split the single combined pool by each fixture's actual kickoff date
+  // rather than by which fetch it came from — dailyPool is "kicks off
+  // today" (used by mega/bronze/silver/gold/saints_lock), weeklyPool is
+  // the whole combined pool, today + tomorrow (used by weekly_lite/titan,
+  // which need more raw fixture volume than a single day usually offers).
+  const dailyPool = combinedPool.filter((p) => p.kickoff && p.kickoff.slice(0, 10) === todayStr);
+  const weeklyPool = combinedPool;
+  console.log(
+    `Daily pool: ${dailyPool.length} fixture(s) kicking off today. Weekly pool: ${weeklyPool.length} fixture(s) across today + tomorrow.`
+  );
 
   const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, slipState, seededUsage);
 
