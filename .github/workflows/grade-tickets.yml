@@ -2,9 +2,18 @@ name: Odd Saint — Grade Fixtures
 
 # Runs every 3 hours to catch matches as they finish throughout the day.
 # Can also be triggered manually from the Actions tab.
+#
+# Offset to :15 past the hour (was :00) so this never fires at the exact
+# same minute as generate-tickets.yml's 06:00/14:00 UTC slots. Both jobs
+# draw from the SAME 100-requests/day API-Football quota, but each runs as
+# a separate GitHub Actions process with its own independent in-process
+# rate limiter (see scripts/lib/apiFootball.mjs) — nothing coordinates the
+# 10-requests/minute ceiling ACROSS two processes hitting the API at the
+# same real-world moment. A 15-minute offset avoids that collision at zero
+# cost; it doesn't change the total daily request count either way.
 on:
   schedule:
-    - cron: '0 */3 * * *'
+    - cron: '15 */3 * * *'
   workflow_dispatch: {}
 
 jobs:
@@ -25,7 +34,6 @@ jobs:
       - name: Grade pending fixtures
         env:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
-          FOOTBALL_DATA_ORG_TOKEN: ${{ secrets.FOOTBALL_DATA_ORG_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: node scripts/grade-tickets.mjs
