@@ -89,18 +89,107 @@ const TARGET_COUNTRIES = {
 
 /**
  * Which league "types" to keep from each country's response. API-Football
- * returns both league competitions (what we want) and cup competitions
- * (knockout tournaments — excluded here since their format doesn't suit
- * this product's accumulator-style tickets).
+ * returns both league competitions (what we want) and domestic cup
+ * competitions (knockout tournaments — excluded here since their format
+ * doesn't suit this product's accumulator-style tickets).
  *
- * KNOWN GAP: this also excludes UEFA Champions League / UEFA Europa League,
- * since API-Football tags those as type 'Cup', not 'League' — even though
- * PRIORITY_LEAGUE_NAMES in generate-tickets.mjs references them. That's a
- * pre-existing inconsistency, not something introduced by the division-cap
- * change below — flagging it here rather than silently leaving it hidden.
+ * Continental club competitions (Champions League, Europa League, etc.)
+ * are also tagged type 'Cup' by API-Football, but they're resolved
+ * SEPARATELY below via resolveContinentalCompetitions() — they don't
+ * belong to any of the per-country TARGET_COUNTRIES queries at all (API-
+ * Football files them under country "World"), so this per-country filter
+ * was never going to reach them regardless of type.
  */
 function isUsableLeague(entry) {
   return entry.league?.type === 'League';
+}
+
+// ---------------------------------------------------------------------------
+// Continental club competitions
+// ---------------------------------------------------------------------------
+// Product direction: all continental competitions must be included in the
+// pool. API-Football lists these under country "World", tagged type 'Cup'
+// (not 'League') — so the per-country loop above never sees them.
+//
+// Rather than hardcode competition IDs (this project's own rule — verify,
+// don't guess), this matches by NAME KEYWORD against whatever API-Football
+// actually returns for country "World". That bucket also contains things
+// that are NOT club competitions this product wants — the World Cup,
+// Nations League, youth internationals, qualifiers, friendlies — so both
+// an include-keyword list and an exclude-keyword list are applied.
+//
+// MANDATORY REVIEW: the script prints every "World"-country entry it saw,
+// whether matched or not, specifically so you can catch a real continental
+// competition using different wording than expected below, or a false
+// positive that slipped through the include list.
+const CONTINENTAL_INCLUDE_KEYWORDS = [
+  'Champions League',       // UEFA, CAF, AFC, CONCACAF, CONMEBOL Libertadores-equivalent naming varies
+  'Europa League',
+  'Europa Conference League',
+  'Libertadores',
+  'Sudamericana',
+  'Confederation Cup',      // CAF Confederation Cup
+  'Champions Cup',          // CONCACAF Champions Cup (current naming, post-2023 rebrand)
+];
+const CONTINENTAL_EXCLUDE_KEYWORDS = [
+  'World Cup',
+  'Nations League',
+  'Qualification',
+  'Qualifiers',
+  'Friendlies',
+  'U15', 'U16', 'U17', 'U18', 'U19', 'U20', 'U21', 'U22', 'U23',
+  'Women', // remove this line if women's competitions should also be included
+];
+
+function matchesAnyKeyword(name, keywords) {
+  const lower = name.toLowerCase();
+  return keywords.some((k) => lower.includes(k.toLowerCase()));
+}
+
+async function resolveContinentalCompetitions() {
+  let entries;
+  try {
+    entries = await getLeaguesByCountry('World');
+  } catch (err) {
+    console.warn('Failed to fetch continental ("World") competitions:', err.message);
+    return [];
+  }
+
+  const matched = [];
+  const unmatched = [];
+
+  entries.forEach((entry) => {
+    const name = entry.league?.name ?? '';
+    const isExcluded = matchesAnyKeyword(name, CONTINENTAL_EXCLUDE_KEYWORDS);
+    const isIncluded = !isExcluded && matchesAnyKeyword(name, CONTINENTAL_INCLUDE_KEYWORDS);
+    if (isIncluded) {
+      matched.push(entry);
+    } else {
+      unmatched.push({ name, type: entry.league?.type });
+    }
+  });
+
+  console.log(
+    `\nContinental ("World") competitions: matched ${matched.length}/${entries.length} — ` +
+      matched.map((e) => e.league.name).join(', ')
+  );
+  console.log(
+    'Everything else seen under "World" (review this — a real continental competition ' +
+      'using different wording than CONTINENTAL_INCLUDE_KEYWORDS would show up here instead):\n  ' +
+      unmatched.map((e) => `${e.name} [${e.type}]`).join('\n  ')
+  );
+
+  // Continental competitions have no domestic "division" concept, so no
+  // count cap applies here — every matched competition is kept. Flagged
+  // priorityNation: true, consistent with how Champions League/Europa
+  // League were already treated in the DEFAULT_LEAGUE_ALLOWLIST fallback.
+  return matched.map((entry) => ({
+    id: entry.league.id,
+    name: entry.league.name,
+    country: 'World',
+    region: 'Continental',
+    priorityNation: true,
+  }));
 }
 
 async function main() {
@@ -159,15 +248,26 @@ async function main() {
     );
   }
 
+  // Continental club competitions (Champions League, Europa League, CAF/
+  // AFC/CONCACAF/CONMEBOL equivalents) — resolved separately since
+  // API-Football files these under country "World", not any of the
+  // per-country queries above. See resolveContinentalCompetitions() for
+  // why keyword-matching is used instead of hardcoded IDs.
+  const continental = await resolveContinentalCompetitions();
+  const countryLeagueCount = resolved.length;
+  resolved.push(...continental);
+
   writeFileSync(OUTPUT_PATH, JSON.stringify(resolved, null, 2) + '\n');
   console.log(
-    `\nWrote ${resolved.length} leagues across ${Object.keys(TARGET_COUNTRIES).length} regions to ${OUTPUT_PATH}`
+    `\nWrote ${resolved.length} leagues to ${OUTPUT_PATH} ` +
+      `(${countryLeagueCount} domestic across ${Object.keys(TARGET_COUNTRIES).length} regions, ` +
+      `${continental.length} continental).`
   );
   console.log(
     '\nReminder: API-Football does not return an explicit division-tier field. ' +
       'The counts above are capped by response ORDER, not verified division depth. ' +
-      'Spot-check leagues.json — especially any country\'s 3rd/4th entries — before ' +
-      'trusting this as accurate for the top-20/other-nations split.'
+      'Spot-check leagues.json — especially any country\'s 3rd/4th entries, and the ' +
+      'continental "unmatched" list above — before trusting this as final.'
   );
 }
 
