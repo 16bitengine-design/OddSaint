@@ -10,9 +10,23 @@
 //
 // API-FOOTBALL FREE PLAN BUDGET (confirmed): 100 requests/day total, 10/min,
 // resetting at 00:00 UTC with no rollover. EVERY endpoint call counts
-// against the same 100 — fixtures, odds, leagues, all of it. This script's
-// pricing step is built around that hard ceiling — see the budget comment
-// on MAX_NEW_ODDS_LOOKUPS_PER_RUN below for the actual daily arithmetic.
+// against the same 100 — fixtures, odds, leagues, all of it.
+//
+// TWO LAYERS OF PROTECTION against ever exceeding that:
+//   1. PRIMARY — scripts/lib/apiFootball.mjs tracks the real, server-
+//      reported remaining count (from the `x-ratelimit-requests-remaining`
+//      header on every response) and refuses to make another request once
+//      it's nearly exhausted, throwing ApiFootballBudgetExhaustedError.
+//      This reacts to the ACTUAL account state — including anything else
+//      that hit the same key today — not just this script's own guess.
+//   2. BACKSTOP — MAX_NEW_ODDS_LOOKUPS_PER_RUN below is a static ceiling
+//      kept low enough that even if the live check somehow failed to fire,
+//      the worst-case daily total still stays under 100 (see the budget
+//      arithmetic on that constant).
+// Every place this file calls into API-Football is wrapped to catch
+// ApiFootballBudgetExhaustedError and degrade gracefully — use whatever
+// was already fetched/cached, skip the rest of the run, log clearly why —
+// rather than crashing or silently pushing past the daily limit.
 //
 // HONEST SCOPE NOTE (read this before treating the output as a finished
 // prediction engine): the "AI Confidence Index" here is a simple, transparent
@@ -22,7 +36,12 @@
 // intentionally simple. Tune the SELECTION STRATEGY section below as your
 // picks strategy matures.
 // ---------------------------------------------------------------------------
-import { getFixturesForDate, getOddsForFixture } from './lib/apiFootball.mjs';
+import {
+  getFixturesForDate,
+  getOddsForFixture,
+  getDailyBudgetStatus,
+  ApiFootballBudgetExhaustedError,
+} from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { collectViableOutcomes } from './lib/markets.mjs';
 import { isWomensCompetition } from './lib/womensLeagueFilter.mjs';
@@ -44,9 +63,10 @@ const LEAGUES_JSON_PATH = join(__dirname, 'lib', 'leagues.json');
 //
 // NOTE: resolve-leagues.mjs spends roughly 1 request per country it checks
 // (~60 requests for the full list) — it's manual-trigger-only specifically
-// so it never collides with the 100/day budget this file depends on. Avoid
-// running it on a day you also need generate-tickets to have its full
-// pricing budget.
+// so it never collides with the 100/day budget this file depends on. It
+// also has its own copy of the same budget circuit breaker, so it will
+// stop and save partial progress rather than run the account dry if
+// there's not enough headroom left on the day you run it.
 const DEFAULT_LEAGUE_ALLOWLIST = new Set([
   39,  // Premier League
   140, // La Liga
@@ -84,27 +104,26 @@ function loadLeagueAllowlist() {
 const LEAGUE_ALLOWLIST = loadLeagueAllowlist();
 
 // ---------------------------------------------------------------------------
-// BUDGET: this is the single most important constant in this file.
-//
-// API-Football's free plan allows exactly 100 requests/day, resetting at
-// 00:00 UTC, with NO rollover of unused requests. Every automated consumer
-// of that quota, worst case, per day:
+// BUDGET BACKSTOP: this is a static ceiling, kept deliberately conservative
+// as a second line of defense behind the live check described in the file
+// header. Worst-case daily arithmetic, assuming (hypothetically) the live
+// check never fired at all:
 //
 //   Fixture-list calls   : 2 dates (today + tomorrow) x 2 runs/day  =  4
-//   Odds lookups         : MAX_NEW_ODDS_LOOKUPS_PER_RUN x 2 runs    = 80  (at 40/run)
-//   Grading              : <=1 request x 8 runs/day (every 3h)     =  8
-//                                                                   ----
-//                                                             Total = 92  (8-request margin)
+//   Odds lookups         : MAX_NEW_ODDS_LOOKUPS_PER_RUN x 2 runs/day = 70  (at 35/run)
+//   Grading              : <=1 request x 8 runs/day (every 3h)      =  8
+//                                                                    ----
+//                                                              Total = 82  (18-request margin)
 //
-// The 80 in that table is a WORST CASE that assumes zero reuse between the
+// The 70 above is itself a worst case that assumes zero reuse between the
 // day's two generate-tickets runs — in practice the second run reuses
-// whatever the first run already priced today (see fetchAlreadyPricedFixturesToday
-// / buildPricedPool below), so real spend should land noticeably under 92.
-// Raising MAX_NEW_ODDS_LOOKUPS_PER_RUN past 40 shrinks that margin — do the
-// arithmetic above again before changing it, and remember resolve-leagues.mjs
-// (manual, ~60 requests) and any manual re-runs also draw from the same
-// 100/day pool on whatever day they're triggered.
-const MAX_NEW_ODDS_LOOKUPS_PER_RUN = 40;
+// whatever the first run already priced today (see
+// fetchAlreadyPricedFixturesToday / buildPricedPool below), so real spend
+// should land well under 82. Raising this constant shrinks that margin —
+// redo the arithmetic above before changing it, and remember
+// resolve-leagues.mjs (manual, ~60 requests) draws from the same 100/day
+// pool on whatever day it's triggered.
+const MAX_NEW_ODDS_LOOKUPS_PER_RUN = 35;
 
 // Named priority leagues break ties when ASSEMBLING tickets from the priced
 // pool (see the final sort at the end of buildPricedPool, and
@@ -190,12 +209,12 @@ const TIER_CONFIG = [
   //
   // HONEST LIMIT: Weekly Titan needs 29 successfully-priced legs. Even
   // with the same-day pricing cache below, a day with genuinely few
-  // eligible fixtures (quiet midweek slate, thin leagues) may still not
-  // reach 29 — this is an inherent limit of a free, rate-limited data
-  // source, not a bug. If Titan skips more often than you'd like, the
-  // levers are: raise MAX_NEW_ODDS_LOOKUPS_PER_RUN (re-check the budget
-  // arithmetic above first), or lower matchCount here and in
-  // dataFetcher.ts.
+  // eligible fixtures (quiet midweek slate, thin leagues) — or a day the
+  // budget circuit breaker trips early — may still not reach 29. This is
+  // an inherent limit of a free, rate-limited data source, not a bug. If
+  // Titan skips more often than you'd like, the levers are: lower
+  // matchCount here and in dataFetcher.ts, since that's the only lever
+  // that doesn't risk the 100/day ceiling.
   { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
   // Single-match, ultra-high-confidence category. Only ever one match —
@@ -315,9 +334,7 @@ async function fetchTodaysFixtureUsage(supabase, today) {
  * far) straight from Supabase — no API-Football cost at all, this is our
  * own database. This is what lets the 14:00 UTC run reuse the 06:00 UTC
  * run's pricing work for free instead of re-spending the odds-lookup
- * budget on the same matches twice in one day. See the budget comment on
- * MAX_NEW_ODDS_LOOKUPS_PER_RUN for why this matters under a 100-request/day
- * ceiling.
+ * budget on the same matches twice in one day.
  */
 async function fetchAlreadyPricedFixturesToday(supabase, today) {
   const { data, error } = await supabase
@@ -377,29 +394,36 @@ function isEligibleFixture(f) {
  * anything already present in `alreadyPricedCache` (today's earlier run)
  * is reused at zero API cost instead of being re-fetched.
  *
- * SINGLE COMBINED POOL: previously the daily and weekly pools were built
- * by two separate calls to this function, each with its own budget and
- * its own 'seen' map — meaning a fixture kicking off today (eligible for
- * BOTH pools) got priced and paid for TWICE per run, and the "today"
- * fixture list itself was fetched twice too. Building one combined pool
- * here and splitting it into dailyPool/weeklyPool by kickoff date
- * afterward (see main()) eliminates both of those duplicate spends.
+ * BUDGET-SAFE BY DESIGN: if getOddsForFixture ever throws
+ * ApiFootballBudgetExhaustedError (the live circuit breaker in
+ * apiFootball.mjs tripped), this stops spending immediately and returns
+ * whatever's already been priced (cache hits + fresh lookups obtained
+ * before running out) — partial data beats no data, and a mid-run
+ * exhaustion should never crash the whole job.
+ *
+ * SINGLE COMBINED POOL: the daily and weekly pools are built from ONE
+ * shared pass here (split by kickoff date afterward in main()) rather than
+ * two separate calls with separate budgets — a fixture kicking off today
+ * is eligible for both pools, so pricing it once and reusing the result
+ * avoids paying for it twice in the same run.
  *
  * FLEXIBLE LEAGUE ROTATION (fix for "glued to particular leagues"):
  * fixtures still needing a fresh price are grouped by league, then priced
  * in a round-robin rotation — named priority leagues go first each round,
  * but only PER_LEAGUE_LOOKUPS_PER_ROUND lookups at a time, before the
  * rotation moves on to the next league (priority or not) that still has
- * fixtures queued. The rotation repeats until either the budget runs out
- * or every league's queue is empty.
+ * fixtures queued.
  */
 async function buildPricedPool(fixturesByDate, maxNewLookups, alreadyPricedCache) {
   const seen = new Map(); // fixtureId -> priced fixture (cache hits + fresh lookups this run)
   let newLookupsUsed = 0;
   let cacheHits = 0;
+  let budgetExhausted = false;
   const leagueBreakdown = new Map(); // league name -> count freshly priced this run (for the run summary log)
 
   for (const [, fixtures] of fixturesByDate) {
+    if (budgetExhausted || newLookupsUsed >= maxNewLookups) break;
+
     const eligible = fixtures.filter(isEligibleFixture);
     if (eligible.length === 0) continue;
 
@@ -433,20 +457,17 @@ async function buildPricedPool(fixturesByDate, maxNewLookups, alreadyPricedCache
     // Rotation order: named priority leagues first (so they still get
     // first look each round), then every other league that actually has
     // fixtures today, in the order first encountered in the API response.
-    // This is a per-round ordering, not an allowlist — a non-priority
-    // league with fixtures today is never excluded from pricing, only
-    // queued behind the priority set within a given round.
     const leagueOrder = [
       ...PRIORITY_LEAGUE_NAMES,
       ...Array.from(byLeague.keys()).filter((name) => !PRIORITY_LEAGUE_NAMES.has(name)),
     ].filter((name) => byLeague.has(name));
 
     let anyQueueHasFixtures = true;
-    while (anyQueueHasFixtures && newLookupsUsed < maxNewLookups) {
+    while (anyQueueHasFixtures && !budgetExhausted && newLookupsUsed < maxNewLookups) {
       anyQueueHasFixtures = false;
 
       for (const leagueName of leagueOrder) {
-        if (newLookupsUsed >= maxNewLookups) break;
+        if (budgetExhausted || newLookupsUsed >= maxNewLookups) break;
 
         const queue = byLeague.get(leagueName);
         if (!queue || queue.length === 0) continue;
@@ -455,6 +476,7 @@ async function buildPricedPool(fixturesByDate, maxNewLookups, alreadyPricedCache
         while (
           takenThisRound < PER_LEAGUE_LOOKUPS_PER_ROUND &&
           queue.length > 0 &&
+          !budgetExhausted &&
           newLookupsUsed < maxNewLookups
         ) {
           const f = queue.shift();
@@ -469,6 +491,15 @@ async function buildPricedPool(fixturesByDate, maxNewLookups, alreadyPricedCache
           try {
             oddsResponse = await getOddsForFixture(fixtureId);
           } catch (err) {
+            if (err instanceof ApiFootballBudgetExhaustedError) {
+              // eslint-disable-next-line no-console
+              console.warn(
+                `${err.message} — stopping fixture pricing here for this run; ` +
+                  `using the ${seen.size} fixture(s) already priced (cache + this run).`
+              );
+              budgetExhausted = true;
+              break;
+            }
             // eslint-disable-next-line no-console
             console.warn(`Odds lookup failed for fixture ${fixtureId}:`, err.message);
             continue;
@@ -504,7 +535,8 @@ async function buildPricedPool(fixturesByDate, maxNewLookups, alreadyPricedCache
     );
   }
   console.log(
-    `Fixture pricing: ${cacheHits} reused from earlier today (free), ${newLookupsUsed} fresh /odds request(s) spent this run.`
+    `Fixture pricing: ${cacheHits} reused from earlier today (free), ${newLookupsUsed} fresh /odds request(s) spent this run` +
+      (budgetExhausted ? ' (stopped early — daily budget circuit breaker tripped).' : '.')
   );
 
   // Priority leagues still get first billing once fixtures are being
@@ -895,13 +927,27 @@ async function main() {
   const alreadyPricedCache = await fetchAlreadyPricedFixturesToday(supabase, todayStr);
 
   // Each needed date's /fixtures list is fetched ONCE here and shared
-  // between the daily and weekly pools below — previously "today" was
-  // fetched twice per run (once building the daily pool, once building the
-  // weekly pool), silently doubling that request every run.
-  console.log(`Fetching fixture list(s) for: ${neededDates.join(', ')}...`);
-  const fixturesByDate = new Map();
-  for (const d of neededDates) {
-    fixturesByDate.set(d, await getFixturesForDate(d));
+  // between the daily and weekly pools below. If the account's daily
+  // budget is ALREADY exhausted before this run even starts (e.g. a
+  // manual re-run or resolve-leagues.mjs used it up earlier today), this
+  // throws ApiFootballBudgetExhaustedError — caught below, logged clearly,
+  // and this run exits cleanly with nothing written rather than crashing.
+  let fixturesByDate;
+  try {
+    console.log(`Fetching fixture list(s) for: ${neededDates.join(', ')}...`);
+    fixturesByDate = new Map();
+    for (const d of neededDates) {
+      fixturesByDate.set(d, await getFixturesForDate(d));
+    }
+  } catch (err) {
+    if (err instanceof ApiFootballBudgetExhaustedError) {
+      console.warn(
+        `${err.message} — skipping this entire run. Today's existing tickets (if any) remain visible; ` +
+          'the next run (or tomorrow\'s 00:00 UTC reset) will pick back up normally.'
+      );
+      return;
+    }
+    throw err; // any other failure (network, credentials, malformed response, etc.) is a real problem
   }
 
   console.log('Pricing fixtures (reusing anything already priced today; spending fresh /odds requests only where needed)...');
@@ -919,6 +965,11 @@ async function main() {
   );
 
   const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, slipState, seededUsage);
+
+  const budgetStatus = getDailyBudgetStatus();
+  if (budgetStatus.remaining !== null) {
+    console.log(`API-Football daily budget: ${budgetStatus.remaining} of ${budgetStatus.limit} remaining as of this run's last request.`);
+  }
 
   if (tickets.length === 0) {
     console.warn('No tickets could be assembled this run — not enough priced fixtures, or every eligible category was skipped. Nothing written.');

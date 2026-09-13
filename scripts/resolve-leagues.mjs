@@ -12,6 +12,16 @@
 // daily, which is why this has its own manually-triggered workflow
 // (.github/workflows/resolve-leagues.yml) separate from the daily jobs.
 //
+// BUDGET SAFETY: this draws from the SAME 100-requests/day account as
+// generate-tickets.mjs and grade-tickets.mjs (see the budget comment in
+// generate-tickets.mjs for the full daily arithmetic) — running this on a
+// day those have already spent heavily can matter. This script respects
+// the same live daily-budget circuit breaker (scripts/lib/apiFootball.mjs):
+// if the account runs low partway through the country list, it stops,
+// WRITES whatever it has already resolved so far (never throws the partial
+// progress away), and tells you to re-run it after the next 00:00 UTC
+// reset to pick up the remaining countries.
+//
 // After running, spot-check scripts/lib/leagues.json — any country that
 // resolved to 0 leagues likely means API-Football expects a different
 // spelling for that country name than what's listed below; the script
@@ -20,7 +30,7 @@
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { getLeaguesByCountry } from './lib/apiFootball.mjs';
+import { getLeaguesByCountry, ApiFootballBudgetExhaustedError } from './lib/apiFootball.mjs';
 import { isWomensCompetition } from './lib/womensLeagueFilter.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -65,13 +75,23 @@ async function main() {
   const resolved = []; // { id, name, country, region }
   const emptyCountries = [];
   let womensExcludedCount = 0;
+  let stoppedEarly = false;
 
-  for (const [region, countries] of Object.entries(TARGET_COUNTRIES)) {
+  outer: for (const [region, countries] of Object.entries(TARGET_COUNTRIES)) {
     for (const country of countries) {
       let leagues;
       try {
         leagues = await getLeaguesByCountry(country);
       } catch (err) {
+        if (err instanceof ApiFootballBudgetExhaustedError) {
+          console.warn(
+            `${err.message} — stopping league resolution here (reached "${country}"). ` +
+              `Writing the ${resolved.length} league(s) resolved so far; re-run this workflow ` +
+              'after the next 00:00 UTC reset to pick up the remaining countries.'
+          );
+          stoppedEarly = true;
+          break outer;
+        }
         console.warn(`Failed to fetch leagues for ${country}:`, err.message);
         continue;
       }
@@ -111,8 +131,16 @@ async function main() {
     );
   }
 
+  // Written even on an early budget-triggered stop — partial, verified
+  // results are strictly better than throwing away everything resolved so
+  // far just because the run didn't finish every country.
   writeFileSync(OUTPUT_PATH, JSON.stringify(resolved, null, 2) + '\n');
-  console.log(`\nWrote ${resolved.length} leagues across ${Object.keys(TARGET_COUNTRIES).length} regions to ${OUTPUT_PATH}`);
+  console.log(
+    `\nWrote ${resolved.length} leagues across ${Object.keys(TARGET_COUNTRIES).length} regions to ${OUTPUT_PATH}` +
+      (stoppedEarly ? ' (INCOMPLETE — stopped early on daily budget, see warning above).' : '.')
+  );
+
+  if (stoppedEarly) process.exitCode = 1; // surface as a non-clean run without discarding the partial write
 }
 
 main().catch((err) => {
