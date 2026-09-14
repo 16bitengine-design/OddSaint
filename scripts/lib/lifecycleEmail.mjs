@@ -76,6 +76,12 @@ export async function tryClaimNotification(supabase, { userId, email, eventType,
 
   if (error) {
     if (error.code === '23505') return false; // already sent — not an error
+    console.error('notification_log insert failed:', {
+      message: error.message,
+      code: error.code,
+      details: error.details,
+      hint: error.hint,
+    });
     throw error;
   }
   return true;
@@ -91,7 +97,15 @@ export async function countSentToday(supabase) {
     .select('id', { count: 'exact', head: true })
     .gte('sent_at', startOfDayUTC.toISOString());
 
-  if (error) throw error;
+  if (error) {
+    console.error('notification_log count query failed:', {
+      message: error.message,
+      code: error.code,
+      details: error.details,
+      hint: error.hint,
+    });
+    throw error;
+  }
   return count ?? 0;
 }
 
