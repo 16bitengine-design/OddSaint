@@ -65,7 +65,15 @@ async function main() {
   const { data: profiles, error: profilesErr } = await supabase
     .from('user_profiles')
     .select('user_id, email, timezone');
-  if (profilesErr) throw profilesErr;
+  if (profilesErr) {
+    console.error('user_profiles query failed:', {
+      message: profilesErr.message,
+      code: profilesErr.code,
+      details: profilesErr.details,
+      hint: profilesErr.hint,
+    });
+    throw profilesErr;
+  }
   if (!profiles || profiles.length === 0) {
     console.log('No user_profiles rows yet — nothing to do.');
     return;
@@ -138,6 +146,12 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error('Lifecycle email run failed:', {
+    message: err?.message,
+    code: err?.code,
+    details: err?.details,
+    hint: err?.hint,
+    stack: err?.stack,
+  });
   process.exit(1);
 });
