@@ -25,18 +25,6 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      # TEMPORARY — remove this step once the notification_log/user_profiles
-      # failure in "Send due lifecycle emails" below is diagnosed. Bypasses
-      # supabase-js entirely and hits the PostgREST REST endpoint directly
-      # with plain fetch(), since the error object surfaced by supabase-js
-      # (message: '', code/details/hint all undefined) isn't a normal
-      # PostgrestError shape and isn't revealing the real cause.
-      - name: DIAGNOSTIC — probe Supabase REST directly
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: node scripts/diagnose-lifecycle-tables.mjs
-
       - name: Send due lifecycle emails
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
