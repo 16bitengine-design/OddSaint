@@ -14,6 +14,7 @@ import {
   webSearchUrlForTeam,
   getArchiveAccess,
   getSaintsLockAccess,
+  getTicketUnlocks,
   getNextReleaseLabel,
   fetchFixturesForDate,
   adminAddFixtureToTicket,
@@ -42,7 +43,6 @@ import {
   type FeedbackRow,
 } from '@/lib/feedback';
 import { adminGrantAccess, type GrantableProduct } from '@/lib/adminGrant';
-import { syncUserTimezone } from '@/lib/lifecycleEmail';
 
 // ---------------------------------------------------------------------------
 // Color tokens — Odd Saint brand
@@ -70,7 +70,7 @@ const SURFACE_GRADIENT = COLORS.surface; // flat surfaces — bookmaker UIs favo
 const FONT_DISPLAY = 'var(--font-body), system-ui, -apple-system, sans-serif';
 const FONT_BODY = 'var(--font-body), system-ui, -apple-system, sans-serif';
 
-type UnlockMap = Record<string, boolean>; // ticketId -> unlocked via ad/purchase
+type UnlockMap = Record<string, boolean>; // ticketId -> unlocked via ad/purchase (session-local only)
 
 // ---------------------------------------------------------------------------
 // Small shared components
@@ -2456,7 +2456,7 @@ function PerformanceHistory({ history }: { history: DayPerformance[] }) {
         Last {history.length} days
       </div>
 
-      {/* Tier filter tabs — horizontally scrollable so all tiers fit on mobile */}
+      {/* Tier filter tabs — horizontally scrollable so all 9 fit on mobile */}
       <div
         style={{
           display: 'flex',
@@ -2716,12 +2716,20 @@ function PricingModal({
   userId,
   userEmail,
   product = 'subscription',
+  ticketId,
 }: {
   onClose: () => void;
   userId: string | null;
   userEmail: string | null;
-  /** 'saints_lock' shows Saint's Lock's own $1.50/day-$7/week-$27/month plans instead of the standard subscription tiers — see src/lib/plans.ts. */
-  product?: 'subscription' | 'saints_lock';
+  /**
+   * 'saints_lock' shows Saint's Lock's own $1.50/day-$7/week-$27/month
+   * plans instead of the standard subscription tiers (see src/lib/plans.ts).
+   * 'ticket_unlock' is a fixed one-off price for a single ticket — see
+   * `ticketId` below — with no plan picker at all.
+   */
+  product?: 'subscription' | 'saints_lock' | 'ticket_unlock';
+  /** Required when product === 'ticket_unlock' — which ticket is being paid for. */
+  ticketId?: string | null;
 }) {
   const subscriptionPlans = [
     { id: 'weekly' as const, label: 'Weekly', price: '$2.49', period: '/week' },
@@ -2733,6 +2741,11 @@ function PricingModal({
     { id: 'weekly' as const, label: 'Weekly', price: '$7', period: '/week', highlight: true },
     { id: 'monthly' as const, label: 'Monthly', price: '$27', period: '/month', badge: 'Best value' },
   ];
+  // Display-only — the server independently derives the real charge from
+  // TICKET_UNLOCK_PRICE_USD in src/lib/plans.ts and never trusts anything
+  // sent from here. Keep this string in sync with that constant.
+  const TICKET_UNLOCK_DISPLAY_PRICE = '$0.99';
+  const isTicketUnlock = product === 'ticket_unlock';
   const plans = product === 'saints_lock' ? saintsLockPlans : subscriptionPlans;
 
   // Kept in sync with COUNTRY_CORRESPONDENTS in src/lib/pawapay.ts — any
@@ -2754,35 +2767,47 @@ function PricingModal({
   const [selectedPlan, setSelectedPlan] = useState<string>(product === 'saints_lock' ? 'weekly' : 'monthly');
   const [countryCode, setCountryCode] = useState('KE');
   const [phoneNumber, setPhoneNumber] = useState('');
+  // Mobile money is opt-in only (see /api/checkout) — defaults to off so
+  // Pesapal, the primary/default provider, is what fires unless someone
+  // explicitly asks for mobile money.
+  const [preferMobileMoney, setPreferMobileMoney] = useState(false);
   const [status, setStatus] = useState<'idle' | 'starting' | 'awaiting_approval' | 'error'>('idle');
   const [error, setError] = useState<string | null>(null);
   const [pollDepositId, setPollDepositId] = useState<string | null>(null);
 
-  const needsPhone = PAWAPAY_COUNTRIES.has(countryCode);
+  const countrySupportsMobileMoney = PAWAPAY_COUNTRIES.has(countryCode);
+  const needsPhone = preferMobileMoney && countrySupportsMobileMoney;
 
-  // Poll PawaPay deposit status once a phone-push payment has been
-  // initiated — there's no redirect to bounce back to, so the UI has to
-  // actively check whether the customer approved on their phone yet.
+  // Poll payment status once a checkout has been initiated. PawaPay always
+  // needs this (no redirect to bounce back to — approval happens via a PIN
+  // prompt on the customer's own phone). Pesapal normally confirms via its
+  // IPN webhook, but this same polling now also runs as a safety net for
+  // it, matching /api/checkout/status?provider=pesapal added alongside the
+  // pawapay path.
   useEffect(() => {
     if (!pollDepositId) return;
     let attempts = 0;
     const maxAttempts = 24; // ~2 minutes at 5s intervals
+    const provider = needsPhone ? 'pawapay' : 'pesapal';
+    const idParam = provider === 'pesapal' ? 'orderTrackingId' : 'depositId';
     const interval = setInterval(async () => {
       attempts++;
       try {
-        const res = await fetch(`/api/checkout/status?depositId=${encodeURIComponent(pollDepositId)}`);
+        const res = await fetch(
+          `/api/checkout/status?provider=${provider}&${idParam}=${encodeURIComponent(pollDepositId)}`
+        );
         const data = await res.json();
         if (data.status === 'COMPLETED') {
           clearInterval(interval);
           window.location.reload(); // simplest way to refresh access state everywhere
-        } else if (data.status === 'FAILED' || data.status === 'REJECTED') {
+        } else if (data.status === 'FAILED' || data.status === 'REJECTED' || data.status === 'INVALID') {
           clearInterval(interval);
           setError('Payment was not approved. Please try again.');
           setStatus('error');
           setPollDepositId(null);
         } else if (attempts >= maxAttempts) {
           clearInterval(interval);
-          setError('Still waiting on approval — check your phone, or try again.');
+          setError('Still waiting on confirmation — check your phone/email, or try again.');
           setStatus('error');
           setPollDepositId(null);
         }
@@ -2791,11 +2816,16 @@ function PricingModal({
       }
     }, 5000);
     return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pollDepositId]);
 
   async function startCheckout() {
     if (!userId || !userEmail) {
       setError('Please sign in first, then come back to subscribe.');
+      return;
+    }
+    if (isTicketUnlock && !ticketId) {
+      setError('Missing ticket — please close this and try again.');
       return;
     }
     if (needsPhone && !phoneNumber.trim()) {
@@ -2811,10 +2841,11 @@ function PricingModal({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           product,
-          plan: selectedPlan,
+          ...(isTicketUnlock ? { ticketId } : { plan: selectedPlan }),
           userId,
           email: userEmail,
           countryCode: countryCode === 'OTHER' ? 'XX' : countryCode,
+          preferMobileMoney,
           phoneNumber: needsPhone ? phoneNumber.trim() : undefined,
         }),
       });
@@ -2889,10 +2920,12 @@ function PricingModal({
             margin: '0 0 4px',
           }}
         >
-          {product === 'saints_lock' ? "Get Saint's Lock access" : 'Choose your plan'}
+          {isTicketUnlock ? 'Unlock this ticket' : product === 'saints_lock' ? "Get Saint's Lock access" : 'Choose your plan'}
         </h2>
         <p style={{ fontSize: 11.5, color: COLORS.textMuted, margin: '0 0 16px' }}>
-          {product === 'saints_lock'
+          {isTicketUnlock
+            ? 'A one-time payment to reveal every selection on this ticket — no subscription required.'
+            : product === 'saints_lock'
             ? "One ultra-high-confidence pick a day. No free trial applies — pay easily with mobile money."
             : 'Unlock every tier, every day — pay easily with mobile money.'}
         </p>
@@ -2914,67 +2947,93 @@ function PricingModal({
 
         {status === 'awaiting_approval' ? (
           <div style={{ textAlign: 'center', padding: '20px 0' }}>
-            <div style={{ fontSize: 32, marginBottom: 10 }}>📱</div>
+            <div style={{ fontSize: 32, marginBottom: 10 }}>{needsPhone ? '📱' : '⏳'}</div>
             <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.textPrimary, marginBottom: 6 }}>
-              Check your phone
+              {needsPhone ? 'Check your phone' : 'Confirming your payment'}
             </div>
             <div style={{ fontSize: 11.5, color: COLORS.textMuted }}>
-              Approve the payment prompt sent to {phoneNumber} to finish.
+              {needsPhone
+                ? `Approve the payment prompt sent to ${phoneNumber} to finish.`
+                : 'This page will refresh automatically once payment is confirmed.'}
             </div>
           </div>
         ) : (
           <>
-            {/* Plan picker */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
-              {plans.map((plan) => (
-                <button
-                  key={plan.id}
-                  onClick={() => setSelectedPlan(plan.id)}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    width: '100%',
-                    textAlign: 'left',
-                    border: `1.5px solid ${selectedPlan === plan.id ? COLORS.emerald : COLORS.border}`,
-                    background: selectedPlan === plan.id ? 'rgba(11,138,79,0.06)' : 'transparent',
-                    borderRadius: 10,
-                    padding: '10px 14px',
-                    cursor: 'pointer',
-                  }}
-                >
-                  <div>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.textPrimary }}>
-                      {plan.label}
-                      {'badge' in plan && plan.badge && (
-                        <span
-                          style={{
-                            marginLeft: 6,
-                            fontSize: 9.5,
-                            fontWeight: 700,
-                            color: COLORS.emerald,
-                            background: 'rgba(11,138,79,0.1)',
-                            borderRadius: 999,
-                            padding: '2px 6px',
-                          }}
-                        >
-                          {plan.badge}
-                        </span>
-                      )}
+            {/* Plan picker — skipped entirely for a fixed-price ticket unlock */}
+            {isTicketUnlock ? (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  border: `1.5px solid ${COLORS.emerald}`,
+                  background: 'rgba(11,138,79,0.06)',
+                  borderRadius: 10,
+                  padding: '12px 14px',
+                  marginBottom: 16,
+                }}
+              >
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.textPrimary }}>One-time unlock</div>
+                  <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>This ticket only — never expires</div>
+                </div>
+                <div style={{ fontFamily: FONT_DISPLAY, fontSize: 17, fontWeight: 800, color: COLORS.emerald }}>
+                  {TICKET_UNLOCK_DISPLAY_PRICE}
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
+                {plans.map((plan) => (
+                  <button
+                    key={plan.id}
+                    onClick={() => setSelectedPlan(plan.id)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      width: '100%',
+                      textAlign: 'left',
+                      border: `1.5px solid ${selectedPlan === plan.id ? COLORS.emerald : COLORS.border}`,
+                      background: selectedPlan === plan.id ? 'rgba(11,138,79,0.06)' : 'transparent',
+                      borderRadius: 10,
+                      padding: '10px 14px',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.textPrimary }}>
+                        {plan.label}
+                        {'badge' in plan && plan.badge && (
+                          <span
+                            style={{
+                              marginLeft: 6,
+                              fontSize: 9.5,
+                              fontWeight: 700,
+                              color: COLORS.emerald,
+                              background: 'rgba(11,138,79,0.1)',
+                              borderRadius: 999,
+                              padding: '2px 6px',
+                            }}
+                          >
+                            {plan.badge}
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>Billed {plan.label.toLowerCase()}</div>
                     </div>
-                    <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>Billed {plan.label.toLowerCase()}</div>
-                  </div>
-                  <div style={{ textAlign: 'right' }}>
-                    <div style={{ fontFamily: FONT_DISPLAY, fontSize: 15, fontWeight: 800, color: COLORS.emerald }}>
-                      {plan.price}
+                    <div style={{ textAlign: 'right' }}>
+                      <div style={{ fontFamily: FONT_DISPLAY, fontSize: 15, fontWeight: 800, color: COLORS.emerald }}>
+                        {plan.price}
+                      </div>
+                      <div style={{ fontSize: 9.5, color: COLORS.textMuted }}>{plan.period}</div>
                     </div>
-                    <div style={{ fontSize: 9.5, color: COLORS.textMuted }}>{plan.period}</div>
-                  </div>
-                </button>
-              ))}
-            </div>
+                  </button>
+                ))}
+              </div>
+            )}
 
-            {/* Unified checkout form — one screen, backend decides PawaPay vs Pesapal */}
+            {/* Unified checkout form — one screen, backend decides PawaPay vs Pesapal.
+                Pesapal is the default; mobile money is an explicit opt-in. */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14 }}>
               <select
                 value={countryCode}
@@ -2995,6 +3054,26 @@ function PricingModal({
                   </option>
                 ))}
               </select>
+
+              {countrySupportsMobileMoney && (
+                <label
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    fontSize: 12,
+                    color: COLORS.textPrimary,
+                    cursor: 'pointer',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={preferMobileMoney}
+                    onChange={(e) => setPreferMobileMoney(e.target.checked)}
+                  />
+                  Pay with mobile money instead of card
+                </label>
+              )}
 
               {needsPhone && (
                 <input
@@ -3049,7 +3128,7 @@ function PricingModal({
             lineHeight: 1.5,
           }}
         >
-          Mobile money via PawaPay · cards and other regions via Pesapal.
+          Cards and bank rails via Pesapal · mobile money via PawaPay (optional).
         </div>
       </div>
     </div>
@@ -3213,13 +3292,17 @@ export default function Page() {
   const [showArchive, setShowArchive] = useState(false);
   const [archiveAccess, setArchiveAccess] = useState<ArchiveAccess>({ level: 'none' });
   const [saintsLockAccess, setSaintsLockAccess] = useState<SaintsLockAccess>({ active: false, expiresAt: null });
+  const [ticketUnlocks, setTicketUnlocks] = useState<Set<string>>(new Set());
   const [trialPolicy, setTrialPolicy] = useState<TrialPolicy>({
     anonymousDays: ANONYMOUS_TRIAL_DAYS,
     signedUpDays: SIGNED_UP_TRIAL_DAYS,
     milestoneReached: false,
   });
   const [showPricing, setShowPricing] = useState(false);
-  const [pricingProduct, setPricingProduct] = useState<'subscription' | 'saints_lock'>('subscription');
+  const [pricingProduct, setPricingProduct] = useState<'subscription' | 'saints_lock' | 'ticket_unlock'>(
+    'subscription'
+  );
+  const [pricingTicketId, setPricingTicketId] = useState<string | null>(null);
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [history, setHistory] = useState<DayPerformance[]>([]);
   const [showHistory, setShowHistory] = useState(false);
@@ -3252,11 +3335,7 @@ export default function Page() {
       setLoading(false);
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
       getSaintsLockAccess(user?.id ?? null).then((a) => mounted && setSaintsLockAccess(a));
-      // Capture the visitor's browser timezone into user_profiles the
-      // moment we know who's signed in, so the lifecycle-email sender
-      // (scripts/send-lifecycle-emails.mjs) can schedule daily nudges at
-      // THIS person's actual local hour rather than a single global time.
-      if (user?.id) syncUserTimezone(user.id, user.email ?? null);
+      getTicketUnlocks(user?.id ?? null).then((s) => mounted && setTicketUnlocks(s));
     });
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
@@ -3266,10 +3345,7 @@ export default function Page() {
       setRegisteredAt(user?.created_at ?? null);
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
       getSaintsLockAccess(user?.id ?? null).then((a) => mounted && setSaintsLockAccess(a));
-      // Same capture on every subsequent sign-in/sign-out/token-refresh
-      // event — covers OAuth sign-ins too, not just the initial magic-link
-      // session picked up above.
-      if (user?.id) syncUserTimezone(user.id, user.email ?? null);
+      getTicketUnlocks(user?.id ?? null).then((s) => mounted && setTicketUnlocks(s));
     });
 
     return () => {
@@ -3342,13 +3418,18 @@ export default function Page() {
   }
 
   function handlePayPerTicket(ticketId: string) {
-    // Wire this up to your payment provider (Stripe, Paystack, etc.).
-    // On success, mark the ticket unlocked for this session.
-    setUnlocks((prev) => ({ ...prev, [ticketId]: true }));
+    // Opens the real checkout flow for a fixed-price, single-ticket
+    // unlock (product: 'ticket_unlock') — see PricingModal and
+    // /api/checkout. On success the page reloads and getTicketUnlocks()
+    // picks up the new row from `ticket_unlocks`.
+    setPricingProduct('ticket_unlock');
+    setPricingTicketId(ticketId);
+    setShowPricing(true);
   }
 
   function handleSubscribe(ticket?: Ticket) {
     setPricingProduct(ticket?.tier === 'saints_lock' ? 'saints_lock' : 'subscription');
+    setPricingTicketId(null);
     setShowPricing(true);
   }
 
@@ -3595,7 +3676,7 @@ export default function Page() {
               key={item.ticket.id}
               ticket={item.ticket}
               trialActive={trialActive}
-              unlocked={!!unlocks[item.ticket.id]}
+              unlocked={!!unlocks[item.ticket.id] || ticketUnlocks.has(item.ticket.id)}
               isSignedIn={!!userEmail}
               isAdmin={isAdmin}
               hasSaintsLockAccess={saintsLockAccess.active}
@@ -3660,6 +3741,7 @@ export default function Page() {
           userId={userId}
           userEmail={userEmail}
           product={pricingProduct}
+          ticketId={pricingTicketId}
         />
       )}
 
