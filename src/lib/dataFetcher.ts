@@ -23,6 +23,8 @@ export type TicketTier =
   | 'bronze'
   | 'silver'
   | 'gold'
+  | 'platinum'
+  | 'diamond'
   | 'weekly_lite'
   | 'weekly_titan'
   | 'saints_lock';
@@ -68,24 +70,20 @@ export interface TierConfig {
 
 // Tier definitions per the product spec.
 //
-// Platinum and Diamond were removed from the product lineup — they were
-// also the two hardest tiers to reliably assemble (25-300x and 300+x
-// cumulative odds need either huge leg counts or extreme long-shot legs).
-// Existing historical Platinum/Diamond ticket rows in Supabase are left
-// untouched (no CHECK constraint on tickets.tier) — the archive can still
-// display them, they just fall back to their raw tier string as a label
-// since TIER_CONFIG no longer has a matching entry. MUST stay in sync with
-// TIER_CONFIG in scripts/generate-tickets.mjs.
-//
-// Weekly Lite/Titan match counts are each ONE FEWER than their "standard"
-// size (20/30) — a deliberate reduction to raise real-world win
-// probability by cutting one compounding leg of bookmaker margin per
-// ticket.
+// Platinum/Diamond/Weekly Lite/Weekly Titan match counts are each ONE
+// FEWER than their "standard" size (10/15/20/30) — a deliberate reduction
+// to raise real-world win probability by cutting one compounding leg of
+// bookmaker margin per ticket. MUST stay in sync with TIER_CONFIG in
+// scripts/generate-tickets.mjs — the two representations had drifted out
+// of sync before this fix (dataFetcher.ts still showed the old 10/15/20/30
+// figures while the real pipeline had already moved to 9/14/19/29).
 export const TIER_CONFIG: TierConfig[] = [
   { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
   { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
   { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
   { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
+  { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
+  { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
   { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2', alwaysFree: false },
@@ -112,7 +110,7 @@ export const RELEASE_SLOT_HOURS_UTC = [6, 14];
 
 function getDailySlipCount(tier: TicketTier, day: string, date: Date): number {
   if (tier === 'saints_lock') return Math.min(MAX_TICKETS_PER_CATEGORY, 2); // min 1/max 2 guaranteed by the real pipeline; see SAINTS_LOCK_MIN_CONFIDENCE
-  if (tier === 'weekly_lite' || tier === 'weekly_titan') {
+  if (tier === 'platinum' || tier === 'diamond' || tier === 'weekly_lite' || tier === 'weekly_titan') {
     return 1; // large accumulators — one curated slip a day
   }
   // mega / bronze / silver / gold: scale with a deterministic "busyness"
@@ -337,6 +335,8 @@ const TIER_ODDS_TARGET: Partial<Record<TicketTier, [number, number]>> = {
   bronze: [2, 3],
   silver: [3, 5],
   gold: [5, 10],
+  platinum: [25, 300],
+  diamond: [300, Infinity],
 };
 
 /**
@@ -354,7 +354,7 @@ function adjustOddsToTarget(matches: Match[], targetRange: [number, number] | un
     if (total >= minTotal && total <= maxTotal) return;
 
     const target = total < minTotal ? minTotal : maxTotal;
-    if (!Number.isFinite(target)) return; // an unbounded (Infinity) upper target — nothing to scale toward
+    if (!Number.isFinite(target)) return; // diamond's upper bound is Infinity — nothing to scale toward
     const factorPerLeg = Math.pow(target / total, 1 / matches.length);
 
     matches.forEach((m) => {
@@ -524,13 +524,6 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
 
     return {
       id: row.id,
-      // NOTE: a historical Platinum/Diamond row's `tier` string won't
-      // match any TicketTier union member anymore — this cast is
-      // permissive at compile time but the value itself is just whatever
-      // string is in the database. tierLabel() below falls back to that
-      // raw string when TIER_CONFIG has no matching entry, so an old
-      // Platinum/Diamond ticket still renders (with its raw tier name as
-      // the label) instead of breaking.
       tier: row.tier as TicketTier,
       label: tierLabel(row.tier),
       slipLabel: row.slip_label ?? undefined,
@@ -547,9 +540,7 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
   // Previous batches stay visible alongside the newest one — sort order
   // just needs to be stable and tier-grouped; nothing here filters out an
   // earlier release_slot, so both of a tier's slips for the day (if both
-  // exist yet) show up until superseded tomorrow. A historical
-  // Platinum/Diamond row (tier not in tierOrder) sorts after every known
-  // tier via indexOf's -1 fallback, then by id.
+  // exist yet) show up until superseded tomorrow.
   tickets.sort(
     (a, b) =>
       tierOrder.indexOf(a.tier) - tierOrder.indexOf(b.tier) ||
@@ -716,6 +707,35 @@ export async function getSaintsLockAccess(userId: string | null): Promise<Saints
     // eslint-disable-next-line no-console
     console.warn('[Odd Saint] Saint\'s Lock access check failed, defaulting to no access:', err);
     return { active: false, expiresAt: null };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-ticket unlocks ("Pay Micro-Fee")
+// ---------------------------------------------------------------------------
+// Reads the current signed-in user's OWN unlocked-ticket ids (RLS restricts
+// ticket_unlocks selects to `user_id = auth.uid()` — see
+// supabase/migrations/004_ticket_unlocks.sql), same access pattern as
+// getSaintsLockAccess/getArchiveAccess above. Real writes only ever happen
+// server-side via grantAccessForPayment() after a verified payment — this
+// is read-only.
+
+/**
+ * Returns the set of ticket ids the signed-in user has individually paid
+ * to unlock via the one-off "Pay Micro-Fee" flow. Empty set for a signed-
+ * out visitor or on any failure — never blocks the rest of the page from
+ * rendering over this.
+ */
+export async function getTicketUnlocks(userId: string | null): Promise<Set<string>> {
+  if (!userId) return new Set();
+  try {
+    const { data, error } = await supabase.from('ticket_unlocks').select('ticket_id').eq('user_id', userId);
+    if (error || !data) return new Set();
+    return new Set(data.map((row: any) => row.ticket_id as string));
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[Odd Saint] Ticket unlocks check failed, defaulting to none unlocked:', err);
+    return new Set();
   }
 }
 
