@@ -9,9 +9,17 @@ import {
 
 // ---------------------------------------------------------------------------
 // Grants access after a verified successful payment. Used by both the
-// PawaPay and Pesapal webhook handlers (plus the admin comp route) so the
-// actual "what happens on a successful payment" logic only exists in one
-// place.
+// PawaPay and Pesapal webhook handlers, the /api/checkout/status polling
+// route, and the admin comp route, so the actual "what happens on a
+// successful payment" logic only exists in one place.
+//
+// THREE PRODUCTS SUPPORTED:
+//   - 'subscription' → upserts subscribers (dated plan, recurring)
+//   - 'saints_lock'  → upserts saints_lock_access (dated plan, recurring)
+//   - 'ticket_unlock' → upserts ticket_unlocks (one-off, single ticket,
+//                        never expires) — requires `ticketId`. See
+//                        supabase/migrations/004_ticket_unlocks.sql and
+//                        TICKET_UNLOCK_PRICE_USD in src/lib/plans.ts.
 //
 // WELCOME EMAILS: fire from here rather than from each individual webhook,
 // for the same reason access-granting itself lives here — one chokepoint
@@ -20,7 +28,10 @@ import {
 // sendWelcomeEmailOnce uses notification_log's insert-first idempotency
 // (see src/lib/notificationLog.ts) keyed on 'lifetime', so a renewal or a
 // repeat purchase of the same product never re-sends the welcome email —
-// only the very first successful grant for that product does.
+// only the very first successful grant for that product does. A one-off
+// ticket unlock deliberately does NOT trigger a welcome email — that
+// template exists for onboarding into a recurring product, not per
+// micro-purchase.
 // ---------------------------------------------------------------------------
 
 export async function grantAccessForPayment(params: {
@@ -28,16 +39,42 @@ export async function grantAccessForPayment(params: {
   userId: string | undefined;
   planId: string | undefined;
   email: string | undefined;
+  ticketId?: string | undefined;
 }): Promise<void> {
-  const { product, userId, planId, email } = params;
+  const { product, userId, planId, email, ticketId } = params;
 
-  if (!userId || !planId) {
+  if (!userId) {
     // eslint-disable-next-line no-console
-    console.warn('[grantAccess] Missing userId/planId, nothing granted:', params);
+    console.warn('[grantAccess] Missing userId, nothing granted:', params);
     return;
   }
 
   const supabase = getSupabaseAdmin();
+
+  if (product === 'ticket_unlock') {
+    if (!ticketId) {
+      // eslint-disable-next-line no-console
+      console.warn('[grantAccess] ticket_unlock product with no ticketId, nothing granted:', params);
+      return;
+    }
+
+    const { error } = await supabase
+      .from('ticket_unlocks')
+      .upsert({ user_id: userId, ticket_id: ticketId, email }, { onConflict: 'user_id,ticket_id' });
+    if (error) throw error;
+
+    // No welcome email for a one-off ticket unlock — see file header note.
+    return;
+  }
+
+  // Everything below requires a planId — 'subscription' and 'saints_lock'
+  // are both dated plans looked up by planId; 'ticket_unlock' (handled
+  // above) is the only product that isn't.
+  if (!planId) {
+    // eslint-disable-next-line no-console
+    console.warn('[grantAccess] Missing planId, nothing granted:', params);
+    return;
+  }
 
   if (product === 'saints_lock') {
     if (!isValidSaintsLockPlanId(planId)) {
