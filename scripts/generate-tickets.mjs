@@ -146,6 +146,15 @@ const TIER_CONFIG = [
   { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
   { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
   { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
+  // Weekend Ticket — drawn only from Saturday+Sunday fixtures (see
+  // getWeekendDates below), generated only on Saturday or Sunday itself.
+  // ASSUMPTION — PLACEHOLDER matchCount/oddsRange: you specified the date
+  // window (Sat–Sun) but not a match count or price tier, so this mirrors
+  // Weekly Lite/Titan's "Mixed" (no fixed TIER_ODDS_TARGET — see below)
+  // with a placeholder ceiling of 10 legs. Confirm/adjust before relying
+  // on this in production, same as TICKET_UNLOCK_PRICE_USD's placeholder
+  // in src/lib/plans.ts.
+  { tier: 'weekend', label: 'Weekend Ticket', matchCount: 10, oddsRange: 'Mixed', alwaysFree: false },
   // Platinum/Diamond/Weekly Lite/Weekly Titan match counts are each ONE
   // FEWER than the "standard" tier size (10/15/20/30) — a deliberate
   // reduction to raise real-world win probability by cutting one
@@ -181,6 +190,37 @@ const TIER_ODDS_TARGET = {
 
 function dateStr(d) {
   return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Returns [saturdayStr, sundayStr] for the CURRENT weekend, in UTC — but
+ * ONLY when `today` itself is a Saturday or Sunday; returns null on
+ * Monday–Friday.
+ *
+ * WHY ONLY SATURDAY/SUNDAY: API-Football's free plan only allows querying
+ * a narrow date window around today (typically yesterday through
+ * tomorrow — see WEEKLY_LOOKAHEAD_DAYS above). An earlier "Friday through
+ * Sunday" design didn't work for exactly this reason: from a Friday run,
+ * Sunday is two days out — outside that window, so the request fails.
+ * Restricting this to Saturday/Sunday keeps every date it ever requests
+ * within one day of "today", which the free plan can always reach:
+ *   - run on Saturday → [today (Sat), tomorrow (Sun)]
+ *   - run on Sunday   → [yesterday (Sat), today (Sun)]
+ */
+function getWeekendDates(today) {
+  const day = today.getUTCDay(); // 0 = Sunday .. 6 = Saturday
+
+  if (day === 6) {
+    const sunday = new Date(today);
+    sunday.setUTCDate(today.getUTCDate() + 1);
+    return [dateStr(today), dateStr(sunday)];
+  }
+  if (day === 0) {
+    const saturday = new Date(today);
+    saturday.setUTCDate(today.getUTCDate() - 1);
+    return [dateStr(saturday), dateStr(today)];
+  }
+  return null; // Monday–Friday: the weekend tier simply doesn't generate this run
 }
 
 // --- Staggered release: figure out which slot (if any) this run should fill ---
@@ -649,7 +689,7 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot) {
   return { tickets, ticketMatches, fixturesUsed: [pick], usedFallback };
 }
 
-function buildTickets(dailyPool, weeklyPool, slipState) {
+function buildTickets(dailyPool, weeklyPool, weekendPool, slipState) {
   const now = new Date();
   const today = dateStr(now);
   const nowIso = now.toISOString();
@@ -681,7 +721,8 @@ function buildTickets(dailyPool, weeklyPool, slipState) {
     }
 
     const isWeekly = config.tier === 'weekly_lite' || config.tier === 'weekly_titan';
-    const basePool = isWeekly ? weeklyPool : dailyPool;
+    const isWeekend = config.tier === 'weekend';
+    const basePool = isWeekly ? weeklyPool : isWeekend ? weekendPool : dailyPool;
     const pool = poolForTier(basePool, config.tier);
     const targetRange = TIER_ODDS_TARGET[config.tier] ?? null;
 
@@ -760,7 +801,27 @@ async function main() {
   const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN);
   console.log(`Priced ${weeklyPool.length} fixtures for the week ahead.`);
 
-  const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, slipState);
+  // Weekend Ticket pool — only fetched on Saturday/Sunday (see
+  // getWeekendDates for why). On Monday–Friday this is simply an empty
+  // pool, which makes the weekend tier's own pickFixturesForSlip call
+  // naturally return [] and get skipped, same as any other day a tier
+  // can't assemble a valid combination — no separate skip branch needed.
+  // NOTE — API BUDGET: this adds a THIRD fetchPricedFixtures call (up to
+  // another MAX_ODDS_LOOKUPS_PER_RUN odds lookups) on top of dailyPool and
+  // weeklyPool, but only on the two days it runs. Watch this against
+  // API-Football's free-plan daily request cap if Saturday/Sunday traffic
+  // already runs close to it.
+  const weekendDates = getWeekendDates(today);
+  let weekendPool = [];
+  if (weekendDates) {
+    console.log(`Fetching weekend fixture pool (${weekendDates.join(' to ')})...`);
+    weekendPool = await fetchPricedFixtures(weekendDates, MAX_ODDS_LOOKUPS_PER_RUN);
+    console.log(`Priced ${weekendPool.length} fixtures for the weekend.`);
+  } else {
+    console.log('Not Saturday or Sunday — skipping the Weekend Ticket pool this run.');
+  }
+
+  const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, weekendPool, slipState);
 
   if (tickets.length === 0) {
     console.warn('No tickets could be assembled this run — not enough priced fixtures, or every eligible category was skipped. Nothing written.');
