@@ -23,6 +23,7 @@ export type TicketTier =
   | 'bronze'
   | 'silver'
   | 'gold'
+  | 'weekend'
   | 'platinum'
   | 'diamond'
   | 'weekly_lite'
@@ -82,6 +83,11 @@ export const TIER_CONFIG: TierConfig[] = [
   { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
   { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
   { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
+  // Weekend Ticket — real pipeline only generates this on Saturday/Sunday
+  // (see getWeekendDates in scripts/generate-tickets.mjs). matchCount/
+  // oddsRange here are the same placeholder values as there — keep both
+  // in sync when the real numbers are confirmed.
+  { tier: 'weekend', label: 'Weekend Ticket', matchCount: 10, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
   { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
   { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
@@ -110,6 +116,13 @@ export const RELEASE_SLOT_HOURS_UTC = [6, 14];
 
 function getDailySlipCount(tier: TicketTier, day: string, date: Date): number {
   if (tier === 'saints_lock') return Math.min(MAX_TICKETS_PER_CATEGORY, 2); // min 1/max 2 guaranteed by the real pipeline; see SAINTS_LOCK_MIN_CONFIDENCE
+  if (tier === 'weekend') {
+    // Mirrors getWeekendDates() in scripts/generate-tickets.mjs — the real
+    // pipeline only ever generates this tier on Saturday/Sunday, so the
+    // mock fallback shouldn't show it as available on a weekday either.
+    const utcDay = date.getUTCDay(); // 0 = Sunday .. 6 = Saturday
+    return utcDay === 0 || utcDay === 6 ? 1 : 0;
+  }
   if (tier === 'platinum' || tier === 'diamond' || tier === 'weekly_lite' || tier === 'weekly_titan') {
     return 1; // large accumulators — one curated slip a day
   }
