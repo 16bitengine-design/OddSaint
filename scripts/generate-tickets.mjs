@@ -146,15 +146,16 @@ const TIER_CONFIG = [
   { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
   { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
   { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
-  // Weekend Ticket — drawn only from Saturday+Sunday fixtures (see
+  // The Weekender — drawn only from Saturday+Sunday fixtures (see
   // getWeekendDates below), generated only on Saturday or Sunday itself.
-  // ASSUMPTION — PLACEHOLDER matchCount/oddsRange: you specified the date
-  // window (Sat–Sun) but not a match count or price tier, so this mirrors
-  // Weekly Lite/Titan's "Mixed" (no fixed TIER_ODDS_TARGET — see below)
-  // with a placeholder ceiling of 10 legs. Confirm/adjust before relying
-  // on this in production, same as TICKET_UNLOCK_PRICE_USD's placeholder
-  // in src/lib/plans.ts.
-  { tier: 'weekend', label: 'Weekend Ticket', matchCount: 10, oddsRange: 'Mixed', alwaysFree: false },
+  // matchCount: 21 is a MINIMUM here, not a ceiling — this tier has no
+  // TIER_ODDS_TARGET entry (left "Mixed", like Weekly Lite/Titan), so
+  // pickFixturesForSlip's no-target-range branch requires the pool to
+  // have at least this many eligible fixtures or the slip is skipped
+  // entirely (`ranked.length < maxMatchCount` → return []) rather than
+  // shipping a shorter ticket. oddsRange stays a placeholder ('Mixed') —
+  // confirm before relying on it in production.
+  { tier: 'weekend', label: 'The Weekender', matchCount: 21, oddsRange: 'Mixed', alwaysFree: false },
   // Platinum/Diamond/Weekly Lite/Weekly Titan match counts are each ONE
   // FEWER than the "standard" tier size (10/15/20/30) — a deliberate
   // reduction to raise real-world win probability by cutting one
@@ -801,24 +802,43 @@ async function main() {
   const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN);
   console.log(`Priced ${weeklyPool.length} fixtures for the week ahead.`);
 
-  // Weekend Ticket pool — only fetched on Saturday/Sunday (see
+  // The Weekender's pool — only fetched on Saturday/Sunday (see
   // getWeekendDates for why). On Monday–Friday this is simply an empty
-  // pool, which makes the weekend tier's own pickFixturesForSlip call
-  // naturally return [] and get skipped, same as any other day a tier
-  // can't assemble a valid combination — no separate skip branch needed.
-  // NOTE — API BUDGET: this adds a THIRD fetchPricedFixtures call (up to
-  // another MAX_ODDS_LOOKUPS_PER_RUN odds lookups) on top of dailyPool and
-  // weeklyPool, but only on the two days it runs. Watch this against
-  // API-Football's free-plan daily request cap if Saturday/Sunday traffic
-  // already runs close to it.
+  // pool, which makes this tier's own pickFixturesForSlip call naturally
+  // return [] and get skipped, same as any other day a tier can't
+  // assemble a valid combination — no separate skip branch needed.
+  //
+  // ISOLATION: wrapped in its own try/catch, unlike dailyPool/weeklyPool
+  // above. Every tier's tickets are batched into ONE upsert at the end of
+  // main() — an uncaught error here would otherwise abort the whole
+  // script before ANY tier's tickets get written, meaning a Weekender
+  // failure (network blip, an unexpected API-Football error) could take
+  // down Bronze, Gold, Saint's Lock, everything else in the same run.
+  // Catching it here means the worst case is "no Weekender slip this
+  // run" — every other tier proceeds exactly as if this block wasn't
+  // here at all.
+  //
+  // NOTE — API BUDGET: this still adds a THIRD fetchPricedFixtures call
+  // (up to another MAX_ODDS_LOOKUPS_PER_RUN odds lookups) on top of
+  // dailyPool and weeklyPool, but only on the two days it runs, and it
+  // happens AFTER both of those complete — so it can only add extra time/
+  // requests to a Sat/Sun run, never take budget away from the other two
+  // pools that already fetched first. Still worth watching against
+  // API-Football's free-plan daily request cap on weekend traffic.
   const weekendDates = getWeekendDates(today);
   let weekendPool = [];
   if (weekendDates) {
     console.log(`Fetching weekend fixture pool (${weekendDates.join(' to ')})...`);
-    weekendPool = await fetchPricedFixtures(weekendDates, MAX_ODDS_LOOKUPS_PER_RUN);
-    console.log(`Priced ${weekendPool.length} fixtures for the weekend.`);
+    try {
+      weekendPool = await fetchPricedFixtures(weekendDates, MAX_ODDS_LOOKUPS_PER_RUN);
+      console.log(`Priced ${weekendPool.length} fixtures for the weekend.`);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('The Weekender: pool fetch failed, skipping this tier for this run only:', err.message);
+      weekendPool = [];
+    }
   } else {
-    console.log('Not Saturday or Sunday — skipping the Weekend Ticket pool this run.');
+    console.log('Not Saturday or Sunday — skipping The Weekender pool this run.');
   }
 
   const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, weekendPool, slipState);
