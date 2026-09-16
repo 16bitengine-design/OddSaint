@@ -78,7 +78,7 @@ export interface TierConfig {
 // of sync before this fix (dataFetcher.ts still showed the old 10/15/20/30
 // figures while the real pipeline had already moved to 9/14/19/29).
 export const TIER_CONFIG: TierConfig[] = [
-  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
+  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 3, oddsRange: '1.5-3', alwaysFree: true },
   { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
   { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
   { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
