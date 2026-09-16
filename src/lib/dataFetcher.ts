@@ -83,11 +83,12 @@ export const TIER_CONFIG: TierConfig[] = [
   { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
   { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
   { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
-  // Weekend Ticket — real pipeline only generates this on Saturday/Sunday
-  // (see getWeekendDates in scripts/generate-tickets.mjs). matchCount/
-  // oddsRange here are the same placeholder values as there — keep both
-  // in sync when the real numbers are confirmed.
-  { tier: 'weekend', label: 'Weekend Ticket', matchCount: 10, oddsRange: 'Mixed', alwaysFree: false },
+  // The Weekender — real pipeline only generates this on Saturday/Sunday
+  // (see getWeekendDates in scripts/generate-tickets.mjs). matchCount is
+  // a MINIMUM there (no fixed odds target for this tier — pool must have
+  // at least this many eligible fixtures or the slip is skipped), not a
+  // ceiling like the small tiers above. Keep in sync with generate-tickets.mjs.
+  { tier: 'weekend', label: 'The Weekender', matchCount: 21, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
   { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
   { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
