@@ -5,10 +5,13 @@ name: Odd Saint — Generate Daily Tickets
 # scripts/generate-tickets.mjs, which enforces the real gap between a
 # tier's 1st and 2nd slip of the day regardless of exactly when these
 # crons fire. Can also be triggered manually from the Actions tab.
+#
+# 04:00 UTC = 07:00 East Africa Time (EAT, UTC+3, no DST)
+# 11:00 UTC = 14:00 East Africa Time
 on:
   schedule:
-    - cron: '0 6 * * *'   # slot 0 — morning batch
-    - cron: '0 14 * * *'  # slot 1 — afternoon batch
+    - cron: '0 4 * * *'   # slot 0 — 7am EAT morning batch
+    - cron: '0 11 * * *'  # slot 1 — 2pm EAT afternoon batch
   workflow_dispatch: {}
 
 jobs:
@@ -28,10 +31,6 @@ jobs:
 
       - name: Generate today's tickets
         env:
-          # Majors pool (Mega/Bronze/Silver/Gold/Saint's Lock):
-          FOOTBALL_DATA_ORG_TOKEN: ${{ secrets.FOOTBALL_DATA_ORG_TOKEN }}
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          # Lengthy pool (Platinum/Diamond/Weekly Lite/Weekly Titan) — unchanged:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
