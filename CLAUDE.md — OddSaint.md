@@ -82,6 +82,22 @@ The account moved from API-Football's Free plan (10 req/min, 100 req/day) to **P
 
 ---
 
+## NEW — 30. LEAGUE QUALITY FILTER + FULL-WIN GUARANTEE
+
+Two accuracy-focused changes to selection, both defense-in-depth rather than single-point fixes.
+
+**League quality filter (`scripts/lib/leagueQuality.mjs`, NEW, shared):**
+- Excludes youth (U10–U23), reserve/B-team, amateur/regional/non-league, and named third-division-or-lower competitions (Serie C/D, Segunda B, 3. Liga, League One/Two, etc.) by name pattern.
+- Applied in TWO places so a stale `leagues.json` can't reintroduce them: `scripts/resolve-leagues.mjs`'s `isUsableLeague()` (keeps them out of `leagues.json` at the source) and `scripts/generate-tickets.mjs`'s fixture-eligibility filter (defense-in-depth).
+- HONEST SCOPE NOTE: API-Football exposes no explicit division-tier field, so this is a name-pattern heuristic, not a verified lookup — see the file header in `leagueQuality.mjs`. Review `AMATEUR_LEAGUE_PATTERNS` periodically against real league names in the Actions logs.
+
+**Full-win guarantee (`ensureFullWinLeg()` in `scripts/generate-tickets.mjs`, plus `FULL_WIN_MARKETS` exported from `scripts/lib/markets.mjs`):**
+- Home Win / Away Win markets were already never substituted away for being "too tight" — their own odds band in `MARKET_CATALOG` starts at 1.3, so the old tight-price guard (`WIN_MARKET_MIN_ODDS`) could only ever fire for Double Chance sub-markets. This is now documented explicitly in code rather than being an implicit side effect.
+- NEW: every generic-tier ticket (mega/bronze/silver/gold/platinum/diamond/weekly_lite/weekly_titan/weekender) now tries to guarantee at least one outright Home/Away Win leg via `ensureFullWinLeg()`, called at both return points of `pickFixturesForSlip()`. It swaps in the safest available full-win fixture from the pool, preferring the least-disruptive swap (trying each leg position, highest-odds first) and only keeping a swap that lands the ticket's total back within the existing 30% tolerance band. Best-effort: if no full-win fixture is available in the pool, or no swap keeps the total in range, the ticket is left as assembled rather than forced.
+- Saint's Lock (`buildSaintsLockTickets()`) is deliberately EXCLUDED from this guarantee — it's a single-leg, confidence-first pick with no "ticket completeness" concept, and swapping in a lower-confidence full-win fixture just to satisfy a market-type preference would contradict its own design principle (see the note in code).
+
+---
+
 ## NEW — 8. SAINT'S LOCK PRODUCT RULES (Hard Enforcement)
 
 Saint's Lock is a single-match, ultra-high-confidence category with distinct access control, separate from all other tiers:
@@ -235,8 +251,11 @@ Implementation: `PRIORITY_LEAGUE_NAMES` in `scripts/generate-tickets.mjs` includ
 - `supabase/migrations/002_batch_updates.sql` — new: schema changes (release slots, feedback table, admin RLS)
 - `.github/workflows/generate-tickets.yml` — updated: two daily cron slots, now 04:00/11:00 UTC (07:00/14:00 EAT)
 - `.github/workflows/analyze-feedback.yml` — new: manual-trigger feedback digest
-- `scripts/generate-tickets.mjs` — updated: staggered slot logic, tier counts, Saint's Lock selection, Weekender tier + dedicated weekend pool, Pro-plan `MAX_ODDS_LOOKUPS_PER_RUN`, per-date fetch resilience
+- `scripts/generate-tickets.mjs` — updated: staggered slot logic, tier counts, Saint's Lock selection, Weekender tier + dedicated weekend pool, Pro-plan `MAX_ODDS_LOOKUPS_PER_RUN`, per-date fetch resilience, amateur/youth league filter, full-win-leg guarantee (`ensureFullWinLeg`)
 - `scripts/lib/apiFootball.mjs` — updated: Pro-plan rate-limit constants
+- `scripts/lib/leagueQuality.mjs` — new: shared youth/reserve/lower-division league name filter, used by both `resolve-leagues.mjs` and `generate-tickets.mjs`
+- `scripts/lib/markets.mjs` — updated: exports `FULL_WIN_MARKETS`
+- `scripts/resolve-leagues.mjs` — updated: applies the league quality filter before writing `leagues.json`
 - `scripts/analyze-feedback.mjs` — new: feedback digest reporter
 - `src/lib/dataFetcher.ts` — updated: tier count sync fix, release-slot fields (now 04:00/11:00 UTC), Weekender tier, Saint's Lock access, admin match-editor helpers
 - `src/lib/feedback.ts` — new: pre-filter, submit, admin moderation functions
