@@ -3247,6 +3247,21 @@ function Footer() {
 
   return (
     <div style={{ marginTop: 28, paddingTop: 18, borderTop: `1px solid ${COLORS.border}` }}>
+      <div style={{ display: 'flex', gap: 14, marginBottom: 10 }}>
+        <a
+          href="/terms"
+          style={{ fontSize: 11.5, color: COLORS.textMuted, textDecoration: 'underline', textUnderlineOffset: 3 }}
+        >
+          Terms of Service
+        </a>
+        <a
+          href="/privacy"
+          style={{ fontSize: 11.5, color: COLORS.textMuted, textDecoration: 'underline', textUnderlineOffset: 3 }}
+        >
+          Privacy Policy
+        </a>
+      </div>
+
       <button
         onClick={() => setShowLegal((s) => !s)}
         style={{
