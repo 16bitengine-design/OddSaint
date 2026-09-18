@@ -19,7 +19,8 @@
 // ---------------------------------------------------------------------------
 import { getFixturesForDate, getOddsForFixture } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
-import { collectViableOutcomes } from './lib/markets.mjs';
+import { collectViableOutcomes, FULL_WIN_MARKETS } from './lib/markets.mjs';
+import { isAmateurOrYouthLeague } from './lib/leagueQuality.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -328,6 +329,11 @@ async function fetchPricedFixtures(dates, maxOddsLookups) {
     const eligible = fixtures.filter(
       (f) =>
         LEAGUE_ALLOWLIST.has(f.league?.id) &&
+        // Defense-in-depth: excludes youth/reserve/third-division-or-lower
+        // competitions by name pattern even if leagues.json (built by
+        // resolve-leagues.mjs, which applies the same filter) is stale or
+        // predates this filter — see scripts/lib/leagueQuality.mjs.
+        !isAmateurOrYouthLeague(f.league?.name) &&
         !isBigClash(f.teams?.home?.name, f.teams?.away?.name) &&
         !isExcluded(f.teams?.home?.name, f.teams?.away?.name)
     );
@@ -437,9 +443,14 @@ const MIN_CONFIDENCE = 68;
 
 // Result-based markets to steer away from when priced this short — an
 // extremely tight price on any of these can still be upset (a draw, a cup
-// shock, a keeper's bad day). Double Chance in particular is the market
-// that actually reaches odds this low (as tight as 1.1) — Home/Away Win
-// never goes below 1.3 per the market catalog's own bounds.
+// shock, a keeper's bad day). Double Chance is the only one of these that
+// actually reaches odds this low (as tight as 1.1) — Home Win / Away Win
+// can NEVER trigger this guard, since their own odds band in
+// MARKET_CATALOG (markets.mjs) starts at 1.3: an outright win pick is
+// never substituted away for being "too safe." This guard exists purely
+// to catch an overly tight Double Chance price, not to steer away from
+// full wins — see FULL_WIN_MARKETS / ensureFullWinLeg below for the
+// separate "always incorporate a full win where necessary" logic.
 const RESULT_BASED_MARKETS = new Set([
   'Home Win', 'Away Win', 'Double Chance 1X', 'Double Chance X2', 'Double Chance 12',
 ]);
@@ -519,6 +530,57 @@ function computeTotalOdds(picks) {
 }
 
 /**
+ * "Always incorporate a full win where necessary": if `picks` doesn't
+ * already contain an outright Home/Away Win leg, try swapping one in from
+ * the pool. Tries every leg position (safest-to-disrupt first — i.e. the
+ * current highest-odds leg) and keeps the first swap that lands the total
+ * back within the same tolerance band pickFixturesForSlip itself allows.
+ * If no full-win fixture is available in today's pool, or no swap keeps
+ * the ticket within its odds range, returns `picks` unchanged — this is a
+ * best-effort guarantee, not a mandate to force a bad combination.
+ */
+function ensureFullWinLeg(picks, pool, usageCount, targetRange) {
+  if (picks.length === 0) return picks;
+  if (picks.some((p) => FULL_WIN_MARKETS.has(p.market))) return picks; // already has one
+
+  const alreadyIn = new Set(picks.map((p) => p.fixtureId));
+  const candidates = pool
+    .filter(
+      (f) =>
+        FULL_WIN_MARKETS.has(f.market) &&
+        !alreadyIn.has(f.fixtureId) &&
+        (usageCount.get(f.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY
+    )
+    .sort((a, b) => a.odds - b.odds); // safest full-win pick first
+
+  if (candidates.length === 0) return picks; // nothing full-win available today
+
+  const candidate = candidates[0];
+
+  if (!targetRange) {
+    // No odds band to protect (Weekly Lite/Titan/Weekender) — swap out
+    // the current highest-odds leg for the full-win candidate.
+    const highestIdx = picks.reduce((hi, p, i) => (p.odds > picks[hi].odds ? i : hi), 0);
+    const next = [...picks];
+    next[highestIdx] = candidate;
+    return next;
+  }
+
+  const [minTotal, maxTotal] = targetRange;
+  const TOLERANCE = 0.3; // same slack pickFixturesForSlip itself allows
+  const order = [...picks.keys()].sort((a, b) => picks[b].odds - picks[a].odds); // highest-odds leg first
+  for (const idx of order) {
+    const next = [...picks];
+    next[idx] = candidate;
+    const total = computeTotalOdds(next);
+    const within = total >= minTotal * (1 - TOLERANCE) && total <= maxTotal * (1 + TOLERANCE);
+    if (within) return next;
+  }
+
+  return picks; // no swap kept the total within range — leave the ticket as assembled
+}
+
+/**
  * Picks fixtures for one slip using the FEWEST legs needed to reach the
  * tier's minimum target odds — starting from the safest available fixtures
  * and adding one at a time, stopping the moment the cumulative total lands
@@ -544,7 +606,7 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
     // No target range to hit (Weekly Lite/Titan/Weekender, "Mixed") —
     // just take the safest available up to the max, as before.
     if (ranked.length < maxMatchCount) return [];
-    return ranked.slice(0, maxMatchCount);
+    return ensureFullWinLeg(ranked.slice(0, maxMatchCount), pool, usageCount, null);
   }
 
   const [minTotal, maxTotal] = targetRange;
@@ -607,7 +669,7 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
   const withinTolerance = finalTotal >= minTotal * (1 - TOLERANCE) && finalTotal <= maxTotal * (1 + TOLERANCE);
   if (!withinTolerance || picks.length === 0) return []; // pool doesn't have enough spread to hit this tier's range today
 
-  return picks;
+  return ensureFullWinLeg(picks, pool, usageCount, targetRange);
 }
 
 // Saint's Lock demands a far higher confidence bar than any other tier —
@@ -627,6 +689,14 @@ const SAINTS_LOCK_MIN_CONFIDENCE = 85;
  * other tier (see nextSlotFor) — at most one new Saint's Lock ticket is
  * produced per run, honoring the min-1/max-2-per-day guarantee across the
  * day's two scheduled runs rather than both at once.
+ *
+ * NOTE: the "always incorporate a full win where necessary" guarantee
+ * (see ensureFullWinLeg, used by the generic per-tier loop below)
+ * deliberately does NOT apply here. Saint's Lock is a single-leg pick with
+ * no "ticket completeness" to satisfy, and its whole design principle is
+ * confidence-first, quality-over-quantity — swapping in a lower-confidence
+ * outright-win fixture just to satisfy a market-type preference would
+ * directly contradict that.
  */
 function buildSaintsLockTickets(dailyPool, usageCount, today, slot) {
   const config = TIER_CONFIG.find((c) => c.tier === 'saints_lock');

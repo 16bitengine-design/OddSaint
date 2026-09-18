@@ -4,7 +4,6 @@
 // Hardcoding hundreds of league ID numbers from memory is risky — a wrong
 // ID doesn't error, it just silently returns zero fixtures for that league
 // forever. This script instead asks API-Football's own /leagues endpoint
-// (the app's sole football data provider — see scripts/lib/apiFootball.mjs)
 // for the real, current IDs per country, and writes a verified league list
 // to scripts/lib/leagues.json for generate-tickets.mjs to read.
 //
@@ -12,10 +11,6 @@
 // list) — trivial as a ONE-TIME or occasional run, but NOT something to run
 // daily, which is why this has its own manually-triggered workflow
 // (.github/workflows/resolve-leagues.yml) separate from the daily jobs.
-//
-// Calls detectApiPlan() once at startup, same as the other scripts, so this
-// run's own request throttling reflects the account's real detected plan
-// rather than always assuming Free — see scripts/lib/apiFootball.mjs.
 //
 // After running, spot-check scripts/lib/leagues.json — any country that
 // resolved to 0 leagues likely means API-Football expects a different
@@ -25,7 +20,8 @@
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { getLeaguesByCountry, detectApiPlan } from './lib/apiFootball.mjs';
+import { getLeaguesByCountry } from './lib/apiFootball.mjs';
+import { isAmateurOrYouthLeague } from './lib/leagueQuality.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_PATH = join(__dirname, 'lib', 'leagues.json');
@@ -57,15 +53,18 @@ const TARGET_COUNTRIES = {
  * Which league "types" to keep from each country's response. API-Football
  * returns both league competitions (what we want) and cup competitions
  * (knockout tournaments — excluded here since their format doesn't suit
- * this product's accumulator-style tickets).
+ * this product's accumulator-style tickets). Also excludes youth, reserve,
+ * and third-division-or-lower competitions by name pattern — see
+ * scripts/lib/leagueQuality.mjs, shared with generate-tickets.mjs so the
+ * two scripts can't drift on what counts as "amateur." API-Football
+ * exposes no explicit division-tier field, so this is a name heuristic,
+ * not a verified tier lookup — spot-check leagues.json after running.
  */
 function isUsableLeague(entry) {
-  return entry.league?.type === 'League';
+  return entry.league?.type === 'League' && !isAmateurOrYouthLeague(entry.league?.name);
 }
 
 async function main() {
-  await detectApiPlan(); // logs detected plan; scripts/lib/apiFootball.mjs throttles accordingly
-
   const resolved = []; // { id, name, country, region }
   const emptyCountries = [];
 
@@ -101,7 +100,9 @@ async function main() {
   if (emptyCountries.length > 0) {
     console.warn(
       '\nThese countries resolved to 0 leagues — likely a country-name spelling ' +
-        'mismatch with what API-Football expects. Check and fix TARGET_COUNTRIES:\n' +
+        'mismatch with what API-Football expects, OR every league in that country ' +
+        'was filtered out as youth/reserve/lower-division. Check and fix ' +
+        'TARGET_COUNTRIES, or review AMATEUR_LEAGUE_PATTERNS in leagueQuality.mjs:\n' +
         emptyCountries.map((c) => `  - ${c}`).join('\n')
     );
   }
