@@ -23,11 +23,11 @@ export type TicketTier =
   | 'bronze'
   | 'silver'
   | 'gold'
-  | 'weekend'
   | 'platinum'
   | 'diamond'
   | 'weekly_lite'
   | 'weekly_titan'
+  | 'weekender'
   | 'saints_lock';
 
 export interface Match {
@@ -79,20 +79,15 @@ export interface TierConfig {
 // of sync before this fix (dataFetcher.ts still showed the old 10/15/20/30
 // figures while the real pipeline had already moved to 9/14/19/29).
 export const TIER_CONFIG: TierConfig[] = [
-  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 3, oddsRange: '1.5-3', alwaysFree: true },
+  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
   { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
   { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
   { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
-  // The Weekender — real pipeline only generates this on Saturday/Sunday
-  // (see getWeekendDates in scripts/generate-tickets.mjs). matchCount is
-  // a MINIMUM there (no fixed odds target for this tier — pool must have
-  // at least this many eligible fixtures or the slip is skipped), not a
-  // ceiling like the small tiers above. Keep in sync with generate-tickets.mjs.
-  { tier: 'weekend', label: 'The Weekender', matchCount: 21, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
   { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
   { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
+  { tier: 'weekender', label: 'Weekender', matchCount: 35, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2', alwaysFree: false },
 ];
 
@@ -112,19 +107,12 @@ export const TIER_CONFIG: TierConfig[] = [
 // out of the read path for free.
 const MAX_TICKETS_PER_CATEGORY = 2;
 
-/** UTC hours the two daily release slots fire at — must match the cron schedule in .github/workflows/generate-tickets.yml. */
-export const RELEASE_SLOT_HOURS_UTC = [6, 14];
+/** UTC hours the two daily release slots fire at — must match the cron schedule in .github/workflows/generate-tickets.yml. 04:00 UTC = 07:00 EAT, 11:00 UTC = 14:00 EAT (UTC+3, no DST). */
+export const RELEASE_SLOT_HOURS_UTC = [4, 11];
 
 function getDailySlipCount(tier: TicketTier, day: string, date: Date): number {
   if (tier === 'saints_lock') return Math.min(MAX_TICKETS_PER_CATEGORY, 2); // min 1/max 2 guaranteed by the real pipeline; see SAINTS_LOCK_MIN_CONFIDENCE
-  if (tier === 'weekend') {
-    // Mirrors getWeekendDates() in scripts/generate-tickets.mjs — the real
-    // pipeline only ever generates this tier on Saturday/Sunday, so the
-    // mock fallback shouldn't show it as available on a weekday either.
-    const utcDay = date.getUTCDay(); // 0 = Sunday .. 6 = Saturday
-    return utcDay === 0 || utcDay === 6 ? 1 : 0;
-  }
-  if (tier === 'platinum' || tier === 'diamond' || tier === 'weekly_lite' || tier === 'weekly_titan') {
+  if (tier === 'platinum' || tier === 'diamond' || tier === 'weekly_lite' || tier === 'weekly_titan' || tier === 'weekender') {
     return 1; // large accumulators — one curated slip a day
   }
   // mega / bronze / silver / gold: scale with a deterministic "busyness"
@@ -721,35 +709,6 @@ export async function getSaintsLockAccess(userId: string | null): Promise<Saints
     // eslint-disable-next-line no-console
     console.warn('[Odd Saint] Saint\'s Lock access check failed, defaulting to no access:', err);
     return { active: false, expiresAt: null };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Per-ticket unlocks ("Pay Micro-Fee")
-// ---------------------------------------------------------------------------
-// Reads the current signed-in user's OWN unlocked-ticket ids (RLS restricts
-// ticket_unlocks selects to `user_id = auth.uid()` — see
-// supabase/migrations/004_ticket_unlocks.sql), same access pattern as
-// getSaintsLockAccess/getArchiveAccess above. Real writes only ever happen
-// server-side via grantAccessForPayment() after a verified payment — this
-// is read-only.
-
-/**
- * Returns the set of ticket ids the signed-in user has individually paid
- * to unlock via the one-off "Pay Micro-Fee" flow. Empty set for a signed-
- * out visitor or on any failure — never blocks the rest of the page from
- * rendering over this.
- */
-export async function getTicketUnlocks(userId: string | null): Promise<Set<string>> {
-  if (!userId) return new Set();
-  try {
-    const { data, error } = await supabase.from('ticket_unlocks').select('ticket_id').eq('user_id', userId);
-    if (error || !data) return new Set();
-    return new Set(data.map((row: any) => row.ticket_id as string));
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn('[Odd Saint] Ticket unlocks check failed, defaulting to none unlocked:', err);
-    return new Set();
   }
 }
 
