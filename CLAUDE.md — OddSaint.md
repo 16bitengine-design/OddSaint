@@ -8,13 +8,13 @@ Add these sections to the existing CLAUDE.md to document the batch of updates ap
 
 Tickets are released in two staggered batches per day rather than all at once, to signal curation intent and prevent an "illusion of choice."
 
-**Release times (UTC, two daily):**
-- **Slot 0**: 06:00 UTC (morning batch)
-- **Slot 1**: 14:00 UTC (afternoon batch)
+**Release times:**
+- **Slot 0**: 04:00 UTC / 07:00 East Africa Time (EAT, UTC+3, no DST) — morning batch
+- **Slot 1**: 11:00 UTC / 14:00 East Africa Time — afternoon batch
 
-Each tier caps at **MAX_TICKETS_PER_CATEGORY = 2** per day — matching values in both `src/lib/dataFetcher.ts` and `scripts/generate-tickets.mjs`. The second slot only fills if at least **MIN_HOURS_BETWEEN_SLOTS = 6** have elapsed since slot 0 for that tier, enforced in code, so the two releases stay meaningfully spread regardless of cron scheduling jitter.
+Each tier caps at **MAX_TICKETS_PER_CATEGORY = 2** per day — matching values in both `src/lib/dataFetcher.ts` and `scripts/generate-tickets.mjs`. The second slot only fills if at least **MIN_HOURS_BETWEEN_SLOTS = 6** have elapsed since slot 0 for that tier (the two 04:00/11:00 UTC triggers are 7h apart, so this always clears), enforced in code, so the two releases stay meaningfully spread regardless of cron scheduling jitter.
 
-**Previous batches remain visible until the next one lands** — Supabase rows are never deleted or overwritten, only new rows added, so the current feed stays stable until the next scheduled release. The frontend's `getNextReleaseLabel()` shows users the clock time of the next slot in their local timezone.
+**Previous batches remain visible until the next one lands** — Supabase rows are never deleted or overwritten, only new rows added, so the current feed stays stable until the next scheduled release. The frontend's `getNextReleaseLabel()` shows users the clock time of the next slot in their local timezone, and `getDailyRefreshInfo()` in `src/app/page.tsx` reads the first slot's hour from the shared `RELEASE_SLOT_HOURS_UTC` constant (exported from `dataFetcher.ts`) rather than a separately hardcoded value, so the displayed time can never drift from the actual cron schedule.
 
 **Implementation:**
 - Database: `release_slot` (0 or 1) and `available_at` (ISO timestamp) columns on `tickets` table.
@@ -40,10 +40,45 @@ platinum    9         ← reduced by 1 from 10 (compounded margin reduction)
 diamond     14        ← reduced by 1 from 15
 weekly_lite 19        ← reduced by 1 from 20
 weekly_titan 29       ← reduced by 1 from 30
+weekender   35        ← NEW — spans Sat+Sun, own dedicated fixture pool
 saints_lock 1
 ```
 
 The `platinum`, `diamond`, `weekly_lite`, `weekly_titan` reductions were intentional to lower win probability by cutting one compounding bookmaker-margin leg. **These two files had drifted out of sync before this batch** — `dataFetcher.ts` still showed the old 10/15/20/30 figures. Fixed in this update. Always sync them when the counts change.
+
+---
+
+## NEW — 28. WEEKENDER TIER
+
+A 35-match accumulator spanning both Saturday and Sunday — distinct from Weekly Lite/Titan, which use the current-day/current-week fixture pools.
+
+**Product rules:**
+- Match count: 35 (ceiling, same "fewest legs to reach target" logic as other tiers — Weekender has no fixed odds target, so it just takes the safest available up to the ceiling, same as Weekly Lite/Titan).
+- One slip a day (`getDailySlipCount` returns 1, same bucket as `platinum`/`diamond`/`weekly_lite`/`weekly_titan`).
+- Odds range: "Mixed" — no `TIER_ODDS_TARGET` entry, same as the two weekly tiers.
+
+**Dedicated fixture pool:**
+- `upcomingWeekendDates(now)` in `scripts/generate-tickets.mjs` returns the next Saturday+Sunday date pair from any day of the week (today itself if today already is Sat/Sun) — mirrors the `WEEKLY_LOOKAHEAD_DAYS` lookahead pattern.
+- Fetched via its own `fetchPricedFixtures(weekendDates, MAX_ODDS_LOOKUPS_PER_RUN)` call in `main()`, kept separate from the daily and weekly pools.
+- Runs on every generation run (both daily slots), not gated to weekend-only runs — this only became viable after moving off the API-Football Free plan (see below), since Free's narrow date-range window meant fetching a few days ahead of a Tuesday run risked a hard failure.
+- `fetchPricedFixtures` now catches a per-date fetch failure and skips just that date (with a console warning) instead of crashing the whole script — a safety net in case a date still turns out to be outside whatever range the current plan allows.
+
+**Frontend/mock:**
+- `TicketTier` and `TIER_CONFIG` in `src/lib/dataFetcher.ts` include `weekender` alongside the other large-accumulator tiers.
+- Mock data generates a Weekender slip every day (no day-of-week restriction), mirroring the real pipeline's "always attempt" behavior.
+
+---
+
+## NEW — 29. API-FOOTBALL PLAN: FREE → PRO
+
+The account moved from API-Football's Free plan (10 req/min, 100 req/day) to **Pro** (300 req/min, 7,500 req/day).
+
+**Changed as a result:**
+- `scripts/lib/apiFootball.mjs`: `MAX_REQUESTS_PER_WINDOW` raised from 8 to 250 (comfortable margin under the 300/min cap).
+- `scripts/generate-tickets.mjs`: `MAX_ODDS_LOOKUPS_PER_RUN` raised from 25 to 200. Worst case is 3 pools (daily/weekly/weekender) × 2 runs/day × 200 = 1,200 odds lookups/day, leaving well over 6,000/day of headroom for grading (every 3h) and manual/one-off script runs.
+- The Weekender tier's "always attempt, any day" fetch pattern (see above) — not viable on Free's narrow date-range window.
+
+**Known gap — flagged for verification, not yet directly confirmed:** whether Pro actually widens the specific future-date range that produced the Free-plan `"Free plans do not have access to this date"` error, and by how many days. The code is defensive either way (`fetchPricedFixtures` skips an out-of-range date instead of crashing), but this is worth confirming from the first few real Action run logs rather than assumed.
 
 ---
 
@@ -191,16 +226,18 @@ Implementation: `PRIORITY_LEAGUE_NAMES` in `scripts/generate-tickets.mjs` includ
 - **Admin match-editor only adds already-priced fixtures** — doesn't invent new matches from scratch. This is intentional: an admin curates from what the pipeline has already scored, not hand-entering odds.
 - **Feedback pre-filter is pattern-based** — detects obvious spam (too short, link-spam, repeated characters) but is not a trained ML classifier. Real moderation judgment stays with the admin review queue.
 - **Mock Saint's Lock** in the fallback data always shows 2 slips rather than respecting the min-1 logic. Cosmetic — only affects local dev before real Supabase data exists.
+- **Weekender's Pro-plan date-range assumption is unverified** — see section 29 above. Watch the first few real Action run logs.
 
 ---
 
 ## SUMMARY OF FILES CHANGED IN THIS BATCH
 
 - `supabase/migrations/002_batch_updates.sql` — new: schema changes (release slots, feedback table, admin RLS)
-- `.github/workflows/generate-tickets.yml` — updated: two daily cron slots
+- `.github/workflows/generate-tickets.yml` — updated: two daily cron slots, now 04:00/11:00 UTC (07:00/14:00 EAT)
 - `.github/workflows/analyze-feedback.yml` — new: manual-trigger feedback digest
-- `scripts/generate-tickets.mjs` — updated: staggered slot logic, tier counts, Saint's Lock selection
+- `scripts/generate-tickets.mjs` — updated: staggered slot logic, tier counts, Saint's Lock selection, Weekender tier + dedicated weekend pool, Pro-plan `MAX_ODDS_LOOKUPS_PER_RUN`, per-date fetch resilience
+- `scripts/lib/apiFootball.mjs` — updated: Pro-plan rate-limit constants
 - `scripts/analyze-feedback.mjs` — new: feedback digest reporter
-- `src/lib/dataFetcher.ts` — updated: tier count sync fix, release-slot fields, Saint's Lock access, admin match-editor helpers
+- `src/lib/dataFetcher.ts` — updated: tier count sync fix, release-slot fields (now 04:00/11:00 UTC), Weekender tier, Saint's Lock access, admin match-editor helpers
 - `src/lib/feedback.ts` — new: pre-filter, submit, admin moderation functions
-- `src/app/page.tsx` — updated: Saint's Lock fixes (crash + countdown + gating), admin match editor modal, support widget, release time display, admin feedback modal support
+- `src/app/page.tsx` — updated: Saint's Lock fixes (crash + countdown + gating), admin match editor modal, support widget, release time display (now reads `RELEASE_SLOT_HOURS_UTC[0]` instead of a hardcoded hour), admin feedback modal support
