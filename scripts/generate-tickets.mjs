@@ -1,19 +1,13 @@
 // ---------------------------------------------------------------------------
 // Odd Saint — daily ticket generation
-// Pulls real fixtures + bookmaker odds from API-Football (the app's sole
-// football data provider — see scripts/lib/apiFootball.mjs), turns them
-// into tickets for every tier, and writes them to Supabase. Runs TWICE a
-// day via .github/workflows/generate-tickets.yml (06:00 and 14:00 UTC) so
-// each tier's daily tickets release in two staggered batches rather than
-// all at once — see fetchTodaysSlipState/nextSlotFor below for how a given
-// run decides whether it's producing today's 1st or 2nd slip for a tier,
-// or skipping that tier entirely because it already has both.
-//
-// PLAN-AWARE BEHAVIOR: detectApiPlan() (scripts/lib/apiFootball.mjs) is
-// called once at the top of main() and used to derive WEEKLY_LOOKAHEAD_DAYS
-// and the odds-lookup budget below — Free-tier defaults unless/until a
-// paid plan is actually detected on the account. See the PLAN-DEPENDENT
-// CONFIG section for the exact values and how to override them.
+// Pulls real fixtures + bookmaker odds from API-Football, turns them into
+// tickets for every tier, and writes them to Supabase. Runs TWICE a day via
+// .github/workflows/generate-tickets.yml (04:00 and 11:00 UTC — 07:00 and
+// 14:00 East Africa Time) so each tier's daily tickets release in two
+// staggered batches rather than all at once — see
+// fetchTodaysSlipState/nextSlotFor below for how a given run decides
+// whether it's producing today's 1st or 2nd slip for a tier, or skipping
+// that tier entirely because it already has both.
 //
 // HONEST SCOPE NOTE (read this before treating the output as a finished
 // prediction engine): the "AI Confidence Index" here is a simple, transparent
@@ -23,7 +17,7 @@
 // intentionally simple. Tune the SELECTION STRATEGY section below as your
 // picks strategy matures.
 // ---------------------------------------------------------------------------
-import { getFixturesForDate, getOddsForFixture, detectApiPlan } from './lib/apiFootball.mjs';
+import { getFixturesForDate, getOddsForFixture } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { collectViableOutcomes } from './lib/markets.mjs';
 import { readFileSync } from 'node:fs';
@@ -77,35 +71,14 @@ function loadLeagueAllowlist() {
 
 const LEAGUE_ALLOWLIST = loadLeagueAllowlist();
 
-// ---------------------------------------------------------------------------
-// PLAN-DEPENDENT CONFIG
-// ---------------------------------------------------------------------------
-// Both values below are resolved once in main(), after detectApiPlan() has
-// actually checked the account — never guessed up front. Free-tier numbers
-// here match what this file used before plan detection existed; the Pro
-// numbers are deliberately conservative bumps, not a claim about any
-// specific paid tier's real ceiling (that's account/pricing-page specific
-// and isn't verified from this codebase) — override via the env vars below
-// once you've checked your actual plan's limits.
-
-// Caps how many /odds requests a single run makes per pool (daily, then
-// weekly — so a full run uses at most ~2x this many, plus a couple of
-// /fixtures calls). The Free-tier number is kept modest because the free
-// plan enforces both a 10-requests/minute throttle (self-limited further
-// in apiFootball.mjs) AND a daily request cap — this leaves headroom for
-// the separate grading job, which runs several times the same day, and for
-// this script now running twice a day itself.
-const FREE_PLAN_MAX_ODDS_LOOKUPS_PER_RUN = 25;
-const DEFAULT_PRO_PLAN_MAX_ODDS_LOOKUPS_PER_RUN = 80; // override: API_FOOTBALL_PRO_ODDS_LOOKUPS
-
-// How many extra days ahead to pull fixtures for the two "Weekly" tiers.
-// API-Football's FREE plan only allows querying a narrow window around
-// today (typically yesterday through tomorrow) — requesting further out
-// returns a "Free plans do not have access to this date" error, so the
-// Free-tier default stays at 1. Once a paid plan is detected, this widens
-// to cover most of a week ahead for the Weekly tiers.
-const FREE_PLAN_WEEKLY_LOOKAHEAD_DAYS = 1;
-const DEFAULT_PRO_PLAN_WEEKLY_LOOKAHEAD_DAYS = 6; // override: API_FOOTBALL_PRO_WEEKLY_LOOKAHEAD_DAYS
+// Caps how many /odds requests we make per pool (daily, weekly, weekender
+// — so a full run uses at most ~3x this many, plus a couple of /fixtures
+// calls). Raised from the old Free-plan-era value of 25 now that the
+// account is on Pro (300 req/min, 7,500 req/day): worst case is 3 pools x
+// 2 runs/day x this value = 6 x 200 = 1,200 odds lookups/day, leaving
+// >6,000/day of headroom for grading (every 3h) and manual runs. Revisit
+// if the Actions logs show the daily cap getting tight.
+const MAX_ODDS_LOOKUPS_PER_RUN = 200;
 
 // Named priority leagues break ties when ASSEMBLING tickets from the priced
 // pool (see the final sort at the end of fetchPricedFixtures, and
@@ -144,6 +117,14 @@ const PRIORITY_LEAGUE_NAMES = new Set([
 // contribute more than a token pick per round.
 const PER_LEAGUE_LOOKUPS_PER_ROUND = 3;
 
+// How many extra days ahead to pull fixtures for the two "Weekly" tiers.
+// API-Football's FREE plan only allows querying a narrow window around
+// today (typically yesterday through tomorrow) — requesting further out
+// returns a "Free plans do not have access to this date" error. Set to 1
+// to stay within that window; if you upgrade your API plan later, this can
+// go back up to pull a genuine week's worth of fixtures.
+const WEEKLY_LOOKAHEAD_DAYS = 1;
+
 // A curated set of marquee clubs across the covered leagues. Fixtures where
 // BOTH sides are in this set (e.g. Real Madrid vs Barcelona, a Manchester
 // or Milan derby) are skipped entirely — these are inherently the hardest
@@ -176,6 +157,12 @@ const TIER_CONFIG = [
   { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
   { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
   { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
+  // Spans BOTH Saturday and Sunday. Built from its own dedicated pool (see
+  // upcomingWeekendDates() and its use in main()) rather than the daily or
+  // weekly pools. 35 legs needs a deep fixture pool — that's the main
+  // reason MAX_ODDS_LOOKUPS_PER_RUN was raised after moving to the
+  // API-Football Pro plan.
+  { tier: 'weekender', label: 'Weekender', matchCount: 35, oddsRange: 'Mixed', alwaysFree: false },
   // Single-match, ultra-high-confidence category. Only ever one match —
   // the single most confident pick available that day, and only ever
   // included if it clears SAINTS_LOCK_MIN_CONFIDENCE (see below), well
@@ -188,8 +175,8 @@ const TIER_CONFIG = [
 // above. These are ACTUALLY ENFORCED during slip assembly (see
 // pickFixturesForSlip) — previously oddsRange was just a display string
 // with nothing checking whether a ticket's real combined odds landed
-// inside it. Weekly Lite/Titan are intentionally left unset ("Mixed" by
-// design, no fixed target).
+// inside it. Weekly Lite/Titan/Weekender are intentionally left unset
+// ("Mixed" by design, no fixed target).
 const TIER_ODDS_TARGET = {
   mega: [1.5, 3],
   bronze: [2, 3],
@@ -202,6 +189,26 @@ const TIER_ODDS_TARGET = {
 
 function dateStr(d) {
   return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Returns [saturdayStr, sundayStr] for the NEXT upcoming Saturday+Sunday
+ * from `now` (today itself if today already is Sat/Sun) — same lookahead
+ * pattern as WEEKLY_LOOKAHEAD_DAYS. Runs on ANY day of the week, relying
+ * on the Pro plan's wider date-range window to fetch a few days ahead
+ * (unlike the old Free-plan-only-weekend-runs restriction). The exact
+ * Pro-plan date-range limit hasn't been directly re-verified — if a date
+ * turns out to still be out of range, fetchPricedFixtures below catches
+ * that per-date and skips it rather than crashing the whole script.
+ */
+function upcomingWeekendDates(now) {
+  const dow = now.getUTCDay(); // 0 = Sunday, 6 = Saturday
+  const daysUntilSaturday = (6 - dow + 7) % 7;
+  const sat = new Date(now);
+  sat.setUTCDate(sat.getUTCDate() + daysUntilSaturday);
+  const sun = new Date(sat);
+  sun.setUTCDate(sun.getUTCDate() + 1);
+  return [dateStr(sat), dateStr(sun)];
 }
 
 // --- Staggered release: figure out which slot (if any) this run should fill ---
@@ -218,7 +225,7 @@ const MAX_TICKETS_PER_CATEGORY = 2;
 // GitHub Actions scheduling jitter can never produce both of a tier's
 // daily slips back-to-back — the two staggered releases stay meaningfully
 // spread out regardless of exactly when this workflow happens to fire.
-// Matches the two 06:00/14:00 UTC cron triggers (8h apart) with headroom.
+// Matches the two 04:00/11:00 UTC cron triggers (7h apart) with headroom.
 const MIN_HOURS_BETWEEN_SLOTS = 6;
 
 /**
@@ -300,12 +307,6 @@ function isExcluded(homeTeam, awayTeam) {
  * below means every allowlisted league with fixtures today gets looked at,
  * not just the named priority set — "priority" now only breaks ties once
  * fixtures are being assembled into tickets (see the final sort below).
- *
- * A per-date fixture fetch that fails outright (e.g. a paid-plan lookahead
- * guess landing on a date the account genuinely can't query) is logged and
- * skipped rather than crashing the whole run — the widened weekly lookahead
- * on a detected paid plan is still a best-effort guess about your account's
- * real date-range allowance, not a verified one.
  */
 async function fetchPricedFixtures(dates, maxOddsLookups) {
   const seen = new Map(); // fixtureId -> priced fixture
@@ -317,11 +318,13 @@ async function fetchPricedFixtures(dates, maxOddsLookups) {
     try {
       fixtures = await getFixturesForDate(d);
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn(`Fixture lookup failed for ${d}, skipping this date:`, err.message);
+      // Safety net for date-range limits we haven't fully re-verified
+      // since moving from Free to Pro — skip just this date instead of
+      // failing the whole run (matters most for the Weekender pool, which
+      // now reaches a few days ahead via upcomingWeekendDates()).
+      console.warn(`Could not fetch fixtures for ${d}, skipping that date:`, err.message);
       continue;
     }
-
     const eligible = fixtures.filter(
       (f) =>
         LEAGUE_ALLOWLIST.has(f.league?.id) &&
@@ -538,8 +541,8 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
   });
 
   if (!targetRange) {
-    // No target range to hit (Weekly Lite/Titan, "Mixed") — just take the
-    // safest available up to the max, as before.
+    // No target range to hit (Weekly Lite/Titan/Weekender, "Mixed") —
+    // just take the safest available up to the max, as before.
     if (ranked.length < maxMatchCount) return [];
     return ranked.slice(0, maxMatchCount);
   }
@@ -684,7 +687,7 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot) {
   return { tickets, ticketMatches, fixturesUsed: [pick], usedFallback };
 }
 
-function buildTickets(dailyPool, weeklyPool, slipState) {
+function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState) {
   const now = new Date();
   const today = dateStr(now);
   const nowIso = now.toISOString();
@@ -716,7 +719,8 @@ function buildTickets(dailyPool, weeklyPool, slipState) {
     }
 
     const isWeekly = config.tier === 'weekly_lite' || config.tier === 'weekly_titan';
-    const basePool = isWeekly ? weeklyPool : dailyPool;
+    const isWeekender = config.tier === 'weekender';
+    const basePool = isWeekender ? weekenderPool : isWeekly ? weeklyPool : dailyPool;
     const pool = poolForTier(basePool, config.tier);
     const targetRange = TIER_ODDS_TARGET[config.tier] ?? null;
 
@@ -764,27 +768,11 @@ function buildTickets(dailyPool, weeklyPool, slipState) {
 // --- Main ---------------------------------------------------------------------
 
 async function main() {
-  // Plan detection happens FIRST and everything plan-dependent below is
-  // derived from its result — never assumed up front. See the
-  // PLAN-DEPENDENT CONFIG section above for what each value means and how
-  // to override it.
-  const plan = await detectApiPlan();
-  const maxOddsLookupsPerRun = plan.isPro
-    ? Number(process.env.API_FOOTBALL_PRO_ODDS_LOOKUPS) || DEFAULT_PRO_PLAN_MAX_ODDS_LOOKUPS_PER_RUN
-    : FREE_PLAN_MAX_ODDS_LOOKUPS_PER_RUN;
-  const weeklyLookaheadDays = plan.isPro
-    ? Number(process.env.API_FOOTBALL_PRO_WEEKLY_LOOKAHEAD_DAYS) || DEFAULT_PRO_PLAN_WEEKLY_LOOKAHEAD_DAYS
-    : FREE_PLAN_WEEKLY_LOOKAHEAD_DAYS;
-  console.log(
-    `Using ${maxOddsLookupsPerRun} odds-lookups/pool and a ${weeklyLookaheadDays}-day weekly lookahead ` +
-      `(${plan.isPro ? 'pro-tier' : 'free-tier'} plan behavior).`
-  );
-
   const today = new Date();
   const todayStr = dateStr(today);
   const dailyDates = [todayStr];
   const weeklyDates = [todayStr];
-  for (let i = 1; i <= weeklyLookaheadDays; i++) {
+  for (let i = 1; i <= WEEKLY_LOOKAHEAD_DAYS; i++) {
     const d = new Date(today);
     d.setDate(d.getDate() + i);
     weeklyDates.push(dateStr(d));
@@ -804,14 +792,19 @@ async function main() {
   }
 
   console.log('Fetching daily fixture pool...');
-  const dailyPool = await fetchPricedFixtures(dailyDates, maxOddsLookupsPerRun);
+  const dailyPool = await fetchPricedFixtures(dailyDates, MAX_ODDS_LOOKUPS_PER_RUN);
   console.log(`Priced ${dailyPool.length} fixtures for today.`);
 
   console.log('Fetching weekly fixture pool (for Weekly Lite / Weekly Titan)...');
-  const weeklyPool = await fetchPricedFixtures(weeklyDates, maxOddsLookupsPerRun);
+  const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN);
   console.log(`Priced ${weeklyPool.length} fixtures for the week ahead.`);
 
-  const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, slipState);
+  console.log('Fetching Weekender pool (upcoming Sat+Sun)...');
+  const weekendDates = upcomingWeekendDates(today);
+  const weekenderPool = await fetchPricedFixtures(weekendDates, MAX_ODDS_LOOKUPS_PER_RUN);
+  console.log(`Priced ${weekenderPool.length} fixtures for the weekend (${weekendDates.join(', ')}).`);
+
+  const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, weekenderPool, slipState);
 
   if (tickets.length === 0) {
     console.warn('No tickets could be assembled this run — not enough priced fixtures, or every eligible category was skipped. Nothing written.');
