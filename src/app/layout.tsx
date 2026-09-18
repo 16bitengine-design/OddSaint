@@ -16,6 +16,7 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
+  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL || 'https://odd-saint.net'),
   title: 'Odd Saint — AI Football Prediction Tickets',
   description:
     'Curated football prediction tickets, AI-assisted and graded in the open. Not financial or betting advice.',
