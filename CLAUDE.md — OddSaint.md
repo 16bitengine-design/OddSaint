@@ -119,7 +119,22 @@ Two accuracy/product-quality rules, both in `scripts/generate-tickets.mjs`.
 
 ---
 
-## NEW — 32. NO MOCK DATA (Removed)
+## NEW — 33. FIXTURE COUNTRY/NATION
+
+Every match now carries which nation/country its league belongs to, not just the league name (e.g. "Premier League (England)" instead of just "Premier League") — shown on the ticket's match rows, the match-analysis modal, and the admin match editor's "available fixtures" picker.
+
+**Source:** API-Football's `league.country` field on each fixture response — captured directly in `fetchPricedFixtures()` in `scripts/generate-tickets.mjs` (`country: f.league?.country ?? 'Unknown'`), no separate lookup needed.
+
+**Database:** new migration `supabase/migrations/004_fixture_country.sql` adds `fixtures.country` (text, default `'Unknown'` for rows written before this change — their real country wasn't captured at the time, so old fixtures will show as "Unknown" rather than a guess).
+
+**Touched:**
+- `scripts/generate-tickets.mjs` — `country` added to the priced-fixture object and the `fixtureRows` upsert.
+- `src/lib/dataFetcher.ts` — `Match.country` and `AvailableFixture.country` added; `fetchRealTicketsForDate()` and `fetchFixturesForDate()` both select and map the new column.
+- `src/app/page.tsx` — `MatchRow`, `MatchAnalysisModal`, and `AdminMatchEditorModal`'s available-fixtures list all display it.
+
+**Not touched:** grading (`scripts/grade-tickets.mjs`) doesn't need country to settle a market, so its `fixtures` select was left as `id, market`. The team-search modal's match-history rows (`TeamMatchResult`, from the `team_match_history` view) also weren't extended — that's a different data shape from ticket fixtures and was out of scope for this change.
+
+---
 
 The deterministic mock/fallback ticket generator described in earlier sections of this doc (and in `src/lib/dataFetcher.ts`'s former file header) has been REMOVED entirely, per explicit product decision: the UI must never show fabricated tickets or fabricated performance stats.
 
