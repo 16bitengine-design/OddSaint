@@ -107,7 +107,16 @@ export const TIER_CONFIG: TierConfig[] = [
 // out of the read path for free.
 const MAX_TICKETS_PER_CATEGORY = 2;
 
-/** UTC hours the two daily release slots fire at — must match the cron schedule in .github/workflows/generate-tickets.yml. 04:00 UTC = 07:00 EAT, 11:00 UTC = 14:00 EAT (UTC+3, no DST). */
+/**
+ * Availability hours (UTC) — when each day's release slot actually
+ * becomes ACCESSIBLE to users, not when the pipeline runs. Generation
+ * itself runs at 03:00 and 10:00 UTC (06:00 and 13:00 EAT — see
+ * .github/workflows/generate-tickets.yml); tickets are then held back for
+ * AVAILABILITY_DELAY_MS (1 hour, see scripts/generate-tickets.mjs) before
+ * being shown, which is why these hours are 04:00 and 11:00, not 03:00
+ * and 10:00. fetchRealTicketsForDate below enforces this by filtering out
+ * any row whose available_at hasn't passed yet.
+ */
 export const RELEASE_SLOT_HOURS_UTC = [4, 11];
 
 function getDailySlipCount(tier: TicketTier, day: string, date: Date): number {
@@ -500,10 +509,24 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
 
   if (!data || data.length === 0) return null;
 
+  // "Ready for use one hour after generation": a row can exist in
+  // Supabase before it's meant to be shown — available_at is stamped as
+  // generation time + AVAILABILITY_DELAY_MS by the pipeline (see
+  // scripts/generate-tickets.mjs). Filter out anything not accessible yet
+  // rather than showing a batch the instant it's written. If nothing
+  // today is accessible yet, fall back to mock (same as "no real data
+  // yet") rather than showing an empty feed.
+  const nowMs = Date.now();
+  const accessible = data.filter((row: any) => {
+    if (!row.available_at) return true; // defensive: no timestamp means don't block it
+    return new Date(row.available_at).getTime() <= nowMs;
+  });
+  if (accessible.length === 0) return null;
+
   const tierOrder = TIER_CONFIG.map((c) => c.tier);
   const tierLabel = (tier: TicketTier) => TIER_CONFIG.find((c) => c.tier === tier)?.label ?? tier;
 
-  const tickets: Ticket[] = data.map((row: any) => {
+  const tickets: Ticket[] = accessible.map((row: any) => {
     const links = [...(row.ticket_matches ?? [])].sort(
       (a: any, b: any) => a.sort_order - b.sort_order
     );
