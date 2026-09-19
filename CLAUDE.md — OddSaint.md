@@ -119,6 +119,28 @@ Two accuracy/product-quality rules, both in `scripts/generate-tickets.mjs`.
 
 ---
 
+## NEW — 32. NO MOCK DATA (Removed)
+
+The deterministic mock/fallback ticket generator described in earlier sections of this doc (and in `src/lib/dataFetcher.ts`'s former file header) has been REMOVED entirely, per explicit product decision: the UI must never show fabricated tickets or fabricated performance stats.
+
+**Live homepage feed — `fetchLatestTickets()` (new, replaces the old `fetchTickets()` call in `page.tsx`):**
+- Returns today's accessible tickets if any exist.
+- Otherwise walks backward up to `LATEST_TICKETS_LOOKBACK_DAYS` (30) days and returns the most recent earlier day's accessible tickets — "the results of the last generation."
+- If nothing is found in that window (e.g. a brand-new deployment before the pipeline has ever run), returns `[]`. `page.tsx` shows an honest "No tickets available right now" message in that case, gated by a new `ticketsLoading` state so it can't flash before the fetch even completes.
+
+**Specific-date lookups — `fetchTickets(date)` (unchanged signature, mock removed):**
+- Still used by the ticket archive (`TicketArchiveModal`) to browse one specific past date.
+- Now returns `[]` instead of mock data when nothing was generated that day — an empty archive result is now always an honest historical fact, never a fabricated stand-in.
+
+**Performance history — `fetchPerformanceHistory()`:**
+- Any day without real graded results now shows as "no data" (`ticketsGenerated: 0`, `winRatePct: null`) instead of the old mock day. `PerformanceHistory` in `page.tsx` already rendered a "—" for a statless day, so no frontend change was needed there.
+
+**Deleted from `src/lib/dataFetcher.ts`:** `getTicketsForDate`, `getDayPerformance`, `buildTicket`, `buildMatch`, `generateScoreForOutcome`, `adjustOddsToTarget`, `pickTeams`, `getMockKickoff`, `hashSeed`, `seededRandom`, and the mock-only constants (`LEAGUE_TEAMS`, `BIG_TEAMS`/`BIG_TEAM_SET`, `MARKETS`, `OUTCOME_PROBS`, `GRADE_BUFFER_MS`, the mock's own `SMALL_TICKET_MAX_ODDS`/`TIER_ODDS_TARGET`, `MAX_TICKETS_PER_CATEGORY`). `dateKey` and `getTicketStatus` were kept — both are generic utilities used by real-data code paths too, not mock-specific.
+
+**Known tradeoff, not addressed here:** the day-level fallback in `fetchLatestTickets()` is all-or-nothing per calendar day, not per tier — if today has SOME tiers already accessible but others still pending, only today's accessible rows show (each row is independently filtered by its own `available_at`, so this already works correctly); it's only when NOTHING for today is accessible yet that the whole feed falls back to an earlier day. A tier-by-tier "show yesterday's Bronze if today's isn't ready yet, even while today's Gold already is" merge was considered out of scope for this change.
+
+---
+
 ## NEW — 8. SAINT'S LOCK PRODUCT RULES (Hard Enforcement)
 
 Saint's Lock is a single-match, ultra-high-confidence category with distinct access control, separate from all other tiers:
@@ -278,6 +300,6 @@ Implementation: `PRIORITY_LEAGUE_NAMES` in `scripts/generate-tickets.mjs` includ
 - `scripts/lib/markets.mjs` — updated: exports `FULL_WIN_MARKETS`
 - `scripts/resolve-leagues.mjs` — updated: applies the league quality filter before writing `leagues.json`
 - `scripts/analyze-feedback.mjs` — new: feedback digest reporter
-- `src/lib/dataFetcher.ts` — updated: tier count sync fix, release-slot fields (now 04:00/11:00 UTC availability, 1h after 03:00/10:00 UTC generation), Weekender tier, `fetchRealTicketsForDate()` now filters out rows not yet accessible, Saint's Lock access, admin match-editor helpers
+- `src/lib/dataFetcher.ts` — updated: tier count sync fix, release-slot fields (now 04:00/11:00 UTC availability, 1h after 03:00/10:00 UTC generation), Weekender tier, `fetchRealTicketsForDate()` now filters out rows not yet accessible, Saint's Lock access, admin match-editor helpers, mock generator REMOVED, new `fetchLatestTickets()`
 - `src/lib/feedback.ts` — new: pre-filter, submit, admin moderation functions
-- `src/app/page.tsx` — updated: Saint's Lock fixes (crash + countdown + gating), admin match editor modal, support widget, release time display (now reads `RELEASE_SLOT_HOURS_UTC[0]` instead of a hardcoded hour), admin feedback modal support
+- `src/app/page.tsx` — updated: Saint's Lock fixes (crash + countdown + gating), admin match editor modal, support widget, release time display (now reads `RELEASE_SLOT_HOURS_UTC[0]` instead of a hardcoded hour), admin feedback modal support, live feed now uses `fetchLatestTickets()` with a `ticketsLoading` state and an honest empty-feed message instead of mock
