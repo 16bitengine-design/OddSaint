@@ -6,12 +6,12 @@ name: Odd Saint — Generate Daily Tickets
 # tier's 1st and 2nd slip of the day regardless of exactly when these
 # crons fire. Can also be triggered manually from the Actions tab.
 #
-# 04:00 UTC = 07:00 East Africa Time (EAT, UTC+3, no DST)
-# 11:00 UTC = 14:00 East Africa Time
+# 03:00 UTC = 06:00 East Africa Time (EAT, UTC+3, no DST)
+# 10:00 UTC = 13:00 East Africa Time
 on:
   schedule:
-    - cron: '0 4 * * *'   # slot 0 — 7am EAT morning batch
-    - cron: '0 11 * * *'  # slot 1 — 2pm EAT afternoon batch
+    - cron: '0 3 * * *'   # slot 0 — 6am EAT morning batch
+    - cron: '0 10 * * *'  # slot 1 — 1pm EAT afternoon batch
   workflow_dispatch: {}
 
 jobs:
