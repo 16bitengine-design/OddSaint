@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { supabase } from '@/lib/supabaseClient';
 import {
   fetchTickets,
+  fetchLatestTickets,
   getTicketStatus,
   getTrialDaysRemaining,
   isWithinFreeTrial,
@@ -359,7 +360,7 @@ function MatchRow({
             {match.homeTeam} vs {match.awayTeam}
           </div>
           <div style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 1 }}>
-            {match.league} · {match.market}
+            {match.league} ({match.country}) · {match.market}
           </div>
           {match.finalHomeScore !== undefined && match.finalAwayScore !== undefined ? (
             <div
@@ -453,7 +454,7 @@ function MatchAnalysisModal({ match, onClose }: { match: Match; onClose: () => v
         </button>
 
         <div style={{ fontSize: 11, color: COLORS.textMuted, fontWeight: 600, marginBottom: 4 }}>
-          {match.league}
+          {match.league} ({match.country})
         </div>
         <h2
           style={{
@@ -979,7 +980,7 @@ function AdminMatchEditorModal({
                   {f.homeTeam} vs {f.awayTeam}
                 </div>
                 <div style={{ fontSize: 10.5, color: COLORS.textMuted }}>
-                  {f.league} · {f.market} · {f.odds} · conf {f.confidence}%
+                  {f.league} ({f.country}) · {f.market} · {f.odds} · conf {f.confidence}%
                 </div>
                 <div style={{ fontSize: 10, color: COLORS.textMuted, marginTop: '2px' }}>
                   🕐 {formatKickoff(f.kickoff)}
@@ -3231,6 +3232,7 @@ export default function Page() {
   const [adTicketId, setAdTicketId] = useState<string | null>(null);
   const [adReady, setAdReady] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [ticketsLoading, setTicketsLoading] = useState(true);
   const [showSupport, setShowSupport] = useState(false);
   const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
   const [showFeedbackAdmin, setShowFeedbackAdmin] = useState(false);
@@ -3274,12 +3276,14 @@ export default function Page() {
   }, []);
 
   function reloadTickets() {
-    fetchTickets()
+    setTicketsLoading(true);
+    fetchLatestTickets()
       .then(setTickets)
       .catch((err) => {
         // eslint-disable-next-line no-console
         console.error('[Odd Saint] Failed to load tickets:', err);
-      });
+      })
+      .finally(() => setTicketsLoading(false));
   }
 
   useEffect(() => {
@@ -3601,6 +3605,25 @@ export default function Page() {
               onEditAsAdmin={setEditingTicket}
             />
           )
+        )}
+
+        {/* No mock fallback — if genuinely nothing is accessible yet
+            (rare: only when the pipeline has never produced anything
+            within the lookback window), say so honestly instead of
+            showing a blank feed or fabricated tickets. */}
+        {!ticketsLoading && tickets.length === 0 && (
+          <div
+            style={{
+              textAlign: 'center',
+              padding: '34px 16px',
+              color: COLORS.textMuted,
+              fontFamily: FONT_BODY,
+              fontSize: 13,
+              lineHeight: 1.6,
+            }}
+          >
+            No tickets available right now — check back after the next release.
+          </div>
         )}
 
         <Footer />
