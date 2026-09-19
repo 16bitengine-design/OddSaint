@@ -2,8 +2,8 @@
 // Odd Saint — daily ticket generation
 // Pulls real fixtures + bookmaker odds from API-Football, turns them into
 // tickets for every tier, and writes them to Supabase. Runs TWICE a day via
-// .github/workflows/generate-tickets.yml (04:00 and 11:00 UTC — 07:00 and
-// 14:00 East Africa Time) so each tier's daily tickets release in two
+// .github/workflows/generate-tickets.yml (03:00 and 10:00 UTC — 06:00 and
+// 13:00 East Africa Time) so each tier's daily tickets release in two
 // staggered batches rather than all at once — see
 // fetchTodaysSlipState/nextSlotFor below for how a given run decides
 // whether it's producing today's 1st or 2nd slip for a tier, or skipping
@@ -226,8 +226,18 @@ const MAX_TICKETS_PER_CATEGORY = 2;
 // GitHub Actions scheduling jitter can never produce both of a tier's
 // daily slips back-to-back — the two staggered releases stay meaningfully
 // spread out regardless of exactly when this workflow happens to fire.
-// Matches the two 04:00/11:00 UTC cron triggers (7h apart) with headroom.
+// Matches the two 03:00/10:00 UTC cron triggers (7h apart) with headroom.
 const MIN_HOURS_BETWEEN_SLOTS = 6;
+
+// Tickets become ACCESSIBLE this long after the moment they're generated
+// — not the instant the row is written. Gives a clean, predictable "ready
+// at" cutoff instead of a batch appearing mid-write, and matches
+// RELEASE_SLOT_HOURS_UTC in src/lib/dataFetcher.ts (generation at
+// 03:00/10:00 UTC + this delay = 04:00/11:00 UTC availability). Enforced
+// on the read side by fetchRealTicketsForDate in dataFetcher.ts, which
+// filters out any row whose available_at is still in the future — this
+// file's only job is stamping the correct future timestamp when writing.
+const AVAILABILITY_DELAY_MS = 60 * 60 * 1000; // 1 hour
 
 /**
  * Reads how many slips already exist today per tier, and when the most
@@ -266,7 +276,14 @@ function nextSlotFor(maxSlipsToday, slipState) {
   const state = slipState ?? { count: 0, lastAvailableAt: null };
   if (state.count >= maxSlipsToday) return null; // already at today's cap for this tier
   if (state.count === 0) return 0; // first slip of the day — always fine
-  const hoursSinceLast = (Date.now() - new Date(state.lastAvailableAt).getTime()) / 3_600_000;
+  // available_at is stamped as GENERATION time + AVAILABILITY_DELAY_MS
+  // (see buildTickets/buildSaintsLockTickets), so recover the actual
+  // generation time before measuring the gap — otherwise every comparison
+  // would be skewed by that same fixed delay, which at this schedule's 7h
+  // gap would put the measured value right at the MIN_HOURS_BETWEEN_SLOTS
+  // boundary instead of safely above it.
+  const lastGeneratedAtMs = new Date(state.lastAvailableAt).getTime() - AVAILABILITY_DELAY_MS;
+  const hoursSinceLast = (Date.now() - lastGeneratedAtMs) / 3_600_000;
   if (hoursSinceLast < MIN_HOURS_BETWEEN_SLOTS) return null; // too soon — this run isn't the 2nd slot's time yet
   return state.count; // e.g. 1 for the 2nd slip of the day
 }
@@ -288,9 +305,26 @@ function isExcluded(homeTeam, awayTeam) {
   return EXCLUDED_TEAMS.has(homeTeam) || EXCLUDED_TEAMS.has(awayTeam);
 }
 
+// Product rule: a fixture must be at least this many hours from kickoff,
+// measured from the moment THIS run started (not wall-clock time when the
+// fixture happens to be evaluated mid-loop), to be eligible for a ticket.
+// Protects against picks generated too close to kickoff, where there's
+// less time for team news, a lineup change, or a postponement to surface
+// before someone acts on the pick.
+const MIN_HOURS_TO_KICKOFF = 2;
+
+function hasMinimumLeadTime(kickoffISO, now) {
+  if (!kickoffISO) return false;
+  const kickoffMs = new Date(kickoffISO).getTime();
+  return kickoffMs - now.getTime() >= MIN_HOURS_TO_KICKOFF * 60 * 60 * 1000;
+}
+
 /**
  * Fetches and prices fixtures for the given dates, spending up to
- * `maxOddsLookups` /odds requests total.
+ * `maxOddsLookups` /odds requests total. `now` anchors both the kickoff
+ * lead-time filter above and is passed through unchanged for the whole
+ * call — every fixture in one run is judged against the same moment,
+ * rather than drifting as the run progresses.
  *
  * FLEXIBLE LEAGUE ROTATION (this is the fix for "glued to particular
  * leagues"): fixtures are grouped by league, then priced in a round-robin
@@ -309,7 +343,7 @@ function isExcluded(homeTeam, awayTeam) {
  * not just the named priority set — "priority" now only breaks ties once
  * fixtures are being assembled into tickets (see the final sort below).
  */
-async function fetchPricedFixtures(dates, maxOddsLookups) {
+async function fetchPricedFixtures(dates, maxOddsLookups, now) {
   const seen = new Map(); // fixtureId -> priced fixture
   let oddsLookupsUsed = 0;
   const leagueBreakdown = new Map(); // league name -> count actually priced (for the run summary log)
@@ -335,7 +369,8 @@ async function fetchPricedFixtures(dates, maxOddsLookups) {
         // predates this filter — see scripts/lib/leagueQuality.mjs.
         !isAmateurOrYouthLeague(f.league?.name) &&
         !isBigClash(f.teams?.home?.name, f.teams?.away?.name) &&
-        !isExcluded(f.teams?.home?.name, f.teams?.away?.name)
+        !isExcluded(f.teams?.home?.name, f.teams?.away?.name) &&
+        hasMinimumLeadTime(f.fixture?.date, now)
     );
 
     if (eligible.length === 0) continue;
@@ -698,7 +733,7 @@ const SAINTS_LOCK_MIN_CONFIDENCE = 85;
  * outright-win fixture just to satisfy a market-type preference would
  * directly contradict that.
  */
-function buildSaintsLockTickets(dailyPool, usageCount, today, slot) {
+function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
   const config = TIER_CONFIG.find((c) => c.tier === 'saints_lock');
   const [minOdds, maxOdds] = TIER_ODDS_TARGET.saints_lock;
 
@@ -736,7 +771,7 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot) {
   usageCount.set(pick.fixtureId, (usageCount.get(pick.fixtureId) ?? 0) + 1);
 
   const ticketId = `${today}-saints_lock-${slot}`;
-  const nowIso = new Date().toISOString();
+  const availableAtIso = new Date(now.getTime() + AVAILABILITY_DELAY_MS).toISOString();
 
   const tickets = [
     {
@@ -749,7 +784,7 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot) {
       total_odds: pick.odds,
       is_free: false,
       release_slot: slot,
-      available_at: nowIso,
+      available_at: availableAtIso,
     },
   ];
   const ticketMatches = [{ ticket_id: ticketId, fixture_id: pick.fixtureId, sort_order: 0 }];
@@ -757,10 +792,9 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot) {
   return { tickets, ticketMatches, fixturesUsed: [pick], usedFallback };
 }
 
-function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState) {
-  const now = new Date();
+function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, now) {
   const today = dateStr(now);
-  const nowIso = now.toISOString();
+  const availableAtIso = new Date(now.getTime() + AVAILABILITY_DELAY_MS).toISOString();
   const tickets = [];
   const ticketMatches = [];
   const fixturesUsed = new Map();
@@ -771,7 +805,7 @@ function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState) {
   // stricter confidence bar than every other category.
   const saintsLockSlot = nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get('saints_lock'));
   if (saintsLockSlot !== null) {
-    const saintsLock = buildSaintsLockTickets(dailyPool, usageCount, today, saintsLockSlot);
+    const saintsLock = buildSaintsLockTickets(dailyPool, usageCount, today, saintsLockSlot, now);
     tickets.push(...saintsLock.tickets);
     ticketMatches.push(...saintsLock.ticketMatches);
     saintsLock.fixturesUsed.forEach((f) => fixturesUsed.set(f.fixtureId, f));
@@ -824,7 +858,7 @@ function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState) {
       total_odds: totalOdds,
       is_free: config.alwaysFree,
       release_slot: slot,
-      available_at: nowIso,
+      available_at: availableAtIso,
     });
 
     picks.forEach((p, idx) => {
@@ -862,19 +896,19 @@ async function main() {
   }
 
   console.log('Fetching daily fixture pool...');
-  const dailyPool = await fetchPricedFixtures(dailyDates, MAX_ODDS_LOOKUPS_PER_RUN);
+  const dailyPool = await fetchPricedFixtures(dailyDates, MAX_ODDS_LOOKUPS_PER_RUN, today);
   console.log(`Priced ${dailyPool.length} fixtures for today.`);
 
   console.log('Fetching weekly fixture pool (for Weekly Lite / Weekly Titan)...');
-  const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN);
+  const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN, today);
   console.log(`Priced ${weeklyPool.length} fixtures for the week ahead.`);
 
   console.log('Fetching Weekender pool (upcoming Sat+Sun)...');
   const weekendDates = upcomingWeekendDates(today);
-  const weekenderPool = await fetchPricedFixtures(weekendDates, MAX_ODDS_LOOKUPS_PER_RUN);
+  const weekenderPool = await fetchPricedFixtures(weekendDates, MAX_ODDS_LOOKUPS_PER_RUN, today);
   console.log(`Priced ${weekenderPool.length} fixtures for the weekend (${weekendDates.join(', ')}).`);
 
-  const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, weekenderPool, slipState);
+  const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, today);
 
   if (tickets.length === 0) {
     console.warn('No tickets could be assembled this run — not enough priced fixtures, or every eligible category was skipped. Nothing written.');
