@@ -8,13 +8,17 @@ Add these sections to the existing CLAUDE.md to document the batch of updates ap
 
 Tickets are released in two staggered batches per day rather than all at once, to signal curation intent and prevent an "illusion of choice."
 
-**Release times:**
-- **Slot 0**: 04:00 UTC / 07:00 East Africa Time (EAT, UTC+3, no DST) — morning batch
-- **Slot 1**: 11:00 UTC / 14:00 East Africa Time — afternoon batch
+**Generation times** (when the pipeline actually runs and prices fixtures):
+- **Slot 0**: 03:00 UTC / 06:00 East Africa Time (EAT, UTC+3, no DST)
+- **Slot 1**: 10:00 UTC / 13:00 East Africa Time
 
-Each tier caps at **MAX_TICKETS_PER_CATEGORY = 2** per day — matching values in both `src/lib/dataFetcher.ts` and `scripts/generate-tickets.mjs`. The second slot only fills if at least **MIN_HOURS_BETWEEN_SLOTS = 6** have elapsed since slot 0 for that tier (the two 04:00/11:00 UTC triggers are 7h apart, so this always clears), enforced in code, so the two releases stay meaningfully spread regardless of cron scheduling jitter.
+**Availability times** (when a slip actually becomes visible/usable — see section 31 below):
+- **Slot 0**: 04:00 UTC / 07:00 EAT — one hour after generation
+- **Slot 1**: 11:00 UTC / 14:00 EAT — one hour after generation
 
-**Previous batches remain visible until the next one lands** — Supabase rows are never deleted or overwritten, only new rows added, so the current feed stays stable until the next scheduled release. The frontend's `getNextReleaseLabel()` shows users the clock time of the next slot in their local timezone, and `getDailyRefreshInfo()` in `src/app/page.tsx` reads the first slot's hour from the shared `RELEASE_SLOT_HOURS_UTC` constant (exported from `dataFetcher.ts`) rather than a separately hardcoded value, so the displayed time can never drift from the actual cron schedule.
+Each tier caps at **MAX_TICKETS_PER_CATEGORY = 2** per day — matching values in both `src/lib/dataFetcher.ts` and `scripts/generate-tickets.mjs`. The second slot only fills if at least **MIN_HOURS_BETWEEN_SLOTS = 6** have elapsed since slot 0's *generation* time for that tier (the two 03:00/10:00 UTC triggers are 7h apart, so this always clears) — `nextSlotFor()` recovers the generation time from the stored `available_at` by subtracting `AVAILABILITY_DELAY_MS`, since `available_at` itself is stamped 1 hour later than generation.
+
+**Previous batches remain visible until the next one lands** — Supabase rows are never deleted or overwritten, only new rows added, so the current feed stays stable until the next scheduled release. The frontend's `getNextReleaseLabel()` shows users the clock time of the next slot in their local timezone, and `getDailyRefreshInfo()` in `src/app/page.tsx` reads the first slot's hour from the shared `RELEASE_SLOT_HOURS_UTC` constant (exported from `dataFetcher.ts`, and representing AVAILABILITY hours, not generation hours) rather than a separately hardcoded value, so the displayed time can never drift from the actual cron schedule.
 
 **Implementation:**
 - Database: `release_slot` (0 or 1) and `available_at` (ISO timestamp) columns on `tickets` table.
@@ -95,6 +99,23 @@ Two accuracy-focused changes to selection, both defense-in-depth rather than sin
 - Home Win / Away Win markets were already never substituted away for being "too tight" — their own odds band in `MARKET_CATALOG` starts at 1.3, so the old tight-price guard (`WIN_MARKET_MIN_ODDS`) could only ever fire for Double Chance sub-markets. This is now documented explicitly in code rather than being an implicit side effect.
 - NEW: every generic-tier ticket (mega/bronze/silver/gold/platinum/diamond/weekly_lite/weekly_titan/weekender) now tries to guarantee at least one outright Home/Away Win leg via `ensureFullWinLeg()`, called at both return points of `pickFixturesForSlip()`. It swaps in the safest available full-win fixture from the pool, preferring the least-disruptive swap (trying each leg position, highest-odds first) and only keeping a swap that lands the ticket's total back within the existing 30% tolerance band. Best-effort: if no full-win fixture is available in the pool, or no swap keeps the total in range, the ticket is left as assembled rather than forced.
 - Saint's Lock (`buildSaintsLockTickets()`) is deliberately EXCLUDED from this guarantee — it's a single-leg, confidence-first pick with no "ticket completeness" concept, and swapping in a lower-confidence full-win fixture just to satisfy a market-type preference would contradict its own design principle (see the note in code).
+
+---
+
+## NEW — 31. MINIMUM KICKOFF LEAD TIME + ONE-HOUR AVAILABILITY DELAY
+
+Two accuracy/product-quality rules, both in `scripts/generate-tickets.mjs`.
+
+**Minimum 2 hours to kickoff (`MIN_HOURS_TO_KICKOFF` / `hasMinimumLeadTime()`):**
+- Applied inside `fetchPricedFixtures()`'s fixture-eligibility filter, alongside the league-quality and big-clash checks — so it covers every pool (daily, weekly, weekender) automatically, with no separate enforcement needed per tier.
+- A fixture is only eligible if its kickoff is at least 2 hours after the moment the run started (`now`, threaded through from `main()` into every `fetchPricedFixtures()` call so the whole run judges fixtures against one consistent instant, not wall-clock time creeping as the run executes).
+- Rationale: protects against picks generated too close to kickoff, where there's less time for team news, a lineup change, or a postponement to surface before someone acts on the pick.
+
+**One-hour availability delay (`AVAILABILITY_DELAY_MS`):**
+- A ticket row is written to Supabase immediately at generation time, but its `available_at` is stamped as generation time + 1 hour, not the write time itself.
+- Enforced on the READ side: `fetchRealTicketsForDate()` in `src/lib/dataFetcher.ts` filters out any row whose `available_at` hasn't passed yet. If nothing for today is accessible yet, it falls back to mock data (same fallback path as "no real data yet").
+- Once a batch's `available_at` passes, it stays visible/accessible all day, same as before — nothing about "throughout the day" changed; only the exact moment things first become visible moved.
+- Side effect requiring a fix: `nextSlotFor()`'s staggered-release gap check reads `available_at` from previous rows to measure time since the last slip. Since `available_at` is now 1 hour later than the actual generation time, the gap check subtracts `AVAILABILITY_DELAY_MS` back out before comparing against `MIN_HOURS_BETWEEN_SLOTS` — otherwise the measured gap would be skewed exactly 1 hour short, which at this schedule's 7-hour generation gap would land right on the 6-hour minimum boundary instead of safely clearing it.
 
 ---
 
@@ -249,14 +270,14 @@ Implementation: `PRIORITY_LEAGUE_NAMES` in `scripts/generate-tickets.mjs` includ
 ## SUMMARY OF FILES CHANGED IN THIS BATCH
 
 - `supabase/migrations/002_batch_updates.sql` — new: schema changes (release slots, feedback table, admin RLS)
-- `.github/workflows/generate-tickets.yml` — updated: two daily cron slots, now 04:00/11:00 UTC (07:00/14:00 EAT)
+- `.github/workflows/generate-tickets.yml` — updated: two daily cron slots, now 03:00/10:00 UTC generation (06:00/13:00 EAT)
 - `.github/workflows/analyze-feedback.yml` — new: manual-trigger feedback digest
-- `scripts/generate-tickets.mjs` — updated: staggered slot logic, tier counts, Saint's Lock selection, Weekender tier + dedicated weekend pool, Pro-plan `MAX_ODDS_LOOKUPS_PER_RUN`, per-date fetch resilience, amateur/youth league filter, full-win-leg guarantee (`ensureFullWinLeg`)
+- `scripts/generate-tickets.mjs` — updated: staggered slot logic, tier counts, Saint's Lock selection, Weekender tier + dedicated weekend pool, Pro-plan `MAX_ODDS_LOOKUPS_PER_RUN`, per-date fetch resilience, amateur/youth league filter, full-win-leg guarantee (`ensureFullWinLeg`), minimum 2h kickoff lead time, 1h availability delay (`AVAILABILITY_DELAY_MS`), `nextSlotFor()` gap-math fix for that delay
 - `scripts/lib/apiFootball.mjs` — updated: Pro-plan rate-limit constants
 - `scripts/lib/leagueQuality.mjs` — new: shared youth/reserve/lower-division league name filter, used by both `resolve-leagues.mjs` and `generate-tickets.mjs`
 - `scripts/lib/markets.mjs` — updated: exports `FULL_WIN_MARKETS`
 - `scripts/resolve-leagues.mjs` — updated: applies the league quality filter before writing `leagues.json`
 - `scripts/analyze-feedback.mjs` — new: feedback digest reporter
-- `src/lib/dataFetcher.ts` — updated: tier count sync fix, release-slot fields (now 04:00/11:00 UTC), Weekender tier, Saint's Lock access, admin match-editor helpers
+- `src/lib/dataFetcher.ts` — updated: tier count sync fix, release-slot fields (now 04:00/11:00 UTC availability, 1h after 03:00/10:00 UTC generation), Weekender tier, `fetchRealTicketsForDate()` now filters out rows not yet accessible, Saint's Lock access, admin match-editor helpers
 - `src/lib/feedback.ts` — new: pre-filter, submit, admin moderation functions
 - `src/app/page.tsx` — updated: Saint's Lock fixes (crash + countdown + gating), admin match editor modal, support widget, release time display (now reads `RELEASE_SLOT_HOURS_UTC[0]` instead of a hardcoded hour), admin feedback modal support
