@@ -2,16 +2,16 @@
 // Odd Saint — data layer
 // Reads real tickets from Supabase (populated by the GitHub Actions
 // pipeline in scripts/generate-tickets.mjs + scripts/grade-tickets.mjs).
-// If no real data exists yet for a given day — e.g. before the pipeline's
-// first run, or a day it couldn't assemble enough fixtures — this falls
-// back to a lightweight, DETERMINISTIC mock generator so the UI never
-// breaks. Every mock ticket is seeded from its calendar date + tier + slip
-// number, so calling the same day twice always returns identical results.
 //
-// IMPORTANT: the mock generator's outcome probabilities are PLACEHOLDER
-// constants for demo/fallback purposes only — not a real track record.
-// Real tickets, once the pipeline is running, use real fixtures, real
-// bookmaker-odds-derived confidence, and real graded results instead.
+// NO MOCK DATA: the live homepage feed (fetchLatestTickets) shows either
+// today's accessible tickets, or — if nothing for today is accessible yet
+// (e.g. before the pipeline's first run of the day, or within the 1-hour
+// availability delay) — the most recent earlier day's tickets, i.e. the
+// results of the last generation. If nothing has ever been generated
+// within the lookback window, the feed is simply empty; nothing here ever
+// fabricates placeholder tickets. fetchTickets(date) is for browsing one
+// SPECIFIC date (the ticket archive) and never looks at any other day —
+// an empty result there means honestly "nothing was generated that day."
 // ---------------------------------------------------------------------------
 import { supabase } from './supabaseClient';
 
@@ -33,6 +33,8 @@ export type TicketTier =
 export interface Match {
   id: string;
   league: string;
+  /** Nation/country the league is from (e.g. "England" for the Premier League) — from API-Football's league.country field. */
+  country: string;
   homeTeam: string;
   awayTeam: string;
   market: string; // e.g. "Over 1.5 Goals", "Home Win"
@@ -57,7 +59,7 @@ export interface Ticket {
   matches: Match[];
   /** 0 = today's 1st release for this tier, 1 = today's 2nd — see RELEASE_SLOT_HOURS_UTC */
   releaseSlot?: number;
-  /** ISO timestamp of when this specific slip was actually released */
+  /** ISO timestamp of when this specific slip actually becomes accessible */
   availableAt?: string;
 }
 
@@ -91,22 +93,6 @@ export const TIER_CONFIG: TierConfig[] = [
   { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2', alwaysFree: false },
 ];
 
-// ---------------------------------------------------------------------------
-// Daily slip volume + staggered release
-// ---------------------------------------------------------------------------
-// Every category caps at 2 tickets/day (down from 3) — mirrors
-// MAX_TICKETS_PER_CATEGORY in scripts/generate-tickets.mjs. The two daily
-// slots release at different times (see RELEASE_SLOT_HOURS_UTC, matching
-// the two cron triggers in generate-tickets.yml) rather than simultaneously
-// — a tier's 2nd slip is a genuinely fresh batch released later in the day,
-// not an alternative shown alongside the 1st, so there's no "which of
-// these do I pick right now" moment for users to be confused by. Whatever
-// batch is currently on Supabase simply stays on screen until the next
-// scheduled slot writes a new row — nothing here ever deletes a previous
-// slip, so "previous batch stays visible until the next one lands" falls
-// out of the read path for free.
-const MAX_TICKETS_PER_CATEGORY = 2;
-
 /**
  * Availability hours (UTC) — when each day's release slot actually
  * becomes ACCESSIBLE to users, not when the pipeline runs. Generation
@@ -118,17 +104,6 @@ const MAX_TICKETS_PER_CATEGORY = 2;
  * any row whose available_at hasn't passed yet.
  */
 export const RELEASE_SLOT_HOURS_UTC = [4, 11];
-
-function getDailySlipCount(tier: TicketTier, day: string, date: Date): number {
-  if (tier === 'saints_lock') return Math.min(MAX_TICKETS_PER_CATEGORY, 2); // min 1/max 2 guaranteed by the real pipeline; see SAINTS_LOCK_MIN_CONFIDENCE
-  if (tier === 'platinum' || tier === 'diamond' || tier === 'weekly_lite' || tier === 'weekly_titan' || tier === 'weekender') {
-    return 1; // large accumulators — one curated slip a day
-  }
-  // mega / bronze / silver / gold: scale with a deterministic "busyness"
-  // factor, capped at MAX_TICKETS_PER_CATEGORY.
-  const busyness = hashSeed(`${day}-busyness`) / 233280; // deterministic 0..1
-  return Math.min(MAX_TICKETS_PER_CATEGORY, 1 + Math.round(busyness * (MAX_TICKETS_PER_CATEGORY - 1)));
-}
 
 /**
  * Given "today" in the visitor's local view, returns a human label for
@@ -150,287 +125,12 @@ export function getNextReleaseLabel(now: Date = new Date()): { label: string; ha
   return { label, hasReleasedToday };
 }
 
-
-// Teams grouped by their actual real-world domestic league — matches are
-// only ever generated within the same league, so a mock fixture never
-// mislabels which competition a real club actually plays in.
-const LEAGUE_TEAMS: Record<string, string[]> = {
-  EPL: ['Arsenal', 'Chelsea', 'Man City', 'Liverpool'],
-  'La Liga': ['Real Madrid', 'Barcelona', 'Atletico Madrid'],
-  Bundesliga: ['Bayern Munich', 'Dortmund', 'Leipzig'],
-  'Serie A': ['AC Milan', 'Inter Milan', 'Juventus', 'Napoli'],
-  'Ligue 1': ['PSG', 'Marseille'],
-};
-
-// Marquee clubs — picks avoid pairing two of these against each other
-// within the same league, since those fixtures are inherently harder to
-// call with real confidence. Every league above has at least one
-// non-marquee club to fall back to when this triggers.
-const BIG_TEAMS = ['Real Madrid', 'Barcelona', 'Bayern Munich', 'Man City', 'Liverpool', 'PSG', 'Juventus', 'Chelsea'];
-const BIG_TEAM_SET = new Set(BIG_TEAMS);
-
-// "Draw No Bet" and plain "Draw" are deliberately excluded — see the
-// generate-tickets.mjs market catalog for the same rule applied to real
-// picks. Both are considered too low-confidence to build a product around.
-const MARKETS = ['Over 1.5 Goals', 'Home Win', 'Away Win', 'BTTS', 'Over 2.5 Goals'];
-
-// ---------------------------------------------------------------------------
-// Mock outcome probabilities (PLACEHOLDER — see file header note)
-// Decided at the ticket level first, then matches are generated consistent
-// with that outcome, so the aggregate win rate stays predictable regardless
-// of how many legs a ticket has (a 30-leg accumulator isn't punished just
-// for having more matches — this is mock data, not a real settlement engine).
-// ---------------------------------------------------------------------------
-const OUTCOME_PROBS = { green: 0.74, red: 0.11, pending: 0.15 } as const;
-
-// How long after kickoff a match is treated as "played" — mirrors the real
-// grading job's buffer (see scripts/grade-tickets.mjs). Before this point,
-// a match's status always displays as pending, REGARDLESS of its eventual
-// decided outcome — a match that hasn't been played yet can't have a result.
-const GRADE_BUFFER_MS = 2.5 * 60 * 60 * 1000;
-
-function seededRandom(seed: number) {
-  // Deterministic pseudo-random generator — same seed always produces the
-  // same sequence, which is what makes a given day's tickets stable.
-  let s = seed;
-  return () => {
-    s = (s * 9301 + 49297) % 233280;
-    return s / 233280;
-  };
-}
-
-/** Simple string hash so any date+tier+slip combination maps to a stable numeric seed. */
-function hashSeed(str: string): number {
-  let h = 0;
-  for (let i = 0; i < str.length; i++) {
-    h = (h * 31 + str.charCodeAt(i)) >>> 0;
-  }
-  return h % 233280;
-}
-
-/** Local calendar date as 'YYYY-MM-DD', used as the root of every day's seed. */
+/** Local calendar date as 'YYYY-MM-DD' — used to key ticket_date queries, archive date pickers, and performance-history lookups. */
 export function dateKey(date: Date): string {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, '0');
   const d = String(date.getDate()).padStart(2, '0');
   return `${y}-${m}-${d}`;
-}
-
-/**
- * Spreads mock kickoffs across a realistic matchday window (12:00–20:30 UTC)
- * on the ticket's actual calendar date, rather than relative to "whenever
- * this function happened to run" — that's what makes the played/not-played
- * check below meaningful instead of arbitrary.
- */
-function getMockKickoff(day: Date, rand: () => number): Date {
-  const hour = 12 + Math.floor(rand() * 9); // 12–20
-  const minute = rand() < 0.5 ? 0 : 30;
-  return new Date(Date.UTC(day.getFullYear(), day.getMonth(), day.getDate(), hour, minute));
-}
-
-function pickTeams(rand: () => number): { home: string; away: string; league: string } {
-  const leagueNames = Object.keys(LEAGUE_TEAMS);
-  const league = leagueNames[Math.floor(rand() * leagueNames.length)];
-  const clubs = LEAGUE_TEAMS[league];
-
-  const home = clubs[Math.floor(rand() * clubs.length)];
-  let away = clubs[Math.floor(rand() * clubs.length)];
-  if (away === home) away = clubs[(clubs.indexOf(away) + 1) % clubs.length];
-
-  // Two marquee clubs facing each other — reroll the away side to a
-  // non-marquee club within the SAME league, so the fixture stays both
-  // gradable with real confidence and correctly labeled for that league.
-  if (BIG_TEAM_SET.has(home) && BIG_TEAM_SET.has(away)) {
-    const regularInLeague = clubs.filter((c) => !BIG_TEAM_SET.has(c));
-    if (regularInLeague.length > 0) {
-      away = regularInLeague[Math.floor(rand() * regularInLeague.length)];
-    }
-  }
-
-  return { home, away, league };
-}
-
-// Tiers with fewer than 7 matches favor safer, more heavily-favored picks —
-// same rule as the real pipeline (scripts/generate-tickets.mjs).
-const SMALL_TICKET_MAX_ODDS = 1.77;
-
-/**
- * Generates a plausible final score consistent with a market and whether
- * the pick won or lost — the inverse of scripts/lib/markets.mjs's
- * settleMarket, which judges a score against a market. Only called once a
- * match has actually "been played" (see hasBeenPlayed below), so mock data
- * never shows a score before its status would allow one.
- */
-function generateScoreForOutcome(
-  market: string,
-  won: boolean,
-  rand: () => number
-): { home: number; away: number } {
-  const lowGoal = () => Math.floor(rand() * 2); // 0-1
-  const highGoal = () => 2 + Math.floor(rand() * 3); // 2-4
-
-  switch (market) {
-    case 'Home Win':
-      return won ? { home: highGoal(), away: lowGoal() } : { home: lowGoal(), away: lowGoal() + (rand() < 0.5 ? 0 : 1) };
-    case 'Away Win':
-      return won ? { home: lowGoal(), away: highGoal() } : { home: lowGoal() + (rand() < 0.5 ? 0 : 1), away: lowGoal() };
-    case 'Over 1.5 Goals':
-      return won ? { home: 1 + Math.floor(rand() * 2), away: 1 + Math.floor(rand() * 2) } : { home: 0, away: rand() < 0.5 ? 0 : 1 };
-    case 'Under 1.5 Goals':
-      return won ? { home: 0, away: rand() < 0.5 ? 0 : 1 } : { home: 1 + Math.floor(rand() * 2), away: 1 + Math.floor(rand() * 2) };
-    case 'Over 2.5 Goals':
-      return won ? { home: highGoal(), away: 1 + Math.floor(rand() * 2) } : { home: 1, away: 1 };
-    case 'Under 2.5 Goals':
-      return won ? { home: 1, away: 1 } : { home: highGoal(), away: 1 + Math.floor(rand() * 2) };
-    case 'Over 3.5 Goals':
-      return won ? { home: highGoal(), away: highGoal() } : { home: 1, away: 1 };
-    case 'BTTS':
-    case 'BTTS - Yes':
-      return won ? { home: 1 + Math.floor(rand() * 2), away: 1 + Math.floor(rand() * 2) } : { home: 0, away: 1 + Math.floor(rand() * 2) };
-    case 'BTTS - No':
-      return won ? { home: 0, away: 1 + Math.floor(rand() * 2) } : { home: 1 + Math.floor(rand() * 2), away: 1 + Math.floor(rand() * 2) };
-    default:
-      return won ? { home: highGoal(), away: lowGoal() } : { home: lowGoal(), away: lowGoal() };
-  }
-}
-
-function buildMatch(
-  rand: () => number,
-  index: number,
-  seedOffset: number,
-  forcedStatus: MatchStatus,
-  day: Date,
-  maxOdds: number
-): Match {
-  const { home, away, league } = pickTeams(rand);
-  const market = MARKETS[Math.floor(rand() * MARKETS.length)];
-  const oddsRange = Math.min(maxOdds, 3.8) - 1.3;
-  const odds = Math.round((1.3 + rand() * oddsRange) * 100) / 100;
-  const confidence = Math.round(60 + rand() * 38);
-
-  const kickoff = getMockKickoff(day, rand);
-  const hasBeenPlayed = Date.now() > kickoff.getTime() + GRADE_BUFFER_MS;
-  // A match can't show a result before it's actually been played — the
-  // "intended" outcome only applies once real time has caught up to it.
-  const status: MatchStatus = hasBeenPlayed ? forcedStatus : 'pending';
-
-  let finalHomeScore: number | undefined;
-  let finalAwayScore: number | undefined;
-  if (status === 'green' || status === 'red') {
-    const score = generateScoreForOutcome(market, status === 'green', rand);
-    finalHomeScore = score.home;
-    finalAwayScore = score.away;
-  }
-
-  return {
-    id: `m-${seedOffset}-${index}`,
-    league,
-    homeTeam: home,
-    awayTeam: away,
-    market,
-    odds,
-    kickoff: kickoff.toISOString(),
-    status,
-    confidence,
-    finalHomeScore,
-    finalAwayScore,
-  };
-}
-
-// Numeric cumulative-odds targets matching each tier's oddsRange label.
-// Mirrors TIER_ODDS_TARGET in scripts/generate-tickets.mjs — mock data
-// should behave the same way real data does. Weekly Lite/Titan
-// intentionally left unset ("Mixed" by design, no fixed target).
-const TIER_ODDS_TARGET: Partial<Record<TicketTier, [number, number]>> = {
-  mega: [1.5, 3],
-  bronze: [2, 3],
-  silver: [3, 5],
-  gold: [5, 10],
-  platinum: [25, 300],
-  diamond: [300, Infinity],
-};
-
-/**
- * Scales every leg's odds toward the tier's target cumulative range,
- * clamped within [minLegOdds, maxLegOdds] per leg. Mock data has no fixed
- * "pool" to swap picks in and out of like the real pipeline does, so this
- * solves directly for the multiplicative factor needed instead.
- */
-function adjustOddsToTarget(matches: Match[], targetRange: [number, number] | undefined, minLegOdds: number, maxLegOdds: number) {
-  if (!targetRange) return;
-  const [minTotal, maxTotal] = targetRange;
-
-  for (let pass = 0; pass < 6; pass++) {
-    const total = matches.reduce((acc, m) => acc * m.odds, 1);
-    if (total >= minTotal && total <= maxTotal) return;
-
-    const target = total < minTotal ? minTotal : maxTotal;
-    if (!Number.isFinite(target)) return; // diamond's upper bound is Infinity — nothing to scale toward
-    const factorPerLeg = Math.pow(target / total, 1 / matches.length);
-
-    matches.forEach((m) => {
-      const scaled = m.odds * factorPerLeg;
-      m.odds = Math.round(Math.min(maxLegOdds, Math.max(minLegOdds, scaled)) * 100) / 100;
-    });
-  }
-}
-
-/** Decide the overall ticket outcome first, then build per-match statuses consistent with it. */
-function buildTicket(config: TierConfig, seed: number, day: Date, releaseSlot: number): Ticket {
-  const rand = seededRandom(seed);
-  const n = config.matchCount;
-  const maxOdds = n < 7 ? SMALL_TICKET_MAX_ODDS : 3.8;
-
-  const outcomeRoll = rand();
-  const overall: MatchStatus =
-    outcomeRoll < OUTCOME_PROBS.green ? 'green' : outcomeRoll < OUTCOME_PROBS.green + OUTCOME_PROBS.red ? 'red' : 'pending';
-
-  const statuses: MatchStatus[] = new Array(n).fill('green');
-  if (overall === 'red') {
-    // Exactly one losing leg — the classic "one bad selection" accumulator failure.
-    const badIndex = Math.floor(rand() * n);
-    statuses[badIndex] = 'red';
-  } else if (overall === 'pending') {
-    // A handful of legs still in play, none failed yet.
-    const pendingFraction = 0.3 + rand() * 0.4;
-    let anyPending = false;
-    for (let i = 0; i < n; i++) {
-      if (rand() < pendingFraction) {
-        statuses[i] = 'pending';
-        anyPending = true;
-      }
-    }
-    if (!anyPending) statuses[0] = 'pending';
-  }
-  // overall === 'green' → statuses stays all-green (subject to the
-  // played/not-played gate applied per match inside buildMatch).
-
-  const matches = Array.from({ length: n }, (_, i) => buildMatch(rand, i, seed, statuses[i], day, maxOdds));
-  adjustOddsToTarget(matches, TIER_ODDS_TARGET[config.tier], 1.3, maxOdds);
-  const totalOdds = Math.round(matches.reduce((acc, m) => acc * m.odds, 1) * 100) / 100;
-
-  // Deterministic mock "available_at": anchor to the release slot's clock
-  // hour on this ticket's calendar day, so mock data mirrors the real
-  // pipeline's staggered-release timestamps instead of always looking
-  // "just released."
-  const slotHour = RELEASE_SLOT_HOURS_UTC[releaseSlot] ?? RELEASE_SLOT_HOURS_UTC[0];
-  const availableAt = new Date(
-    Date.UTC(day.getFullYear(), day.getMonth(), day.getDate(), slotHour, 0)
-  ).toISOString();
-
-  return {
-    id: `t-${config.tier}-${seed}`,
-    tier: config.tier,
-    label: config.label,
-    slipLabel: undefined, // both daily slips are full tickets released at different times, not "1 of 2" alternatives
-    matchCount: n,
-    oddsRange: config.oddsRange,
-    totalOdds,
-    isFree: config.alwaysFree,
-    matches,
-    releaseSlot,
-    availableAt,
-  };
 }
 
 /**
@@ -446,37 +146,12 @@ export function getTicketStatus(ticket: Ticket): MatchStatus {
 }
 
 /**
- * Generates every ticket for a given calendar day — deterministically, so
- * the same date always regenerates identical tickets and outcomes.
- *
- * Replace this with a real Supabase query once tickets are graded and
- * stored server-side, e.g.:
- *
- *   const { data } = await supabase
- *     .from('tickets')
- *     .select('*, matches(*)')
- *     .eq('ticket_date', dateKey(date));
- */
-export function getTicketsForDate(date: Date): Ticket[] {
-  const day = dateKey(date);
-  const tickets: Ticket[] = [];
-
-  TIER_CONFIG.forEach((config) => {
-    const count = getDailySlipCount(config.tier, day, date);
-    for (let i = 0; i < count; i++) {
-      const seed = hashSeed(`${day}-${config.tier}-${i}`);
-      tickets.push(buildTicket(config, seed, date, i));
-    }
-  });
-
-  return tickets;
-}
-
-/**
  * Reads real, pipeline-generated tickets from Supabase for a given day.
- * Returns null (rather than an empty array) when there's nothing real to
- * show yet, so the caller can fall back to mock data instead of rendering
- * an empty feed.
+ * Returns null (rather than an empty array) when there's nothing
+ * accessible yet for that day, so callers can distinguish "nothing here"
+ * from "haven't checked yet" and decide what to do next (e.g.
+ * fetchLatestTickets below falls back to an earlier day; fetchTickets
+ * does not).
  */
 async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
   const day = dateKey(date);
@@ -487,23 +162,19 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
       .from('tickets')
       .select(
         `id, tier, slip_label, match_count, odds_range, total_odds, is_free, release_slot, available_at,
-         ticket_matches ( sort_order, fixtures ( id, league, home_team, away_team, kickoff, market, odds, confidence, result_status, final_home_score, final_away_score ) )`
+         ticket_matches ( sort_order, fixtures ( id, league, country, home_team, away_team, kickoff, market, odds, confidence, result_status, final_home_score, final_away_score ) )`
       )
       .eq('ticket_date', day);
 
     if (result.error) {
       // eslint-disable-next-line no-console
-      console.warn('[Odd Saint] Supabase ticket query failed, using mock data:', result.error.message);
+      console.warn('[Odd Saint] Supabase ticket query failed:', result.error.message);
       return null;
     }
     data = result.data;
   } catch (err) {
-    // A thrown exception (network failure, misconfigured client, etc.) is
-    // different from a clean query error above — catch it here too so any
-    // failure mode falls back to mock data instead of leaving the ticket
-    // feed silently empty.
     // eslint-disable-next-line no-console
-    console.warn('[Odd Saint] Supabase ticket query threw, using mock data:', err);
+    console.warn('[Odd Saint] Supabase ticket query threw:', err);
     return null;
   }
 
@@ -513,9 +184,7 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
   // Supabase before it's meant to be shown — available_at is stamped as
   // generation time + AVAILABILITY_DELAY_MS by the pipeline (see
   // scripts/generate-tickets.mjs). Filter out anything not accessible yet
-  // rather than showing a batch the instant it's written. If nothing
-  // today is accessible yet, fall back to mock (same as "no real data
-  // yet") rather than showing an empty feed.
+  // rather than showing a batch the instant it's written.
   const nowMs = Date.now();
   const accessible = data.filter((row: any) => {
     if (!row.available_at) return true; // defensive: no timestamp means don't block it
@@ -535,6 +204,7 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
       return {
         id: String(f.id),
         league: f.league,
+        country: f.country,
         homeTeam: f.home_team,
         awayTeam: f.away_team,
         market: f.market,
@@ -577,20 +247,51 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
 }
 
 /**
- * Fetch all of today's tickets — real pipeline data if available, mock data
- * otherwise (e.g. before the daily generation job has run for this date).
+ * Fetch tickets for one SPECIFIC calendar day — used by the ticket
+ * archive, where browsing a past date should show exactly what was
+ * generated that day, honestly, including an empty result if nothing
+ * was. Never looks at any other day and never fabricates data.
  */
 export async function fetchTickets(date: Date = new Date()): Promise<Ticket[]> {
   try {
     const real = await fetchRealTicketsForDate(date);
-    return real ?? getTicketsForDate(date);
+    return real ?? [];
   } catch (err) {
-    // Last-resort safety net — no matter what goes wrong upstream, the
-    // ticket feed should never end up silently empty.
     // eslint-disable-next-line no-console
-    console.warn('[Odd Saint] fetchTickets failed unexpectedly, using mock data:', err);
-    return getTicketsForDate(date);
+    console.warn('[Odd Saint] fetchTickets failed unexpectedly:', err);
+    return [];
   }
+}
+
+// How many days back the live homepage feed will search for the most
+// recent generation if today's isn't accessible yet. A generous cap so a
+// multi-day outage doesn't just go blank, while still bounded so a
+// brand-new deployment with nothing ever generated doesn't loop forever.
+const LATEST_TICKETS_LOOKBACK_DAYS = 30;
+
+/**
+ * The live homepage's ticket feed: today's accessible tickets if any
+ * exist yet, otherwise the most recent earlier day's accessible tickets —
+ * "the results of the last generation." Never falls back to fabricated
+ * data; if nothing is found within the lookback window (e.g. a brand-new
+ * deployment before the pipeline has ever run), returns an empty array
+ * and the UI shows an honest "nothing yet" state.
+ */
+export async function fetchLatestTickets(): Promise<Ticket[]> {
+  const today = new Date();
+  for (let i = 0; i < LATEST_TICKETS_LOOKBACK_DAYS; i++) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    try {
+      const real = await fetchRealTicketsForDate(d);
+      if (real) return real;
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`[Odd Saint] fetchLatestTickets: query failed for ${dateKey(d)}, trying the day before:`, err);
+      // keep walking backward rather than giving up on the whole feed
+    }
+  }
+  return []; // nothing accessible within the lookback window
 }
 
 /**
@@ -615,6 +316,8 @@ export async function fetchTicketsByTier(tier: TicketTier, date: Date = new Date
 export interface AvailableFixture {
   id: number;
   league: string;
+  /** Nation/country the league is from (e.g. "England" for the Premier League). */
+  country: string;
   homeTeam: string;
   awayTeam: string;
   kickoff: string;
@@ -628,13 +331,14 @@ export async function fetchFixturesForDate(date: Date): Promise<AvailableFixture
   try {
     const { data, error } = await supabase
       .from('fixtures')
-      .select('id, league, home_team, away_team, kickoff, market, odds, confidence')
+      .select('id, league, country, home_team, away_team, kickoff, market, odds, confidence')
       .eq('ticket_date', dateKey(date))
       .order('kickoff', { ascending: true });
     if (error || !data) return [];
     return data.map((f: any) => ({
       id: f.id,
       league: f.league,
+      country: f.country,
       homeTeam: f.home_team,
       awayTeam: f.away_team,
       kickoff: f.kickoff,
@@ -843,12 +547,11 @@ export function getAnonymousTrialStart(): string {
 // ---------------------------------------------------------------------------
 // Performance history
 // ---------------------------------------------------------------------------
-// A rolling record of how many tickets ran each day and how they graded out.
-// Because ticket generation is fully deterministic by date, this "history"
-// doesn't need a database yet — every past day can be re-derived on demand
-// and will always produce the same result. Once matches are graded by a
-// real backend job, swap this to read a `daily_performance` table instead
-// of recomputing it client-side — see the file header note.
+// A rolling record of how many tickets ran each day and how they graded
+// out. NO MOCK DATA: any day without real graded results simply shows as
+// "no data" (ticketsGenerated: 0, winRatePct: null) rather than a
+// fabricated placeholder — see PerformanceHistory in src/app/page.tsx,
+// which already renders a "—" for a day with no stats.
 
 export interface TierStats {
   ticketsGenerated: number;
@@ -864,6 +567,8 @@ export interface DayPerformance {
   overall: TierStats;
   byTier: Partial<Record<TicketTier, TierStats>>;
 }
+
+const EMPTY_TIER_STATS: TierStats = { ticketsGenerated: 0, won: 0, failed: 0, pending: 0, winRatePct: null };
 
 function computeStats(statusesPerTicket: MatchStatus[][]): TierStats {
   let won = 0;
@@ -887,29 +592,11 @@ function computeStats(statusesPerTicket: MatchStatus[][]): TierStats {
   };
 }
 
-export function getDayPerformance(date: Date): DayPerformance {
-  const tickets = getTicketsForDate(date);
-  const statusesOf = (t: Ticket) => t.matches.map((m) => m.status);
-
-  const byTier: Partial<Record<TicketTier, TierStats>> = {};
-  TIER_CONFIG.forEach((config) => {
-    const tierTickets = tickets.filter((t) => t.tier === config.tier);
-    if (tierTickets.length > 0) {
-      byTier[config.tier] = computeStats(tierTickets.map(statusesOf));
-    }
-  });
-
-  return {
-    date: dateKey(date),
-    overall: computeStats(tickets.map(statusesOf)),
-    byTier,
-  };
-}
-
 /**
  * One query covering the whole window, grouped by day and by tier — real
  * graded results if present for that day, otherwise the day is simply
- * absent from the returned map (caller falls back to mock for it).
+ * absent from the returned map (caller fills the gap with EMPTY_TIER_STATS
+ * rather than mock data).
  */
 async function fetchRealHistoryRange(days: number): Promise<Map<string, DayPerformance>> {
   const map = new Map<string, DayPerformance>();
@@ -929,7 +616,7 @@ async function fetchRealHistoryRange(days: number): Promise<Map<string, DayPerfo
     data = result.data;
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.warn('[Odd Saint] Supabase history query threw, using mock data:', err);
+    console.warn('[Odd Saint] Supabase history query threw:', err);
     return map;
   }
 
@@ -967,8 +654,9 @@ async function fetchRealHistoryRange(days: number): Promise<Map<string, DayPerfo
 /**
  * Returns performance for the last `days` calendar days, most recent first
  * (today is index 0). Uses real graded results wherever the pipeline has
- * already produced them, and mock data for any day it hasn't reached yet.
- * Each day includes both the overall total and a per-tier breakdown.
+ * produced them; any day with nothing real yet shows as "no data" rather
+ * than mock. Each day includes both the overall total and a per-tier
+ * breakdown.
  */
 export async function fetchPerformanceHistory(days: number = 14): Promise<DayPerformance[]> {
   const realByDay = await fetchRealHistoryRange(days);
@@ -977,7 +665,7 @@ export async function fetchPerformanceHistory(days: number = 14): Promise<DayPer
   for (let i = 0; i < days; i++) {
     const d = new Date(today);
     d.setDate(d.getDate() - i);
-    history.push(realByDay.get(dateKey(d)) ?? getDayPerformance(d));
+    history.push(realByDay.get(dateKey(d)) ?? { date: dateKey(d), overall: EMPTY_TIER_STATS, byTier: {} });
   }
   return history;
 }
