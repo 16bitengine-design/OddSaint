@@ -14,7 +14,6 @@ import {
   fetchTeamHistory,
   webSearchUrlForTeam,
   getArchiveAccess,
-  getSaintsLockAccess,
   getNextReleaseLabel,
   fetchFixturesForDate,
   adminAddFixtureToTicket,
@@ -33,7 +32,6 @@ import {
   type TeamFormSummary,
   type ArchiveAccess,
   type TrialPolicy,
-  type SaintsLockAccess,
   type AvailableFixture,
 } from '@/lib/dataFetcher';
 import {
@@ -70,8 +68,6 @@ const COLORS = {
 const SURFACE_GRADIENT = COLORS.surface; // flat surfaces — bookmaker UIs favor clean flat cards over gradients
 const FONT_DISPLAY = 'var(--font-body), system-ui, -apple-system, sans-serif';
 const FONT_BODY = 'var(--font-body), system-ui, -apple-system, sans-serif';
-
-type UnlockMap = Record<string, boolean>; // ticketId -> unlocked via ad/purchase
 
 // ---------------------------------------------------------------------------
 // Small shared components
@@ -185,101 +181,6 @@ function AdSlot({ variant }: { variant: 'infeed' | 'anchor' }) {
       }}
     >
       Ad Slot — {isAnchor ? 'Sticky Anchor' : 'In-Feed'}
-    </div>
-  );
-}
-
-function WatchAdOverlay({ onDone, onClose }: { onDone: () => void; onClose: () => void }) {
-  const [seconds, setSeconds] = useState(5);
-
-  useEffect(() => {
-    if (seconds <= 0) {
-      onDone();
-      return;
-    }
-    const t = setTimeout(() => setSeconds((s) => s - 1), 1000);
-    return () => clearTimeout(t);
-  }, [seconds, onDone]);
-
-  return (
-    <div
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(0,0,0,0.85)',
-        zIndex: 50,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        padding: 20,
-      }}
-    >
-      <div
-        style={{
-          background: SURFACE_GRADIENT,
-          border: `1px solid ${COLORS.hairline}`,
-          borderRadius: 16,
-          padding: 26,
-          width: '100%',
-          maxWidth: 360,
-          textAlign: 'center',
-          boxShadow: '0 20px 60px -20px rgba(0,0,0,0.6)',
-        }}
-      >
-        <div
-          style={{
-            fontFamily: FONT_DISPLAY,
-            fontSize: 15,
-            fontWeight: 600,
-            color: COLORS.textPrimary,
-            marginBottom: 10,
-          }}
-        >
-          Simulated video ad
-        </div>
-        <div
-          style={{
-            height: 140,
-            borderRadius: 12,
-            background: '#0d0d0d',
-            border: `1px dashed ${COLORS.border}`,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            fontFamily: FONT_DISPLAY,
-            fontSize: 34,
-            fontWeight: 600,
-            color: COLORS.emerald,
-            marginBottom: 16,
-          }}
-        >
-          {seconds > 0 ? seconds : '✓'}
-        </div>
-        <div style={{ fontSize: 12.5, color: COLORS.textMuted, marginBottom: 18 }}>
-          {seconds > 0
-            ? `Selection unlocks in ${seconds}s...`
-            : 'Selection unlocked! You can close this now.'}
-        </div>
-        <button
-          onClick={onClose}
-          disabled={seconds > 0}
-          style={{
-            width: '100%',
-            padding: '11px 0',
-            borderRadius: 9,
-            border: 'none',
-            fontFamily: FONT_BODY,
-            fontWeight: 600,
-            fontSize: 13,
-            cursor: seconds > 0 ? 'not-allowed' : 'pointer',
-            background: seconds > 0 ? COLORS.border : `linear-gradient(135deg, ${COLORS.emerald}, #0d9668)`,
-            color: seconds > 0 ? COLORS.textMuted : '#04150f',
-            transition: 'background 0.2s ease',
-          }}
-        >
-          {seconds > 0 ? 'Please wait...' : 'Close & Reveal'}
-        </button>
-      </div>
     </div>
   );
 }
@@ -1014,44 +915,33 @@ function AdminMatchEditorModal({
 
 function TicketCard({
   ticket,
-  unlocked,
   trialActive,
   isSignedIn,
   isAdmin,
-  hasSaintsLockAccess,
-  onWatchAd,
-  onSubscribe,
-  onPayPerTicket,
+  onSignUp,
   onSelectMatch,
   onEditAsAdmin,
 }: {
   ticket: Ticket;
-  unlocked: boolean;
   trialActive: boolean;
   isSignedIn: boolean;
   isAdmin: boolean;
-  hasSaintsLockAccess: boolean;
-  onWatchAd: (ticketId: string) => void;
-  onSubscribe: () => void;
-  onPayPerTicket: (ticketId: string) => void;
+  onSignUp: () => void;
   onSelectMatch: (match: Match) => void;
   onEditAsAdmin: (ticket: Ticket) => void;
 }) {
   const [open, setOpen] = useState(false);
   const overallStatus = getTicketStatus(ticket);
   const isSaintsLock = ticket.tier === 'saints_lock';
-  // Weekly Titan is free forever once someone signs up — the signup
-  // incentive, separate from the time-limited trial.
-  const isWeeklyTitanUnlockedForever = ticket.tier === 'weekly_titan' && isSignedIn;
-  // Admins see every ticket unlocked, every tier, including Saint's Lock —
-  // "administrator can access all tickets without payment." This check
-  // comes FIRST and short-circuits everything else below it; nothing else
-  // in this function needs to special-case admin once this line is right.
-  const isLocked = isAdmin
-    ? false
-    : isSaintsLock
-    ? !hasSaintsLockAccess
-    : !ticket.isFree && !isWeeklyTitanUnlockedForever && !trialActive && !unlocked;
+  // Access model: every ticket is free once someone signs up — no paid
+  // tiers active right now (that infrastructure — PricingModal, plans.ts,
+  // the checkout routes — is kept intact for a future re-introduction,
+  // just not linked from anywhere in the current UI). Admins are always
+  // unlocked. Anonymous visitors get a time-limited trial EXCEPT for
+  // Saint's Lock, which has never had a trial and still requires signing
+  // up regardless of the trial window — that's the one exception below.
+  const isUnlocked = isAdmin || isSignedIn || ticket.isFree || (!isSaintsLock && trialActive);
+  const isLocked = !isUnlocked;
 
   const borderColor =
     overallStatus === 'green' ? COLORS.emerald : overallStatus === 'red' ? COLORS.red : COLORS.amber;
@@ -1216,67 +1106,25 @@ function TicketCard({
                   }}
                 >
                   {isSaintsLock
-                    ? isSignedIn
-                      ? "Saint's Lock requires a paid pass — no free trial applies here."
-                      : "Saint's Lock requires a free account, then a paid pass — sign in to continue."
-                    : 'Your free trial has ended. Unlock this ticket:'}
+                    ? "Saint's Lock requires a free account — no trial applies here."
+                    : 'Your free trial has ended.'}
                 </div>
-                {!isSaintsLock && (
-                  <button
-                    onClick={() => onWatchAd(ticket.id)}
-                    style={{
-                      padding: '11px 0',
-                      borderRadius: 9,
-                      border: 'none',
-                      fontFamily: FONT_BODY,
-                      fontWeight: 600,
-                      fontSize: 13,
-                      background: `linear-gradient(135deg, ${COLORS.emerald}, #0d9668)`,
-                      color: '#04150f',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    ▶ Watch Ad to Reveal Selection
-                  </button>
-                )}
-                <div style={{ display: 'flex', gap: 8 }}>
-                  {!isSaintsLock && (
-                    <button
-                      onClick={() => onPayPerTicket(ticket.id)}
-                      style={{
-                        flex: 1,
-                        padding: '9px 0',
-                        borderRadius: 8,
-                        border: `1px solid ${COLORS.hairline}`,
-                        fontFamily: FONT_BODY,
-                        fontWeight: 600,
-                        fontSize: 12,
-                        background: 'transparent',
-                        color: COLORS.textPrimary,
-                        cursor: 'pointer',
-                      }}
-                    >
-                      Pay Micro-Fee
-                    </button>
-                  )}
-                  <button
-                    onClick={onSubscribe}
-                    style={{
-                      flex: 1,
-                      padding: '9px 0',
-                      borderRadius: 8,
-                      border: `1px solid ${COLORS.hairline}`,
-                      fontFamily: FONT_BODY,
-                      fontWeight: 600,
-                      fontSize: 12,
-                      background: 'transparent',
-                      color: COLORS.textPrimary,
-                      cursor: 'pointer',
-                    }}
-                  >
-                    {isSaintsLock ? "Get Saint's Lock Pass" : 'Subscribe Monthly'}
-                  </button>
-                </div>
+                <button
+                  onClick={onSignUp}
+                  style={{
+                    padding: '11px 0',
+                    borderRadius: 9,
+                    border: 'none',
+                    fontFamily: FONT_BODY,
+                    fontWeight: 600,
+                    fontSize: 13,
+                    background: `linear-gradient(135deg, ${COLORS.emerald}, #0d9668)`,
+                    color: '#04150f',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Sign up free to unlock
+                </button>
               </div>
             </div>
           ) : (
@@ -2696,13 +2544,9 @@ function TicketArchiveModal({
               key={t.id}
               ticket={t}
               trialActive={true}
-              unlocked={true}
               isSignedIn={true}
               isAdmin={isAdmin}
-              hasSaintsLockAccess={true}
-              onWatchAd={() => {}}
-              onSubscribe={() => {}}
-              onPayPerTicket={() => {}}
+              onSignUp={() => {}}
               onSelectMatch={setArchiveSelectedMatch}
               onEditAsAdmin={onEditAsAdmin}
             />
@@ -3084,17 +2928,11 @@ function markDismissedToday(): void {
 function TrialReminderBanner({
   userEmail,
   daysLeft,
-  signedUpDaysElapsed,
-  signedUpTotalDays,
   onSignUpClick,
-  onUpgradeClick,
 }: {
   userEmail: string | null;
   daysLeft: number;
-  signedUpDaysElapsed: number;
-  signedUpTotalDays: number;
   onSignUpClick: () => void;
-  onUpgradeClick: () => void;
 }) {
   const [dismissed, setDismissed] = useState(wasDismissedToday);
   if (dismissed) return null;
@@ -3104,17 +2942,11 @@ function TrialReminderBanner({
     setDismissed(true);
   }
 
-  // Anonymous visitor, still within the trial window → nudge to sign up.
+  // Signed-up users already have permanent free access to everything, so
+  // this banner only ever nudges an anonymous visitor still within their
+  // trial window to sign up before it ends.
   const showSignUpNudge = !userEmail && daysLeft > 0;
-  // Signed-up user, past the halfway point of their window → nudge to
-  // upgrade. Scales with the actual policy rather than a hardcoded "15" —
-  // that matters once the 50k-subscriber milestone sets signedUpTotalDays
-  // to 0, where the nudge correctly starts immediately instead of a fixed
-  // day count that would never be reached.
-  const upgradeThreshold = Math.ceil(signedUpTotalDays / 2);
-  const showUpgradeNudge = !!userEmail && signedUpDaysElapsed >= upgradeThreshold && daysLeft > 0;
-
-  if (!showSignUpNudge && !showUpgradeNudge) return null;
+  if (!showSignUpNudge) return null;
 
   return (
     <div
@@ -3131,15 +2963,11 @@ function TrialReminderBanner({
       }}
     >
       <div style={{ fontSize: 11.5, color: COLORS.textPrimary, lineHeight: 1.4 }}>
-        {showSignUpNudge
-          ? signedUpTotalDays > 0
-            ? `Sign up free and get ${signedUpTotalDays} more day${signedUpTotalDays === 1 ? '' : 's'} — ${daysLeft} day${daysLeft === 1 ? '' : 's'} left on your trial.`
-            : `Sign up before your trial ends to keep access — ${daysLeft} day${daysLeft === 1 ? '' : 's'} left.`
-          : `Loving Odd Saint? Plans start at $2.49/week — ${daysLeft} free day${daysLeft === 1 ? '' : 's'} left.`}
+        {`Sign up free to keep full access after your trial ends — ${daysLeft} day${daysLeft === 1 ? '' : 's'} left.`}
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
         <button
-          onClick={showSignUpNudge ? onSignUpClick : onUpgradeClick}
+          onClick={onSignUpClick}
           style={{
             padding: '6px 12px',
             borderRadius: 7,
@@ -3153,7 +2981,7 @@ function TrialReminderBanner({
             whiteSpace: 'nowrap',
           }}
         >
-          {showSignUpNudge ? 'Sign up' : 'See plans'}
+          Sign up
         </button>
         <button
           onClick={dismiss}
@@ -3217,7 +3045,6 @@ export default function Page() {
   const [showTeamSearch, setShowTeamSearch] = useState(false);
   const [showArchive, setShowArchive] = useState(false);
   const [archiveAccess, setArchiveAccess] = useState<ArchiveAccess>({ level: 'none' });
-  const [saintsLockAccess, setSaintsLockAccess] = useState<SaintsLockAccess>({ active: false, expiresAt: null });
   const [trialPolicy, setTrialPolicy] = useState<TrialPolicy>({
     anonymousDays: ANONYMOUS_TRIAL_DAYS,
     signedUpDays: SIGNED_UP_TRIAL_DAYS,
@@ -3228,9 +3055,6 @@ export default function Page() {
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [history, setHistory] = useState<DayPerformance[]>([]);
   const [showHistory, setShowHistory] = useState(false);
-  const [unlocks, setUnlocks] = useState<UnlockMap>({});
-  const [adTicketId, setAdTicketId] = useState<string | null>(null);
-  const [adReady, setAdReady] = useState(false);
   const [loading, setLoading] = useState(true);
   const [ticketsLoading, setTicketsLoading] = useState(true);
   const [showSupport, setShowSupport] = useState(false);
@@ -3257,7 +3081,6 @@ export default function Page() {
       setRegisteredAt(user?.created_at ?? null);
       setLoading(false);
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
-      getSaintsLockAccess(user?.id ?? null).then((a) => mounted && setSaintsLockAccess(a));
     });
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
@@ -3266,7 +3089,6 @@ export default function Page() {
       setUserId(user?.id ?? null);
       setRegisteredAt(user?.created_at ?? null);
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
-      getSaintsLockAccess(user?.id ?? null).then((a) => mounted && setSaintsLockAccess(a));
     });
 
     return () => {
@@ -3302,50 +3124,25 @@ export default function Page() {
       });
   }, []);
 
-  // Signed-up users get a fresh trial window from their account creation
-  // date; anonymous visitors get one from first visit. These lengths are
-  // dynamic — see getTrialPolicy(), which tightens both once the app
-  // crosses the 50,000-active-subscriber milestone.
+  // Access model: every ticket is free once someone signs up, so the only
+  // thing this trial clock governs now is how long an ANONYMOUS visitor
+  // gets before being asked to sign up — trialPolicy.signedUpDays and the
+  // milestone-tightening it can apply to signed-up users are dormant
+  // (kept for a future paid re-introduction, see handleSubscribe below)
+  // since signing up now means permanent free access, not a countdown.
   const trialActive = useMemo(
-    () =>
-      userEmail
-        ? isWithinFreeTrial(registeredAt, trialPolicy.signedUpDays)
-        : isWithinFreeTrial(anonTrialStart, trialPolicy.anonymousDays),
-    [userEmail, registeredAt, anonTrialStart, trialPolicy]
+    () => isWithinFreeTrial(anonTrialStart, trialPolicy.anonymousDays),
+    [anonTrialStart, trialPolicy]
   );
   const daysLeft = useMemo(
-    () =>
-      userEmail
-        ? getTrialDaysRemaining(registeredAt, trialPolicy.signedUpDays)
-        : getTrialDaysRemaining(anonTrialStart, trialPolicy.anonymousDays),
-    [userEmail, registeredAt, anonTrialStart, trialPolicy]
+    () => getTrialDaysRemaining(anonTrialStart, trialPolicy.anonymousDays),
+    [anonTrialStart, trialPolicy]
   );
-  // How many days into the signed-up trial someone is — used to trigger
-  // the day-15+ upgrade-to-paid reminder.
-  const signedUpDaysElapsed = useMemo(() => {
-    if (!userEmail || !registeredAt) return 0;
-    return trialPolicy.signedUpDays - getTrialDaysRemaining(registeredAt, trialPolicy.signedUpDays);
-  }, [userEmail, registeredAt, trialPolicy]);
 
-  function handleWatchAd(ticketId: string) {
-    setAdTicketId(ticketId);
-    setAdReady(false);
-  }
-
-  function closeAdOverlay() {
-    if (adTicketId) {
-      setUnlocks((prev) => ({ ...prev, [adTicketId]: true }));
-    }
-    setAdTicketId(null);
-    setAdReady(false);
-  }
-
-  function handlePayPerTicket(ticketId: string) {
-    // Wire this up to your payment provider (Stripe, Paystack, etc.).
-    // On success, mark the ticket unlocked for this session.
-    setUnlocks((prev) => ({ ...prev, [ticketId]: true }));
-  }
-
+  // Dormant — no paid tier is currently linked from anywhere in the UI
+  // (every ticket is free after sign-up for now), but PricingModal,
+  // plans.ts, and the checkout routes are kept intact so re-introducing a
+  // paid tier later is just a matter of wiring a button back to this.
   function handleSubscribe(ticket?: Ticket) {
     setPricingProduct(ticket?.tier === 'saints_lock' ? 'saints_lock' : 'subscription');
     setShowPricing(true);
@@ -3541,21 +3338,18 @@ export default function Page() {
         >
           {isAdmin
             ? 'Admin account — every ticket, every tier, including Saint\'s Lock, is unlocked for you automatically.'
+            : userEmail
+            ? "You're signed in — every ticket, every tier, including Saint's Lock, is free for you."
             : trialActive
-            ? userEmail
-              ? `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Weekly Titan stays free forever now that you're signed in.`
-              : `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Every ticket is unlocked, no account needed.`
-            : 'Your free trial has ended. The Mega Day Ticket stays free forever — unlock premium tiers with an ad, a micro-fee, or a subscription.'}
+            ? `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Every ticket is unlocked, no account needed. Sign up anytime to keep full access for free.`
+            : 'Your free trial has ended. The Mega Day Ticket stays free forever — sign up free to unlock everything else, including Saint\'s Lock.'}
         </div>
 
         {!isAdmin && (
           <TrialReminderBanner
             userEmail={userEmail}
             daysLeft={daysLeft}
-            signedUpDaysElapsed={signedUpDaysElapsed}
-            signedUpTotalDays={trialPolicy.signedUpDays}
             onSignUpClick={() => setShowLoginModal(true)}
-            onUpgradeClick={() => handleSubscribe()}
           />
         )}
 
@@ -3594,13 +3388,9 @@ export default function Page() {
               key={item.ticket.id}
               ticket={item.ticket}
               trialActive={trialActive}
-              unlocked={!!unlocks[item.ticket.id]}
               isSignedIn={!!userEmail}
               isAdmin={isAdmin}
-              hasSaintsLockAccess={saintsLockAccess.active}
-              onWatchAd={handleWatchAd}
-              onSubscribe={() => handleSubscribe(item.ticket)}
-              onPayPerTicket={handlePayPerTicket}
+              onSignUp={() => setShowLoginModal(true)}
               onSelectMatch={setSelectedMatch}
               onEditAsAdmin={setEditingTicket}
             />
@@ -3636,11 +3426,6 @@ export default function Page() {
 
       {/* Support / feedback entry point — always available */}
       <SupportButton onClick={() => setShowSupport(true)} />
-
-      {/* Watch-ad-to-unlock overlay */}
-      {adTicketId && (
-        <WatchAdOverlay onDone={() => setAdReady(true)} onClose={closeAdOverlay} />
-      )}
 
       {/* Optional sign-in modal — never blocks browsing, only opened by choice */}
       {showLoginModal && (
