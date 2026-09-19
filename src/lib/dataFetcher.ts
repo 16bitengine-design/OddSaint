@@ -440,26 +440,39 @@ export async function getSaintsLockAccess(userId: string | null): Promise<Saints
 }
 
 /**
- * Trial length in days for anonymous (not signed in) visitors.
- * Signing up grants a separate, fresh SIGNED_UP_TRIAL_DAYS window on top —
- * up to ANONYMOUS_TRIAL_DAYS + SIGNED_UP_TRIAL_DAYS = 44 total free days if
- * someone signs up on day 1 of browsing.
+ * Trial length in days for anonymous (not signed in) visitors — the only
+ * access window left in the current model. Signing up now grants
+ * permanent free access to every ticket, every tier, including Saint's
+ * Lock (see the "Access model" note on TicketCard in src/app/page.tsx),
+ * rather than a second time-limited window — so SIGNED_UP_TRIAL_DAYS and
+ * POST_MILESTONE_SIGNED_UP_TRIAL_DAYS below are DORMANT: kept, and still
+ * returned by getTrialPolicy(), only so a future paid tier can reuse this
+ * same plumbing without rebuilding it — nothing currently reads them for
+ * gating.
  *
- * These are the DEFAULT values, used while the app is still growing. Once
- * SUBSCRIBER_MILESTONE active subscribers is reached, getTrialPolicy()
- * below switches new visitors to a tighter policy instead — see there.
+ * ANONYMOUS_TRIAL_DAYS is the DEFAULT value, used while the app is still
+ * growing. Once SUBSCRIBER_MILESTONE active subscribers is reached,
+ * getTrialPolicy() below switches new anonymous visitors to
+ * POST_MILESTONE_ANONYMOUS_TRIAL_DAYS instead — see there. The two
+ * currently happen to be equal (7), so the milestone doesn't yet change
+ * anonymous behavior; lower POST_MILESTONE_ANONYMOUS_TRIAL_DAYS if a
+ * tighter post-milestone anonymous window is wanted later.
  *
- * NOTE: Saint's Lock is explicitly excluded from ALL trial logic on this
- * page — see getSaintsLockAccess above and the frontend gating in
- * src/app/page.tsx. Nothing here ever grants Saint's Lock access via trial.
+ * NOTE: Saint's Lock is explicitly excluded from the anonymous trial
+ * specifically — see getSaintsLockAccess above and the frontend gating in
+ * src/app/page.tsx. It has never had a trial and still requires signing
+ * up regardless of where someone is in the anonymous window; once signed
+ * up, though, it's free like everything else.
  */
-export const ANONYMOUS_TRIAL_DAYS = 14;
-export const SIGNED_UP_TRIAL_DAYS = 30;
+export const ANONYMOUS_TRIAL_DAYS = 7;
+export const SIGNED_UP_TRIAL_DAYS = 30; // dormant — see note above
 
 const SUBSCRIBER_MILESTONE = 50_000;
-// After the milestone: a much shorter free look, and no signed-up bonus —
-// continued access past the 7 days requires actually subscribing rather
-// than just creating an account.
+// Dormant lever for tightening the anonymous trial further once the app
+// hits scale — currently equal to ANONYMOUS_TRIAL_DAYS, so it changes
+// nothing yet. POST_MILESTONE_SIGNED_UP_TRIAL_DAYS is dormant along with
+// SIGNED_UP_TRIAL_DAYS above (signing up is unconditional free access
+// now, not a second countdown).
 const POST_MILESTONE_ANONYMOUS_TRIAL_DAYS = 7;
 const POST_MILESTONE_SIGNED_UP_TRIAL_DAYS = 0;
 
