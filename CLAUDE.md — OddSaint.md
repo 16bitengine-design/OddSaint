@@ -119,7 +119,36 @@ Two accuracy/product-quality rules, both in `scripts/generate-tickets.mjs`.
 
 ---
 
-## NEW — 33. FIXTURE COUNTRY/NATION
+## NEW — 34. ACCESS MODEL PIVOT: FREE-AFTER-SIGNUP (Growth Phase)
+
+Strategic pivot: grow the subscriber list first, monetize later. Every ticket — including Saint's Lock — is now free for any signed-up user, permanently, with no day-count expiry. Paid subscription and Saint's Lock passes are DEPRIORITIZED, not deleted — the intent is to re-link them to real gating once the growth phase ends.
+
+**New access rules:**
+- **Anonymous visitor:** 7-day trial from first visit (`ANONYMOUS_TRIAL_DAYS`, reduced from 14), full access to everything EXCEPT Saint's Lock, which has never had a trial and still requires signing up regardless of where someone is in the 7-day window (that specific hard rule survives this pivot unchanged).
+- **Signed-up user (any account, free signup, no payment):** permanent, unconditional access to every ticket, every tier, including Saint's Lock. No expiry, no day counter, no separate paid pass needed for Saint's Lock anymore.
+- **Admin:** unchanged — always unlocked, as before.
+- **Mega Day Ticket:** unchanged — always free (`alwaysFree: true`), even for an anonymous visitor whose trial has expired and who hasn't signed up.
+
+**Unified unlock formula** (`TicketCard` in `src/app/page.tsx`):
+```ts
+const isUnlocked = isAdmin || isSignedIn || ticket.isFree || (!isSaintsLock && trialActive);
+```
+Replaces the old per-tier branching (Saint's Lock's separate `hasSaintsLockAccess` paid-pass check, Weekly Titan's special "free forever once signed in" case — now subsumed since EVERY tier behaves that way once signed in).
+
+**Removed from the unlock path (not the codebase — see "kept dormant" below):**
+- The "Watch Ad to Reveal Selection" flow (`WatchAdOverlay` component, `handleWatchAd`/`closeAdOverlay`, the `unlocks` session-map state) — deleted entirely. Ad-watching and pay-per-ticket bypassing the paywall undercut the actual goal (growing the signed-up list), so they're gone, not just hidden.
+- "Pay Micro-Fee" button and `handlePayPerTicket` — deleted entirely, same reasoning.
+- Saint's Lock's separate `getSaintsLockAccess()` fetch and `saintsLockAccess` state in `page.tsx` — removed (the paid-pass concept it tracked no longer gates anything); `getSaintsLockAccess()` itself still exists in `src/lib/dataFetcher.ts`, just unused for now.
+- `TrialReminderBanner`'s upgrade-to-paid nudge variant (`onUpgradeClick`, `signedUpDaysElapsed`, `signedUpTotalDays` props) — removed; the banner now only ever nudges an anonymous visitor to sign up before their 7 days end, since a signed-up user has nothing to upgrade to right now.
+
+**Kept dormant, on purpose, for the future paid re-introduction:**
+- `PricingModal`, `showPricing`/`pricingProduct` state, and `handleSubscribe()` in `page.tsx` — fully intact, just not currently linked from any button (no current UI opens it).
+- `src/lib/plans.ts`, the checkout API routes, `src/lib/pawapay.ts`, `src/lib/pesapal.ts`, `src/lib/grantAccess.ts`, and the `subscribers`/`saints_lock_access`/`pending_transactions` tables — all untouched. Re-introducing a paid tier later is a matter of wiring a button back to `handleSubscribe()`, not rebuilding payment infrastructure.
+- `SIGNED_UP_TRIAL_DAYS`, `POST_MILESTONE_SIGNED_UP_TRIAL_DAYS`, and the `SUBSCRIBER_MILESTONE` tightening mechanism in `dataFetcher.ts` — still exported/computed by `getTrialPolicy()`, just not read for gating by anything right now.
+
+**Known side effect, not addressed here:** the ticket **archive** (`getArchiveAccess()`, gated on the `subscribers` table for non-admins) was left untouched. Since nothing currently grants real `subscribers` rows (payment is dormant, and admin-granting via `AdminGrantAccessModal` still works but is a manual action), archive access will in practice be admin-only going forward unless an admin manually grants someone a `subscribers` row. This wasn't part of what was asked ("access to all tickets," not archive browsing) — flagging it in case it should also open up to any signed-up user later.
+
+---
 
 Every match now carries which nation/country its league belongs to, not just the league name (e.g. "Premier League (England)" instead of just "Premier League") — shown on the ticket's match rows, the match-analysis modal, and the admin match editor's "available fixtures" picker.
 
