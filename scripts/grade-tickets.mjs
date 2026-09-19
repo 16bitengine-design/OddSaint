@@ -5,15 +5,8 @@
 // — see scripts/lib/apiFootball.mjs), and settles them 'green' or 'red'
 // based on whether the picked market actually hit. Runs a few times a day
 // via .github/workflows/grade-tickets.yml.
-//
-// Calls detectApiPlan() once at startup, same as generate-tickets.mjs, so
-// this job's own request throttling reflects the account's real detected
-// plan rather than always assuming Free — see scripts/lib/apiFootball.mjs
-// for what that changes. MAX_FIXTURES_PER_RUN below is a modest per-run
-// cap unrelated to the Free/Pro distinction (it's about spacing grading
-// checks sensibly, not about API request budget), so it's left as-is.
 // ---------------------------------------------------------------------------
-import { getFixturesByIds, detectApiPlan } from './lib/apiFootball.mjs';
+import { getFixturesByIds } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { settleMarket } from './lib/markets.mjs';
 
@@ -29,8 +22,6 @@ const MAX_FIXTURES_PER_RUN = 40;
 const FINISHED_STATUSES = new Set(['FT', 'AET', 'PEN']); // API-Football short status codes
 
 async function main() {
-  await detectApiPlan(); // logs detected plan; scripts/lib/apiFootball.mjs throttles accordingly
-
   const supabase = getSupabaseAdmin();
 
   const cutoff = new Date(Date.now() - MIN_HOURS_SINCE_KICKOFF * 60 * 60 * 1000).toISOString();
