@@ -3,13 +3,13 @@
 //
 // This script is allowed to change a small, explicit set of numeric
 // parameters automatically — but ONLY in the "safer" direction (raising a
-// confidence floor, tightening an odds ceiling), and only within
-// hardcoded bounds, with a cooldown between changes and a minimum sample
-// size before it will act. It NEVER loosens a threshold automatically —
-// that always requires a human to review scripts/propose-improvements.mjs's
-// output and decide. This mirrors the existing project principle: only
-// raise MIN_CONFIDENCE or tighten selection logic to genuinely improve
-// quality, backed by real data — never falsify grading, never guess.
+// confidence floor), and only within hardcoded bounds, with a cooldown
+// between changes and a minimum sample size before it will act. It NEVER
+// loosens a threshold automatically — that always requires a human to
+// review scripts/propose-improvements.mjs's output and decide. This
+// mirrors the existing project principle: only raise MIN_CONFIDENCE or
+// tighten selection logic to genuinely improve quality, backed by real
+// data — never falsify grading, never guess.
 //
 // What this touches: the `tuning_state` table only (see migration
 // supabase/migrations/004_self_improvement.sql). It never edits any .mjs
@@ -17,6 +17,18 @@
 // that needs `contents: write` permission. Every change is logged to
 // `tuning_log` with the evidence that justified it, and reversible at any
 // time via Supabase's Table Editor.
+//
+// CHANGE LOG: the `small_ticket_max_odds` parameter (and its evaluator,
+// evaluateSmallTicketMaxOdds) was RETIRED from auto-tuning. It was built
+// against the old single shared SMALL_TICKET_TIERS/SMALL_TICKET_MAX_ODDS
+// ceiling in generate-tickets.mjs (one ceiling for mega/bronze/silver).
+// That concept no longer exists there — it's been replaced by five
+// independent per-tier LEG_ODDS_BAND ranges, so a single tunable
+// small_ticket_max_odds value has no tier left to apply to. The
+// `tuning_state.small_ticket_max_odds` column still exists in Supabase
+// but is no longer read or written here — left in place rather than
+// dropped, since removing a column is a separate, deliberate schema
+// decision (see CLAUDE.md section 14/30: never casually drop columns).
 //
 // Run on a schedule via .github/workflows/self-tune.yml (weekly, after
 // grade-tickets.mjs has had a week to settle new results) or manually.
@@ -57,15 +69,6 @@ const TUNING_BOUNDS = {
     max: 82,
     cooldownDays: 7,
     minSampleSize: 40,
-    improvementMargin: 3,
-  },
-  small_ticket_max_odds: {
-    step: 0.05,
-    safeDirection: 'down', // safer = tighter = lower max odds for small tiers
-    min: 1.4,
-    max: 2.0,
-    cooldownDays: 14,
-    minSampleSize: 30,
     improvementMargin: 3,
   },
   saints_lock_min_confidence: {
@@ -196,47 +199,6 @@ function evaluateMinConfidence(fixtures, state) {
 }
 
 /**
- * SMALL_TICKET_MAX_ODDS: only ever lowered (tightened). Compares win rate
- * of legs priced just under the current cap vs. legs priced in the band
- * that a lower cap would exclude. This approximates "small ticket" legs
- * using the same odds ceiling the real pipeline applies (see poolForTier
- * in generate-tickets.mjs), since fixtures rows don't carry a tier label
- * directly.
- */
-function evaluateSmallTicketMaxOdds(fixtures, state) {
-  const bounds = TUNING_BOUNDS.small_ticket_max_odds;
-  const current = state.small_ticket_max_odds;
-  if (current <= bounds.min) return null;
-
-  const candidate = Math.max(bounds.min, Math.round((current - bounds.step) * 100) / 100);
-
-  const underCandidate = fixtures.filter((f) => f.odds <= candidate);
-  const betweenCandidateAndCurrent = fixtures.filter((f) => f.odds > candidate && f.odds <= current);
-
-  const winRateKept = pct(underCandidate.filter((f) => f.result_status === 'green').length, underCandidate.length);
-  const winRateExcluded = pct(
-    betweenCandidateAndCurrent.filter((f) => f.result_status === 'green').length,
-    betweenCandidateAndCurrent.length
-  );
-
-  if (winRateKept === null || winRateExcluded === null) return null;
-  if (underCandidate.length < bounds.minSampleSize) return null;
-  if (winRateKept - winRateExcluded < bounds.improvementMargin) return null;
-
-  return {
-    parameter: 'small_ticket_max_odds',
-    oldValue: current,
-    newValue: candidate,
-    winRateBefore: winRateExcluded,
-    sampleSize: underCandidate.length,
-    reason:
-      `Tightened from ${current} to ${candidate} — legs at/under ${candidate} won ${winRateKept}% ` +
-      `(n=${underCandidate.length}) vs ${winRateExcluded}% for legs between ${candidate} and ${current}, ` +
-      `over the last ${LOOKBACK_DAYS} days.`,
-  };
-}
-
-/**
  * SAINTS_LOCK_MIN_CONFIDENCE: only ever raised, same logic as
  * min_confidence but scoped to the Saint's Lock odds band (1.5-2.0) since
  * that's the only band it ever draws from.
@@ -284,7 +246,6 @@ async function main() {
 
   const evaluators = [
     { parameter: 'min_confidence', evaluate: evaluateMinConfidence },
-    { parameter: 'small_ticket_max_odds', evaluate: evaluateSmallTicketMaxOdds },
     { parameter: 'saints_lock_min_confidence', evaluate: evaluateSaintsLockMinConfidence },
   ];
 
