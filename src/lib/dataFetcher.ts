@@ -12,6 +12,13 @@
 // fabricates placeholder tickets. fetchTickets(date) is for browsing one
 // SPECIFIC date (the ticket archive) and never looks at any other day —
 // an empty result there means honestly "nothing was generated that day."
+//
+// CHANGE LOG (this batch): TIER_CONFIG's matchCount and oddsRange for
+// mega/bronze/silver/gold/weekly_lite/weekly_titan/weekender updated to
+// mirror scripts/generate-tickets.mjs's TIER_CONFIG exactly, per the
+// tier-count-sync rule (CLAUDE.md section 7) — see that file's own
+// change-log comment for the full rationale (7-category portfolio
+// framework mapping). platinum/diamond/saints_lock are unchanged.
 // ---------------------------------------------------------------------------
 import { supabase } from './supabaseClient';
 
@@ -71,25 +78,26 @@ export interface TierConfig {
   alwaysFree: boolean;
 }
 
-// Tier definitions per the product spec.
+// Tier definitions per the product spec. MUST stay in sync with
+// TIER_CONFIG in scripts/generate-tickets.mjs — the two representations
+// drifted out of sync once before (see the historical project note this
+// file used to carry about 10/15/20/30 vs 9/14/19/29); keep them
+// identical whenever either changes.
 //
-// Platinum/Diamond/Weekly Lite/Weekly Titan match counts are each ONE
-// FEWER than their "standard" size (10/15/20/30) — a deliberate reduction
-// to raise real-world win probability by cutting one compounding leg of
-// bookmaker margin per ticket. MUST stay in sync with TIER_CONFIG in
-// scripts/generate-tickets.mjs — the two representations had drifted out
-// of sync before this fix (dataFetcher.ts still showed the old 10/15/20/30
-// figures while the real pipeline had already moved to 9/14/19/29).
+// Current leg counts (mega → weekender), per the 7-category portfolio
+// framework mapping applied this batch:
+//   mega 3, bronze 4, silver 8, gold 12, weekly_lite 16, weekly_titan 19,
+//   weekender 22. platinum/diamond/saints_lock unchanged.
 export const TIER_CONFIG: TierConfig[] = [
-  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
-  { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
-  { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
-  { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
+  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 3, oddsRange: '2-2.5', alwaysFree: true },
+  { tier: 'bronze', label: 'Bronze', matchCount: 4, oddsRange: '4-6', alwaysFree: false },
+  { tier: 'silver', label: 'Silver', matchCount: 8, oddsRange: '15-30', alwaysFree: false },
+  { tier: 'gold', label: 'Gold', matchCount: 12, oddsRange: '100-300', alwaysFree: false },
   { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
   { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
-  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
-  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
-  { tier: 'weekender', label: 'Weekender', matchCount: 35, oddsRange: 'Mixed', alwaysFree: false },
+  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 16, oddsRange: '300-800', alwaysFree: false },
+  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 19, oddsRange: '1000-3000', alwaysFree: false },
+  { tier: 'weekender', label: 'Weekender', matchCount: 22, oddsRange: '10000+', alwaysFree: false },
   { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2', alwaysFree: false },
 ];
 
