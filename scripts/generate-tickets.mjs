@@ -16,6 +16,32 @@
 // confidence figure — real odds reflect real market consensus — but it's
 // intentionally simple. Tune the SELECTION STRATEGY section below as your
 // picks strategy matures.
+//
+// CHANGE LOG (this batch — see CLAUDE.md — OddSaint Self-Improvement.md
+// and the project's own conversation history for full rationale):
+//   1. pickMarketFromOdds() now selects the HIGHEST-odds outcome on a
+//      fixture that still clears MIN_CONFIDENCE, not the lowest-odds
+//      ("safest") one. Goal: hit each tier's cumulative odds target in as
+//      FEW legs as possible, per pickFixturesForSlip's own "fewest legs"
+//      design intent. The old RESULT_BASED_MARKETS/WIN_MARKET_MIN_ODDS
+//      guard existed only to steer away from an overly tight Double
+//      Chance price under the old "pick smallest odds" rule — it's
+//      removed as dead code under the new rule (an overly tight price
+//      simply won't be the highest-odds qualifying outcome anymore).
+//   2. TIER_CONFIG leg counts and TIER_ODDS_TARGET reworked across
+//      mega → weekender per the 7-category portfolio framework mapping
+//      (see 16BITENGINE strategy doc). weekly_lite/weekly_titan/weekender
+//      now have real odds targets instead of "Mixed"/no target.
+//   3. New LEG_ODDS_BAND — a per-tier average-leg-odds band — replaces
+//      the old single shared SMALL_TICKET_TIERS/SMALL_TICKET_MAX_ODDS
+//      ceiling. poolForTier now filters by this band per tier.
+//   4. MAX_FIXTURE_APPEARANCES_PER_DAY lowered from 3 to 1 — "zero
+//      cross-contamination": a fixture used in one tier's ticket can no
+//      longer appear in any other tier's ticket the same day.
+//   5. Fixture eligibility now requires a resolvable league.country —
+//      "a match must come from a known country" — instead of silently
+//      defaulting unknown countries to the string 'Unknown' and still
+//      including them.
 // ---------------------------------------------------------------------------
 import { getFixturesForDate, getOddsForFixture } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
@@ -144,26 +170,33 @@ function isBigClash(homeTeam, awayTeam) {
   return BIG_CLUBS.has(homeTeam) && BIG_CLUBS.has(awayTeam);
 }
 
+// ---------------------------------------------------------------------------
+// TIER_CONFIG — leg-count ceilings per tier. Reworked this batch to map
+// the 7-category portfolio framework onto Odd Saint's real tier names, in
+// product order: Mega Day Ticket, Bronze, Silver, Gold, Weekly Lite,
+// Weekly Titan, Weekender. matchCount is the CEILING pickFixturesForSlip
+// aims to reach the target odds within, not a fixed requirement — see
+// that function's own doc comment.
+//
+// Platinum and Diamond are left unchanged from their pre-existing values;
+// they were not part of the 7-category mapping this batch worked from —
+// flagged for a follow-up decision on whether to fold them in or retire
+// them, not silently guessed here.
+// ---------------------------------------------------------------------------
 const TIER_CONFIG = [
-  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
-  { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
-  { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
-  { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
-  // Platinum/Diamond/Weekly Lite/Weekly Titan match counts are each ONE
-  // FEWER than the "standard" tier size (10/15/20/30) — a deliberate
-  // reduction to raise real-world win probability by cutting one
-  // compounding leg of bookmaker margin per ticket. Must stay in sync with
-  // TIER_CONFIG in src/lib/dataFetcher.ts.
+  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 3, oddsRange: '2-2.5', alwaysFree: true },
+  { tier: 'bronze', label: 'Bronze', matchCount: 4, oddsRange: '4-6', alwaysFree: false },
+  { tier: 'silver', label: 'Silver', matchCount: 8, oddsRange: '15-30', alwaysFree: false },
+  { tier: 'gold', label: 'Gold', matchCount: 12, oddsRange: '100-300', alwaysFree: false },
   { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
   { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
-  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
-  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
-  // Spans BOTH Saturday and Sunday. Built from its own dedicated pool (see
-  // upcomingWeekendDates() and its use in main()) rather than the daily or
-  // weekly pools. 35 legs needs a deep fixture pool — that's the main
-  // reason MAX_ODDS_LOOKUPS_PER_RUN was raised after moving to the
-  // API-Football Pro plan.
-  { tier: 'weekender', label: 'Weekender', matchCount: 35, oddsRange: 'Mixed', alwaysFree: false },
+  // Weekly Lite/Titan/Weekender now have real leg ceilings and real odds
+  // targets (see TIER_ODDS_TARGET below) instead of an unbounded "Mixed"
+  // ticket that just took the safest available legs up to the old,
+  // larger ceiling.
+  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 16, oddsRange: '300-800', alwaysFree: false },
+  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 19, oddsRange: '1000-3000', alwaysFree: false },
+  { tier: 'weekender', label: 'Weekender', matchCount: 22, oddsRange: '10000+', alwaysFree: false },
   // Single-match, ultra-high-confidence category. Only ever one match —
   // the single most confident pick available that day, and only ever
   // included if it clears SAINTS_LOCK_MIN_CONFIDENCE (see below), well
@@ -173,18 +206,19 @@ const TIER_CONFIG = [
 ];
 
 // Numeric cumulative-odds targets matching each tier's oddsRange label
-// above. These are ACTUALLY ENFORCED during slip assembly (see
-// pickFixturesForSlip) — previously oddsRange was just a display string
-// with nothing checking whether a ticket's real combined odds landed
-// inside it. Weekly Lite/Titan/Weekender are intentionally left unset
-// ("Mixed" by design, no fixed target).
+// above. ACTUALLY ENFORCED during slip assembly (see pickFixturesForSlip).
+// Every generic tier now has a real target — weekly_lite/weekly_titan/
+// weekender are no longer "Mixed"/untargeted.
 const TIER_ODDS_TARGET = {
-  mega: [1.5, 3],
-  bronze: [2, 3],
-  silver: [3, 5],
-  gold: [5, 10],
+  mega: [2, 2.5],
+  bronze: [4, 6],
+  silver: [15, 30],
+  gold: [100, 300],
   platinum: [25, 300],
   diamond: [300, Infinity],
+  weekly_lite: [300, 800],
+  weekly_titan: [1000, 3000],
+  weekender: [10000, Infinity],
   saints_lock: [1.5, 2],
 };
 
@@ -363,6 +397,13 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
     const eligible = fixtures.filter(
       (f) =>
         LEAGUE_ALLOWLIST.has(f.league?.id) &&
+        // "A match must come from a known country" — drop fixtures whose
+        // league carries no resolvable country rather than silently
+        // defaulting to 'Unknown' and still including them (that
+        // fallback still happens further below purely for the DISPLAY
+        // value on fixtures that pass this filter with a real country —
+        // this check is the actual eligibility gate).
+        !!f.league?.country &&
         // Defense-in-depth: excludes youth/reserve/third-division-or-lower
         // competitions by name pattern even if leagues.json (built by
         // resolve-leagues.mjs, which applies the same filter) is stale or
@@ -477,32 +518,33 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
 // force in a pick the market itself doesn't consider a clear favorite.
 const MIN_CONFIDENCE = 68;
 
-// Result-based markets to steer away from when priced this short — an
-// extremely tight price on any of these can still be upset (a draw, a cup
-// shock, a keeper's bad day). Double Chance is the only one of these that
-// actually reaches odds this low (as tight as 1.1) — Home Win / Away Win
-// can NEVER trigger this guard, since their own odds band in
-// MARKET_CATALOG (markets.mjs) starts at 1.3: an outright win pick is
-// never substituted away for being "too safe." This guard exists purely
-// to catch an overly tight Double Chance price, not to steer away from
-// full wins — see FULL_WIN_MARKETS / ensureFullWinLeg below for the
-// separate "always incorporate a full win where necessary" logic.
-const RESULT_BASED_MARKETS = new Set([
-  'Home Win', 'Away Win', 'Double Chance 1X', 'Double Chance X2', 'Double Chance 12',
-]);
-const WIN_MARKET_MIN_ODDS = 1.3;
-
 /**
  * SELECTION STRATEGY (odds → market pick):
+ *
  * Checks every market in the shared catalog (Match Winner, Goals
  * Over/Under, Both Teams Score, Double Chance) against this fixture's
- * bookmaker odds, and takes the SAFEST viable outcome — i.e. whichever
- * has the lowest odds / highest implied confidence — rather than picking
- * randomly among them. If that safest outcome is a result-based market
- * (see RESULT_BASED_MARKETS) priced below WIN_MARKET_MIN_ODDS, an Over
- * Goals market is substituted instead when one's available. Skips the
- * fixture entirely if nothing clears MIN_CONFIDENCE, rather than forcing a
- * low-quality pick just to fill a ticket.
+ * bookmaker odds, and takes the HIGHEST-odds outcome that still clears
+ * MIN_CONFIDENCE — not the lowest-odds/"safest" one.
+ *
+ * Rationale: the product goal is to hit each tier's cumulative odds
+ * target using as FEW legs as possible (see pickFixturesForSlip's own
+ * doc comment). A Double Chance price (1X/X2/12) covers two of three
+ * possible results, so it's almost always priced lower than an outright
+ * Home/Away Win on the same fixture — under a "lowest odds first" rule,
+ * Double Chance gets picked on nearly every fixture, which then needs
+ * MORE legs to reach any given cumulative target. Picking the highest
+ * qualifying odds instead means outright Win markets (and other
+ * higher-priced-but-still-confident outcomes) get chosen naturally,
+ * without needing to special-case any one market type.
+ *
+ * The old RESULT_BASED_MARKETS/WIN_MARKET_MIN_ODDS guard (which used to
+ * substitute away an overly tight Double Chance price for a Goals
+ * market) is removed as dead code under this rule: an overly tight price
+ * will essentially never be the HIGHEST qualifying outcome on a fixture,
+ * so the situation that guard existed for no longer arises in practice.
+ *
+ * Skips the fixture entirely if nothing clears MIN_CONFIDENCE, rather
+ * than forcing a low-quality pick just to fill a ticket.
  */
 function pickMarketFromOdds(oddsResponse) {
   const bookmaker = oddsResponse?.[0]?.bookmakers?.[0];
@@ -511,29 +553,12 @@ function pickMarketFromOdds(oddsResponse) {
   const viable = collectViableOutcomes(bookmaker.bets);
   if (viable.length === 0) return null;
 
-  const sorted = [...viable].sort((a, b) => a.odds - b.odds);
-  let chosen = sorted[0]; // lowest odds = safest, by default
+  const qualifying = viable.filter((o) => impliedConfidence(o.odds) >= MIN_CONFIDENCE);
+  if (qualifying.length === 0) return null; // nothing on this fixture clears the floor
 
-  const isResultMarket = RESULT_BASED_MARKETS.has(chosen.market);
-  if (isResultMarket && chosen.odds < WIN_MARKET_MIN_ODDS) {
-    const goalsAlt = sorted.find((o) => o.market === 'Over 1.5 Goals' || o.market === 'Over 2.5 Goals');
-    if (goalsAlt) {
-      chosen = goalsAlt;
-    } else {
-      // No Goals-market alternative for this fixture — fall back to the
-      // next-safest non-result-based option if one exists (e.g. BTTS),
-      // rather than the too-short result-based price.
-      const nonResult = sorted.find((o) => !RESULT_BASED_MARKETS.has(o.market));
-      if (nonResult) chosen = nonResult;
-      // If truly nothing else is viable, the short price is accepted
-      // rather than dropping the fixture entirely.
-    }
-  }
+  const chosen = [...qualifying].sort((a, b) => b.odds - a.odds)[0]; // highest odds that still qualifies
 
-  const confidence = impliedConfidence(chosen.odds);
-  if (confidence < MIN_CONFIDENCE) return null; // too uncertain even at its safest — skip this fixture
-
-  return { market: chosen.market, odds: chosen.odds, confidence };
+  return { market: chosen.market, odds: chosen.odds, confidence: impliedConfidence(chosen.odds) };
 }
 
 function impliedConfidence(odds) {
@@ -543,23 +568,40 @@ function impliedConfidence(odds) {
 
 // --- Assemble tickets from the priced-fixture pool ---------------------------
 
-// Tiers with fewer than 7 matches favor safer, more heavily-favored picks:
-// their fixture pool is restricted to legs priced at 1.77 or below rather
-// than the full odds range used for Gold and up.
-const SMALL_TICKET_TIERS = new Set(['mega', 'bronze', 'silver']); // matchCount < 7
-const SMALL_TICKET_MAX_ODDS = 1.77;
+// Per-tier average-leg-odds band — replaces the old single shared
+// SMALL_TICKET_TIERS/SMALL_TICKET_MAX_ODDS ceiling (which only applied to
+// mega/bronze/silver, capped at 1.77). Every generic tier now has its own
+// explicit band, mapped from the 7-category portfolio framework. Tiers
+// with no band defined here (platinum, diamond, saints_lock) are left
+// unfiltered by poolForTier, same as tiers outside SMALL_TICKET_TIERS were
+// before this change.
+const LEG_ODDS_BAND = {
+  mega: [1.25, 1.35],
+  bronze: [1.40, 1.65],
+  silver: [1.70, 2.00],
+  gold: [1.80, 2.10],
+  weekly_lite: [1.90, 2.20],
+  weekly_titan: [1.80, 2.00],
+  weekender: [1.80, 2.10],
+};
 
-/** Narrows the pool to safer, lower-odds picks for tiers under 7 matches. */
+/** Narrows the pool to the tier's own average-leg-odds band, where one is defined. */
 function poolForTier(pool, tier) {
-  if (!SMALL_TICKET_TIERS.has(tier)) return pool;
-  return pool.filter((p) => p.odds <= SMALL_TICKET_MAX_ODDS);
+  const band = LEG_ODDS_BAND[tier];
+  if (!band) return pool;
+  return pool.filter((p) => p.odds >= band[0] && p.odds <= band[1]);
 }
 
 // No single match can appear in more than this many of the day's tickets,
-// across every tier combined. Without this cap, a small fixture pool can
-// end up reused in nearly every ticket — meaning one unexpected result
-// takes down the whole day's slate at once instead of just a few tickets.
-const MAX_FIXTURE_APPEARANCES_PER_DAY = 3;
+// across every tier combined. "Zero cross-contamination": a fixture used
+// in one tier's ticket must never appear in another tier's ticket the
+// same day, so that if that one fixture fails, it ruins only the single
+// ticket it's on — not multiple tickets across the portfolio at once.
+// Lowered from 3 to 1 this batch; the previous value of 3 deliberately
+// allowed reuse so a thin fixture pool wouldn't starve every tier — that
+// tradeoff is now made the other way on purpose. Expect more skipped
+// slips on days with a thin fixture pool as a direct consequence.
+const MAX_FIXTURE_APPEARANCES_PER_DAY = 1;
 
 function computeTotalOdds(picks) {
   return Math.round(picks.reduce((acc, p) => acc * p.odds, 1) * 100) / 100;
@@ -594,8 +636,8 @@ function ensureFullWinLeg(picks, pool, usageCount, targetRange) {
   const candidate = candidates[0];
 
   if (!targetRange) {
-    // No odds band to protect (Weekly Lite/Titan/Weekender) — swap out
-    // the current highest-odds leg for the full-win candidate.
+    // No odds band to protect — swap out the current highest-odds leg for
+    // the full-win candidate.
     const highestIdx = picks.reduce((hi, p, i) => (p.odds > picks[hi].odds ? i : hi), 0);
     const next = [...picks];
     next[highestIdx] = candidate;
@@ -639,8 +681,8 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
   });
 
   if (!targetRange) {
-    // No target range to hit (Weekly Lite/Titan/Weekender, "Mixed") —
-    // just take the safest available up to the max, as before.
+    // No target range to hit — just take the safest available up to the
+    // max, as before.
     if (ranked.length < maxMatchCount) return [];
     return ensureFullWinLeg(ranked.slice(0, maxMatchCount), pool, usageCount, null);
   }
