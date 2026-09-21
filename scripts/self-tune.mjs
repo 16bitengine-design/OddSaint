@@ -71,11 +71,17 @@ const TUNING_BOUNDS = {
     minSampleSize: 40,
     improvementMargin: 3,
   },
+  // min/max corrected this batch — see generate-tickets.mjs's
+  // SAINTS_LOCK_MIN_CONFIDENCE comment for the bug this fixes. The old
+  // 80-92 bounds were mathematically unreachable within Saint's Lock's
+  // own TIER_ODDS_TARGET ([1.5, 2.0]), which tops out around 67% implied
+  // confidence — this evaluator could never have found evidence to act
+  // on. 55-67 matches what's actually achievable in that odds band.
   saints_lock_min_confidence: {
     step: 1,
     safeDirection: 'up',
-    min: 80,
-    max: 92,
+    min: 55,
+    max: 67,
     cooldownDays: 14,
     minSampleSize: 10,
     improvementMargin: 2,

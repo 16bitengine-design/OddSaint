@@ -513,10 +513,82 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
   });
 }
 
-// A fixture is skipped entirely if nothing viable clears this confidence
-// floor — better to generate one fewer match, or even skip a slip, than to
-// force in a pick the market itself doesn't consider a clear favorite.
-const MIN_CONFIDENCE = 68;
+// Per-tier average-leg-odds band — replaces the old single shared
+// SMALL_TICKET_TIERS/SMALL_TICKET_MAX_ODDS ceiling (which only applied to
+// mega/bronze/silver, capped at 1.77). Every generic tier now has its own
+// explicit band, mapped from the 7-category portfolio framework. Tiers
+// with no band defined here (platinum, diamond) are handled separately —
+// see minConfidenceForUnbandedTiers and poolForTier below. Defined here,
+// BEFORE MIN_CONFIDENCE, because MIN_CONFIDENCE is now derived from it —
+// see the note on MIN_CONFIDENCE for why.
+const LEG_ODDS_BAND = {
+  mega: [1.25, 1.35],
+  bronze: [1.40, 1.65],
+  silver: [1.70, 2.00],
+  gold: [1.80, 2.10],
+  weekly_lite: [1.90, 2.20],
+  weekly_titan: [1.80, 2.00],
+  weekender: [1.80, 2.10],
+};
+
+// The loosest (highest) average-leg-odds any currently configured
+// LEG_ODDS_BAND permits — computed, not hand-picked, so it can never
+// silently drift out of sync with LEG_ODDS_BAND as bands change.
+const HIGHEST_PERMITTED_LEG_ODDS = Math.max(...Object.values(LEG_ODDS_BAND).map(([, max]) => max));
+
+/** Unclipped implied confidence — used ONLY for the pricing-time admission decision below. Never stored/displayed (see impliedConfidence for that). */
+function rawConfidence(odds) {
+  return 100 / odds;
+}
+
+function impliedConfidence(odds) {
+  const raw = Math.round(rawConfidence(odds));
+  return Math.min(95, Math.max(55, raw)); // clipped to a sane display range — storage/display value only
+}
+
+// ---------------------------------------------------------------------------
+// MIN_CONFIDENCE — CRITICAL FIX (this batch)
+//
+// This used to be a single hand-picked value (68), compared against the
+// CLIPPED display confidence (impliedConfidence). That comparison is
+// equivalent to a hard odds ceiling of ~1.47 (100/68), because
+// impliedConfidence(odds) >= 68 can only be true below that price. Once
+// LEG_ODDS_BAND was introduced with bands reaching up to 2.20, this
+// silently emptied the shared fixture pool for EVERY tier whose band
+// exceeds ~1.47 — silver through weekender, and the upper half of
+// bronze's own band. Verified directly: every one of those tiers would
+// skip its slip on every single run, not occasionally on a thin day.
+//
+// Fixed two ways together:
+//   1. This floor is now DERIVED from HIGHEST_PERMITTED_LEG_ODDS (the
+//      loosest odds any configured tier actually needs), not a hand-
+//      picked number that can silently fall out of sync with the bands.
+//   2. The comparison uses RAW (unclipped) confidence, not the clipped
+//      display value — clipping bottoms out at 55 regardless of how high
+//      the odds actually are, which would otherwise make any threshold
+//      <=55 a complete no-op (unable to reject anything) and any
+//      threshold >55 block odds it shouldn't.
+//
+// LEG_ODDS_BAND is now the real per-tier quality/eligibility gate for
+// every tier it covers. This constant is left as only a coarse "is this
+// outcome remotely sane" admission floor at pricing time, PLUS the real
+// tunable quality gate for platinum/diamond, which have no
+// LEG_ODDS_BAND — see minConfidenceForUnbandedTiers below.
+// ---------------------------------------------------------------------------
+const MIN_CONFIDENCE = 100 / HIGHEST_PERMITTED_LEG_ODDS; // ≈45.45 given the bands above — RAW, not clipped
+
+// Real per-leg quality floor for tiers with NO LEG_ODDS_BAND (platinum,
+// diamond) — these still need a genuine confidence gate the way every
+// tier did before LEG_ODDS_BAND existed; without this they'd inherit the
+// much looser MIN_CONFIDENCE above and admit far riskier legs than they
+// did before this batch. Compared against the CLIPPED, stored confidence
+// value (matching what self-tune.mjs's evidence-gathering already
+// reasons about historically in the `fixtures` table) — 68 is the same
+// value MIN_CONFIDENCE held before this fix, so platinum/diamond's
+// behavior is unchanged by this batch. `let`, not `const`: overwritten in
+// main() from tuning_state.min_confidence when available — see
+// fetchTuningState().
+let minConfidenceForUnbandedTiers = 68;
 
 /**
  * SELECTION STRATEGY (odds → market pick):
@@ -524,7 +596,8 @@ const MIN_CONFIDENCE = 68;
  * Checks every market in the shared catalog (Match Winner, Goals
  * Over/Under, Both Teams Score, Double Chance) against this fixture's
  * bookmaker odds, and takes the HIGHEST-odds outcome that still clears
- * MIN_CONFIDENCE — not the lowest-odds/"safest" one.
+ * MIN_CONFIDENCE (the loose, band-derived admission floor above) — not
+ * the lowest-odds/"safest" one.
  *
  * Rationale: the product goal is to hit each tier's cumulative odds
  * target using as FEW legs as possible (see pickFixturesForSlip's own
@@ -539,12 +612,13 @@ const MIN_CONFIDENCE = 68;
  *
  * The old RESULT_BASED_MARKETS/WIN_MARKET_MIN_ODDS guard (which used to
  * substitute away an overly tight Double Chance price for a Goals
- * market) is removed as dead code under this rule: an overly tight price
- * will essentially never be the HIGHEST qualifying outcome on a fixture,
- * so the situation that guard existed for no longer arises in practice.
+ * market) remains removed as dead code under this rule.
  *
  * Skips the fixture entirely if nothing clears MIN_CONFIDENCE, rather
- * than forcing a low-quality pick just to fill a ticket.
+ * than forcing a low-quality pick just to fill a ticket. The STORED
+ * confidence (fixtures.confidence, and what tier-specific quality gates
+ * downstream compare against) is still the clipped display value —
+ * only the admission decision itself now uses the raw one.
  */
 function pickMarketFromOdds(oddsResponse) {
   const bookmaker = oddsResponse?.[0]?.bookmakers?.[0];
@@ -553,7 +627,7 @@ function pickMarketFromOdds(oddsResponse) {
   const viable = collectViableOutcomes(bookmaker.bets);
   if (viable.length === 0) return null;
 
-  const qualifying = viable.filter((o) => impliedConfidence(o.odds) >= MIN_CONFIDENCE);
+  const qualifying = viable.filter((o) => rawConfidence(o.odds) >= MIN_CONFIDENCE);
   if (qualifying.length === 0) return null; // nothing on this fixture clears the floor
 
   const chosen = [...qualifying].sort((a, b) => b.odds - a.odds)[0]; // highest odds that still qualifies
@@ -561,35 +635,13 @@ function pickMarketFromOdds(oddsResponse) {
   return { market: chosen.market, odds: chosen.odds, confidence: impliedConfidence(chosen.odds) };
 }
 
-function impliedConfidence(odds) {
-  const raw = Math.round((1 / odds) * 100);
-  return Math.min(95, Math.max(55, raw)); // clipped to a sane display range
-}
-
 // --- Assemble tickets from the priced-fixture pool ---------------------------
 
-// Per-tier average-leg-odds band — replaces the old single shared
-// SMALL_TICKET_TIERS/SMALL_TICKET_MAX_ODDS ceiling (which only applied to
-// mega/bronze/silver, capped at 1.77). Every generic tier now has its own
-// explicit band, mapped from the 7-category portfolio framework. Tiers
-// with no band defined here (platinum, diamond, saints_lock) are left
-// unfiltered by poolForTier, same as tiers outside SMALL_TICKET_TIERS were
-// before this change.
-const LEG_ODDS_BAND = {
-  mega: [1.25, 1.35],
-  bronze: [1.40, 1.65],
-  silver: [1.70, 2.00],
-  gold: [1.80, 2.10],
-  weekly_lite: [1.90, 2.20],
-  weekly_titan: [1.80, 2.00],
-  weekender: [1.80, 2.10],
-};
-
-/** Narrows the pool to the tier's own average-leg-odds band, where one is defined. */
+/** Narrows the pool to the tier's own average-leg-odds band, or — for tiers with no band (platinum, diamond) — to the real tunable confidence floor. */
 function poolForTier(pool, tier) {
   const band = LEG_ODDS_BAND[tier];
-  if (!band) return pool;
-  return pool.filter((p) => p.odds >= band[0] && p.odds <= band[1]);
+  if (band) return pool.filter((p) => p.odds >= band[0] && p.odds <= band[1]);
+  return pool.filter((p) => p.confidence >= minConfidenceForUnbandedTiers);
 }
 
 // No single match can appear in more than this many of the day's tickets,
@@ -750,13 +802,30 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
   return ensureFullWinLeg(picks, pool, usageCount, targetRange);
 }
 
-// Saint's Lock demands a far higher confidence bar than any other tier —
-// "next to impossible to get wrong" framing means this should almost never
-// miss. Well above the standard MIN_CONFIDENCE floor (68) used everywhere
-// else. If fewer than 2 fixtures clear this bar on a given day, fewer than
-// 2 Saint's Lock tickets get produced — quality over quantity applies here
-// most strictly of all.
-const SAINTS_LOCK_MIN_CONFIDENCE = 85;
+// ---------------------------------------------------------------------------
+// SAINTS_LOCK_MIN_CONFIDENCE — bug fix (this batch, surfaced while fixing
+// MIN_CONFIDENCE above; PRE-EXISTING, not introduced by tonight's other
+// changes).
+//
+// Saint's Lock demands a higher confidence bar than any other tier, but
+// it must be REACHABLE within its own TIER_ODDS_TARGET.saints_lock range
+// ([1.5, 2.0]) — impliedConfidence() in that range tops out at ~67 (odds
+// = 1.5) and bottoms at 55, clipped (odds = 2.0). The previous value of
+// 85 was simply unreachable anywhere within the [1.5, 2.0] band Saint's
+// Lock actually draws from. Verified directly: the
+// `qualifying` filter in buildSaintsLockTickets below could never match
+// anything, so the "minimum 1/day fallback" branch (originally meant for
+// rare bad days) was running on literally every generation — Saint's
+// Lock's stated 85% bar was never actually being enforced.
+//
+// Lowered to a value genuinely achievable at the safer end of the band
+// while still meaningfully excluding its riskier half — a judgment call,
+// not a derived constant like MIN_CONFIDENCE above (there's no single
+// "correct" value here, only a range that's at least reachable: ~55–67).
+// Tunable via tuning_state.saints_lock_min_confidence — see
+// fetchTuningState() in main(); self-tune.mjs's own bounds for this
+// parameter were widened to match (55–67, were 80–92 — also unreachable).
+let SAINTS_LOCK_MIN_CONFIDENCE = 62; // was 85
 
 /**
  * Dedicated selection for Saint's Lock — unlike every other tier (which
@@ -912,6 +981,51 @@ function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, now) {
   return { tickets, ticketMatches, fixturesUsed: Array.from(fixturesUsed.values()) };
 }
 
+/**
+ * Reads the live auto-tuned parameter values written by
+ * scripts/self-tune.mjs (supabase/migrations/004_self_improvement.sql's
+ * tuning_state table). Falls back to this file's own hardcoded defaults
+ * on any read failure — a Supabase hiccup, or the migration not yet
+ * applied, must never block a whole generation run.
+ *
+ * min_confidence is applied ONLY to platinum/diamond (see
+ * minConfidenceForUnbandedTiers / poolForTier) — deliberately NOT used to
+ * override MIN_CONFIDENCE, the shared pricing-time admission floor
+ * derived from HIGHEST_PERMITTED_LEG_ODDS. self-tune.mjs only ever RAISES
+ * min_confidence (never lowers it); if that tuned value fed the shared
+ * floor instead, self-tune.mjs would eventually re-narrow it far enough
+ * to reintroduce the exact silver-through-weekender blocking bug this
+ * batch just fixed — autonomously, weeks from now, with no code change
+ * to point to. Scoping it to the two unbanded tiers avoids that risk
+ * entirely while still letting Layer 2 auto-tuning do something real.
+ *
+ * KNOWN LIMITATION, not fixed in this pass: self-tune.mjs's own evidence-
+ * gathering (fetchGradedFixtures) reasons about ALL graded fixtures
+ * across every tier, not just platinum/diamond's — so the win-rate
+ * evidence behind a tuned min_confidence value no longer purely reflects
+ * the population it now governs. Narrowing that query to only
+ * platinum/diamond fixtures would need a tier join (fixtures has no tier
+ * column directly; it'd go through ticket_matches/tickets) — real
+ * additional work, flagged rather than done here.
+ */
+async function fetchTuningState(supabase) {
+  try {
+    const { data, error } = await supabase
+      .from('tuning_state')
+      .select('min_confidence, saints_lock_min_confidence')
+      .eq('id', 1)
+      .maybeSingle();
+    if (error || !data) {
+      console.warn('Could not read tuning_state — using this file\'s hardcoded defaults for this run.');
+      return null;
+    }
+    return data;
+  } catch (err) {
+    console.warn('tuning_state read threw — using this file\'s hardcoded defaults for this run:', err.message);
+    return null;
+  }
+}
+
 // --- Main ---------------------------------------------------------------------
 
 async function main() {
@@ -926,6 +1040,16 @@ async function main() {
   }
 
   const supabase = getSupabaseAdmin();
+
+  const tuning = await fetchTuningState(supabase);
+  if (tuning?.min_confidence != null) {
+    minConfidenceForUnbandedTiers = tuning.min_confidence;
+    console.log(`Using tuned min_confidence for platinum/diamond: ${minConfidenceForUnbandedTiers}`);
+  }
+  if (tuning?.saints_lock_min_confidence != null) {
+    SAINTS_LOCK_MIN_CONFIDENCE = tuning.saints_lock_min_confidence;
+    console.log(`Using tuned saints_lock_min_confidence: ${SAINTS_LOCK_MIN_CONFIDENCE}`);
+  }
 
   console.log('Checking today\'s existing slips (staggered-release state)...');
   const slipState = await fetchTodaysSlipState(supabase, todayStr);
