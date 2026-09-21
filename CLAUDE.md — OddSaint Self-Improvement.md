@@ -60,6 +60,103 @@ New migration: `supabase/migrations/005_multibookmaker_consensus.sql`.
 
 ---
 
+## CRITICAL FIX — MIN_CONFIDENCE vs. LEG_ODDS_BAND (was silently blocking Silver through Weekender on every run)
+
+**Discovered post-deployment, from the workflow error while diagnosing an
+unrelated migration gap.** Verified numerically before fixing — see the
+table below.
+
+The original `MIN_CONFIDENCE = 68` was compared against the CLIPPED
+display confidence (`impliedConfidence`, floors at 55 regardless of odds).
+That comparison is mathematically equivalent to a hard odds ceiling of
+~1.47 (`100/68`). Once `LEG_ODDS_BAND` was introduced (bands reaching up
+to 2.20 for weekly_lite), this silently emptied the shared fixture pool
+for every tier whose band exceeds that ceiling:
+
+| Tier | Band | Clipped confidence range | Cleared old MIN_CONFIDENCE=68? |
+|---|---|---|---|
+| mega | 1.25–1.35 | 74–80 | Yes |
+| bronze | 1.40–1.65 | 61–71 | **Only the 1.40–1.47 sliver** |
+| silver | 1.70–2.00 | 55–59 | **No — never** |
+| gold | 1.80–2.10 | 55–56 | **No — never** |
+| weekly_lite | 1.90–2.20 | 55–55 | **No — never** |
+| weekly_titan | 1.80–2.00 | 55–56 | **No — never** |
+| weekender | 1.80–2.10 | 55–56 | **No — never** |
+
+Five of seven mapped tiers would skip their slip on **every single run**,
+not occasionally on a thin-fixture day — this was a structural wall, not
+a probabilistic risk, and would have shown up in the very first
+`workflow_dispatch` test.
+
+**Fix, implemented in `scripts/generate-tickets.mjs`:**
+
+1. `LEG_ODDS_BAND` moved earlier in the file so `MIN_CONFIDENCE` can be
+   derived from it: `MIN_CONFIDENCE = 100 / HIGHEST_PERMITTED_LEG_ODDS`
+   (`HIGHEST_PERMITTED_LEG_ODDS` = the max upper bound across every
+   configured band — currently 2.20, from weekly_lite). Self-documenting
+   and can't silently drift out of sync with the bands as they change.
+2. New `rawConfidence(odds) = 100 / odds` (unclipped) is what
+   `pickMarketFromOdds`'s admission filter now compares against, instead
+   of the clipped `impliedConfidence`. Clipping bottoms out at 55
+   regardless of actual odds, which would otherwise make any threshold
+   ≤55 a total no-op — unable to reject anything — while any threshold
+   above 55 blocks odds it shouldn't. The STORED/displayed
+   `fixtures.confidence` value is still the clipped one; only the
+   admission decision changed.
+3. `LEG_ODDS_BAND` is now the real per-tier quality/eligibility gate for
+   the seven tiers it covers. `MIN_CONFIDENCE` is left as only a coarse
+   sanity floor at pricing time.
+4. **Platinum and diamond** (no `LEG_ODDS_BAND` entry) get a separate,
+   real confidence gate: new `minConfidenceForUnbandedTiers` (default 68
+   — the same value `MIN_CONFIDENCE` held before this fix, so these two
+   tiers' behavior is unchanged), applied in `poolForTier` against the
+   clipped stored value. This is what `tuning_state.min_confidence` now
+   feeds (see Layer 2 below) — deliberately scoped to just these two
+   tiers rather than the shared admission floor (see that section for
+   why).
+
+Verified end-to-end after the fix: all seven bands are now admitted at
+pricing time (simulated directly, not assumed).
+
+---
+
+## PRE-EXISTING BUG, ALSO FIXED — Saint's Lock's 85% floor was unreachable in its own odds band
+
+**Not introduced by any change in this conversation — surfaced while
+verifying the fix above, because it's the same category of bug.** Worth
+fixing in the same pass rather than leaving it, since it's a real,
+currently-live defect.
+
+`SAINTS_LOCK_MIN_CONFIDENCE = 85` was compared against
+`p.confidence` (clipped) inside `buildSaintsLockTickets`'s `qualifying`
+filter — but Saint's Lock's own `TIER_ODDS_TARGET.saints_lock` band is
+`[1.5, 2.0]`, where clipped confidence only ever ranges 55–67 (odds=1.5 →
+67; odds=2.0 → 55, clipped) — 85% is simply unreachable anywhere within
+that band. **The `qualifying` filter could never match anything, so
+`buildSaintsLockTickets` was running on its "minimum 1/day fallback"
+branch (originally written for rare bad days) on every single
+generation.** The product's stated 85%-confidence positioning for Saint's
+Lock was never actually being enforced.
+
+**Fix:** lowered `SAINTS_LOCK_MIN_CONFIDENCE` to `62` — reachable at the
+safer end of the `[1.5, 2.0]` band while still meaningfully excluding its
+riskier half. This is a judgment call (there's no single mathematically
+"correct" value, only a reachable range of roughly 55–67), not a derived
+constant like `MIN_CONFIDENCE` above — open to adjustment.
+
+Also corrected `self-tune.mjs`'s `TUNING_BOUNDS.saints_lock_min_confidence`
+from `{min: 80, max: 92}` (also unreachable — same root cause) to
+`{min: 55, max: 67}`, and:
+
+- `supabase/migrations/004_self_improvement.sql`'s seed default: 85 → 62.
+- New `supabase/migrations/004b_fix_saints_lock_seed.sql` — a corrective
+  `UPDATE` for any database that already applied the migration with the
+  old seed (the original migration's `INSERT ... ON CONFLICT DO NOTHING`
+  won't retroactively fix an existing row). Run this once if you already
+  ran `004_self_improvement.sql` before this fix.
+
+---
+
 ## UPDATED — MARKET SELECTION STRATEGY (Highest Qualifying Odds, Not Lowest)
 
 `pickMarketFromOdds()` in `scripts/generate-tickets.mjs` no longer selects
