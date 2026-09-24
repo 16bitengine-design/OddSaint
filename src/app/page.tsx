@@ -3054,6 +3054,8 @@ export default function Page() {
   const [pricingProduct, setPricingProduct] = useState<'subscription' | 'saints_lock'>('subscription');
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [history, setHistory] = useState<DayPerformance[]>([]);
+  // Collapsed by default — expands when the user taps "View performance
+  // history →" in Hero (onViewHistory toggles this).
   const [showHistory, setShowHistory] = useState(false);
   const [loading, setLoading] = useState(true);
   const [ticketsLoading, setTicketsLoading] = useState(true);
