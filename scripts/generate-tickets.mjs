@@ -17,36 +17,23 @@
 // intentionally simple. Tune the SELECTION STRATEGY section below as your
 // picks strategy matures.
 //
-// CHANGE LOG (this batch — see CLAUDE.md — OddSaint Self-Improvement.md
-// and the project's own conversation history for full rationale):
-//   1. pickMarketFromOdds() now selects the HIGHEST-odds outcome on a
-//      fixture that still clears MIN_CONFIDENCE, not the lowest-odds
-//      ("safest") one. Goal: hit each tier's cumulative odds target in as
-//      FEW legs as possible, per pickFixturesForSlip's own "fewest legs"
-//      design intent. The old RESULT_BASED_MARKETS/WIN_MARKET_MIN_ODDS
-//      guard existed only to steer away from an overly tight Double
-//      Chance price under the old "pick smallest odds" rule — it's
-//      removed as dead code under the new rule (an overly tight price
-//      simply won't be the highest-odds qualifying outcome anymore).
-//   2. TIER_CONFIG leg counts and TIER_ODDS_TARGET reworked across
-//      mega → weekender per the 7-category portfolio framework mapping
-//      (see 16BITENGINE strategy doc). weekly_lite/weekly_titan/weekender
-//      now have real odds targets instead of "Mixed"/no target.
-//   3. New LEG_ODDS_BAND — a per-tier average-leg-odds band — replaces
-//      the old single shared SMALL_TICKET_TIERS/SMALL_TICKET_MAX_ODDS
-//      ceiling. poolForTier now filters by this band per tier.
-//   4. MAX_FIXTURE_APPEARANCES_PER_DAY lowered from 3 to 1 — "zero
-//      cross-contamination": a fixture used in one tier's ticket can no
-//      longer appear in any other tier's ticket the same day.
-//   5. Fixture eligibility now requires a resolvable league.country —
-//      "a match must come from a known country" — instead of silently
-//      defaulting unknown countries to the string 'Unknown' and still
-//      including them.
+// SELF-TUNING WIRING (added in this batch): min_confidence and
+// saints_lock_min_confidence are now read from Supabase's `tuning_state`
+// table at the start of every run (see fetchTuningState below), rather than
+// only ever using the hardcoded MIN_CONFIDENCE / SAINTS_LOCK_MIN_CONFIDENCE
+// constants. Those constants are KEPT and now serve as the fallback used if
+// the tuning_state read fails for any reason (missing row, migration not
+// yet applied, transient Supabase error) — generation must never crash or
+// silently use an undefined threshold just because self-tune.mjs's table
+// couldn't be read. scripts/self-tune.mjs is what actually writes
+// tuning_state (weekly, evidence-gated, safe-direction-only); this file
+// only reads it.
 // ---------------------------------------------------------------------------
 import { getFixturesForDate, getOddsForFixture } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { collectViableOutcomes, FULL_WIN_MARKETS } from './lib/markets.mjs';
 import { isAmateurOrYouthLeague } from './lib/leagueQuality.mjs';
+import { getModelCrossCheck } from './lib/modelCrossCheck.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -170,33 +157,26 @@ function isBigClash(homeTeam, awayTeam) {
   return BIG_CLUBS.has(homeTeam) && BIG_CLUBS.has(awayTeam);
 }
 
-// ---------------------------------------------------------------------------
-// TIER_CONFIG — leg-count ceilings per tier. Reworked this batch to map
-// the 7-category portfolio framework onto Odd Saint's real tier names, in
-// product order: Mega Day Ticket, Bronze, Silver, Gold, Weekly Lite,
-// Weekly Titan, Weekender. matchCount is the CEILING pickFixturesForSlip
-// aims to reach the target odds within, not a fixed requirement — see
-// that function's own doc comment.
-//
-// Platinum and Diamond are left unchanged from their pre-existing values;
-// they were not part of the 7-category mapping this batch worked from —
-// flagged for a follow-up decision on whether to fold them in or retire
-// them, not silently guessed here.
-// ---------------------------------------------------------------------------
 const TIER_CONFIG = [
-  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 3, oddsRange: '2-2.5', alwaysFree: true },
-  { tier: 'bronze', label: 'Bronze', matchCount: 4, oddsRange: '4-6', alwaysFree: false },
-  { tier: 'silver', label: 'Silver', matchCount: 8, oddsRange: '15-30', alwaysFree: false },
-  { tier: 'gold', label: 'Gold', matchCount: 12, oddsRange: '100-300', alwaysFree: false },
+  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
+  { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
+  { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
+  { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
+  // Platinum/Diamond/Weekly Lite/Weekly Titan match counts are each ONE
+  // FEWER than the "standard" tier size (10/15/20/30) — a deliberate
+  // reduction to raise real-world win probability by cutting one
+  // compounding leg of bookmaker margin per ticket. Must stay in sync with
+  // TIER_CONFIG in src/lib/dataFetcher.ts.
   { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
   { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
-  // Weekly Lite/Titan/Weekender now have real leg ceilings and real odds
-  // targets (see TIER_ODDS_TARGET below) instead of an unbounded "Mixed"
-  // ticket that just took the safest available legs up to the old,
-  // larger ceiling.
-  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 16, oddsRange: '300-800', alwaysFree: false },
-  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 19, oddsRange: '1000-3000', alwaysFree: false },
-  { tier: 'weekender', label: 'Weekender', matchCount: 22, oddsRange: '10000+', alwaysFree: false },
+  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
+  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
+  // Spans BOTH Saturday and Sunday. Built from its own dedicated pool (see
+  // upcomingWeekendDates() and its use in main()) rather than the daily or
+  // weekly pools. 35 legs needs a deep fixture pool — that's the main
+  // reason MAX_ODDS_LOOKUPS_PER_RUN was raised after moving to the
+  // API-Football Pro plan.
+  { tier: 'weekender', label: 'Weekender', matchCount: 35, oddsRange: 'Mixed', alwaysFree: false },
   // Single-match, ultra-high-confidence category. Only ever one match —
   // the single most confident pick available that day, and only ever
   // included if it clears SAINTS_LOCK_MIN_CONFIDENCE (see below), well
@@ -206,19 +186,18 @@ const TIER_CONFIG = [
 ];
 
 // Numeric cumulative-odds targets matching each tier's oddsRange label
-// above. ACTUALLY ENFORCED during slip assembly (see pickFixturesForSlip).
-// Every generic tier now has a real target — weekly_lite/weekly_titan/
-// weekender are no longer "Mixed"/untargeted.
+// above. These are ACTUALLY ENFORCED during slip assembly (see
+// pickFixturesForSlip) — previously oddsRange was just a display string
+// with nothing checking whether a ticket's real combined odds landed
+// inside it. Weekly Lite/Titan/Weekender are intentionally left unset
+// ("Mixed" by design, no fixed target).
 const TIER_ODDS_TARGET = {
-  mega: [2, 2.5],
-  bronze: [4, 6],
-  silver: [15, 30],
-  gold: [100, 300],
+  mega: [1.5, 3],
+  bronze: [2, 3],
+  silver: [3, 5],
+  gold: [5, 10],
   platinum: [25, 300],
   diamond: [300, Infinity],
-  weekly_lite: [300, 800],
-  weekly_titan: [1000, 3000],
-  weekender: [10000, Infinity],
   saints_lock: [1.5, 2],
 };
 
@@ -322,6 +301,34 @@ function nextSlotFor(maxSlipsToday, slipState) {
   return state.count; // e.g. 1 for the 2nd slip of the day
 }
 
+// --- Self-tuning: read min_confidence / saints_lock_min_confidence from ------
+// --- Supabase's tuning_state table (written weekly by scripts/self-tune.mjs) -
+
+/**
+ * Reads the live auto-tuned parameter values from `tuning_state` (see
+ * supabase/migrations/004_self_improvement.sql). Falls back to the
+ * hardcoded MIN_CONFIDENCE / SAINTS_LOCK_MIN_CONFIDENCE constants below on
+ * ANY failure — missing row, migration not yet applied, transient Supabase
+ * error — so a self-tune/Supabase hiccup can never block or corrupt a real
+ * generation run. This is the piece that was previously missing: without
+ * it, self-tune.mjs's weekly writes to tuning_state had no effect on
+ * anything real, since nothing ever read them back.
+ */
+async function fetchTuningState(supabase) {
+  try {
+    const { data, error } = await supabase.from('tuning_state').select('*').eq('id', 1).single();
+    if (error || !data) throw error ?? new Error('tuning_state has no row with id=1');
+    return {
+      minConfidence: data.min_confidence,
+      saintsLockMinConfidence: data.saints_lock_min_confidence,
+    };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('Could not read tuning_state, falling back to hardcoded defaults:', err.message);
+    return { minConfidence: MIN_CONFIDENCE, saintsLockMinConfidence: SAINTS_LOCK_MIN_CONFIDENCE };
+  }
+}
+
 // --- Fetch + price fixtures ---------------------------------------------------
 
 // Empty by default — add exact team names here (matching API-Football's
@@ -360,6 +367,17 @@ function hasMinimumLeadTime(kickoffISO, now) {
  * call — every fixture in one run is judged against the same moment,
  * rather than drifting as the run progresses.
  *
+ * `{ supabase, minConfidence }` (added in this batch):
+ *   - `supabase` is needed here (not just in main()) so each priced
+ *     fixture can be cross-checked against the own Poisson model via
+ *     scripts/lib/modelCrossCheck.mjs immediately after a market is picked
+ *     — cross-check data is attached to the SAME priced-fixture object
+ *     that eventually becomes a `fixtures` row, rather than looked up
+ *     again later.
+ *   - `minConfidence` is the tuning_state-derived (or fallback) value from
+ *     fetchTuningState(), threaded into pickMarketFromOdds() instead of
+ *     that function closing over the module-level MIN_CONFIDENCE constant.
+ *
  * FLEXIBLE LEAGUE ROTATION (this is the fix for "glued to particular
  * leagues"): fixtures are grouped by league, then priced in a round-robin
  * rotation — named priority leagues go first each round, but only
@@ -377,7 +395,7 @@ function hasMinimumLeadTime(kickoffISO, now) {
  * not just the named priority set — "priority" now only breaks ties once
  * fixtures are being assembled into tickets (see the final sort below).
  */
-async function fetchPricedFixtures(dates, maxOddsLookups, now) {
+async function fetchPricedFixtures(dates, maxOddsLookups, now, { supabase, minConfidence }) {
   const seen = new Map(); // fixtureId -> priced fixture
   let oddsLookupsUsed = 0;
   const leagueBreakdown = new Map(); // league name -> count actually priced (for the run summary log)
@@ -397,13 +415,6 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
     const eligible = fixtures.filter(
       (f) =>
         LEAGUE_ALLOWLIST.has(f.league?.id) &&
-        // "A match must come from a known country" — drop fixtures whose
-        // league carries no resolvable country rather than silently
-        // defaulting to 'Unknown' and still including them (that
-        // fallback still happens further below purely for the DISPLAY
-        // value on fixtures that pass this filter with a real country —
-        // this check is the actual eligibility gate).
-        !!f.league?.country &&
         // Defense-in-depth: excludes youth/reserve/third-division-or-lower
         // competitions by name pattern even if leagues.json (built by
         // resolve-leagues.mjs, which applies the same filter) is stale or
@@ -470,8 +481,21 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
             continue;
           }
 
-          const picked = pickMarketFromOdds(oddsResponse);
+          const picked = pickMarketFromOdds(oddsResponse, minConfidence);
           if (!picked) continue; // no usable market for this fixture — skip it
+
+          // Model cross-check (Layer 1 of the self-improvement system) —
+          // CROSS-CHECK ONLY, never influences the pick above. Fails safe
+          // internally (see modelCrossCheck.mjs), so this can never throw
+          // or block generation even if teamModel.mjs / Supabase hiccups.
+          const crossCheck = await getModelCrossCheck(supabase, {
+            league: f.league?.name ?? 'Unknown League',
+            homeTeamId: f.teams?.home?.id ?? null,
+            awayTeamId: f.teams?.away?.id ?? null,
+            homeTeamName: f.teams?.home?.name ?? 'Home',
+            awayTeamName: f.teams?.away?.name ?? 'Away',
+            marketLabel: picked.market,
+          });
 
           seen.set(fixtureId, {
             fixtureId,
@@ -484,6 +508,8 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
             market: picked.market,
             odds: picked.odds,
             confidence: picked.confidence,
+            modelProbability: crossCheck.probability,
+            modelAvailable: crossCheck.available,
           });
           leagueBreakdown.set(leagueName, (leagueBreakdown.get(leagueName) ?? 0) + 1);
         }
@@ -513,147 +539,100 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
   });
 }
 
-// Per-tier average-leg-odds band — replaces the old single shared
-// SMALL_TICKET_TIERS/SMALL_TICKET_MAX_ODDS ceiling (which only applied to
-// mega/bronze/silver, capped at 1.77). Every generic tier now has its own
-// explicit band, mapped from the 7-category portfolio framework. Tiers
-// with no band defined here (platinum, diamond) are handled separately —
-// see minConfidenceForUnbandedTiers and poolForTier below. Defined here,
-// BEFORE MIN_CONFIDENCE, because MIN_CONFIDENCE is now derived from it —
-// see the note on MIN_CONFIDENCE for why.
-const LEG_ODDS_BAND = {
-  mega: [1.25, 1.35],
-  bronze: [1.40, 1.65],
-  silver: [1.70, 2.00],
-  gold: [1.80, 2.10],
-  weekly_lite: [1.90, 2.20],
-  weekly_titan: [1.80, 2.00],
-  weekender: [1.80, 2.10],
-};
+// Fallback used only if tuning_state can't be read (see fetchTuningState) —
+// a fixture is skipped entirely if nothing viable clears this confidence
+// floor — better to generate one fewer match, or even skip a slip, than to
+// force in a pick the market itself doesn't consider a clear favorite.
+const MIN_CONFIDENCE = 68;
 
-// The loosest (highest) average-leg-odds any currently configured
-// LEG_ODDS_BAND permits — computed, not hand-picked, so it can never
-// silently drift out of sync with LEG_ODDS_BAND as bands change.
-const HIGHEST_PERMITTED_LEG_ODDS = Math.max(...Object.values(LEG_ODDS_BAND).map(([, max]) => max));
-
-/** Unclipped implied confidence — used ONLY for the pricing-time admission decision below. Never stored/displayed (see impliedConfidence for that). */
-function rawConfidence(odds) {
-  return 100 / odds;
-}
-
-function impliedConfidence(odds) {
-  const raw = Math.round(rawConfidence(odds));
-  return Math.min(95, Math.max(55, raw)); // clipped to a sane display range — storage/display value only
-}
-
-// ---------------------------------------------------------------------------
-// MIN_CONFIDENCE — CRITICAL FIX (this batch)
-//
-// This used to be a single hand-picked value (68), compared against the
-// CLIPPED display confidence (impliedConfidence). That comparison is
-// equivalent to a hard odds ceiling of ~1.47 (100/68), because
-// impliedConfidence(odds) >= 68 can only be true below that price. Once
-// LEG_ODDS_BAND was introduced with bands reaching up to 2.20, this
-// silently emptied the shared fixture pool for EVERY tier whose band
-// exceeds ~1.47 — silver through weekender, and the upper half of
-// bronze's own band. Verified directly: every one of those tiers would
-// skip its slip on every single run, not occasionally on a thin day.
-//
-// Fixed two ways together:
-//   1. This floor is now DERIVED from HIGHEST_PERMITTED_LEG_ODDS (the
-//      loosest odds any configured tier actually needs), not a hand-
-//      picked number that can silently fall out of sync with the bands.
-//   2. The comparison uses RAW (unclipped) confidence, not the clipped
-//      display value — clipping bottoms out at 55 regardless of how high
-//      the odds actually are, which would otherwise make any threshold
-//      <=55 a complete no-op (unable to reject anything) and any
-//      threshold >55 block odds it shouldn't.
-//
-// LEG_ODDS_BAND is now the real per-tier quality/eligibility gate for
-// every tier it covers. This constant is left as only a coarse "is this
-// outcome remotely sane" admission floor at pricing time, PLUS the real
-// tunable quality gate for platinum/diamond, which have no
-// LEG_ODDS_BAND — see minConfidenceForUnbandedTiers below.
-// ---------------------------------------------------------------------------
-const MIN_CONFIDENCE = 100 / HIGHEST_PERMITTED_LEG_ODDS; // ≈45.45 given the bands above — RAW, not clipped
-
-// Real per-leg quality floor for tiers with NO LEG_ODDS_BAND (platinum,
-// diamond) — these still need a genuine confidence gate the way every
-// tier did before LEG_ODDS_BAND existed; without this they'd inherit the
-// much looser MIN_CONFIDENCE above and admit far riskier legs than they
-// did before this batch. Compared against the CLIPPED, stored confidence
-// value (matching what self-tune.mjs's evidence-gathering already
-// reasons about historically in the `fixtures` table) — 68 is the same
-// value MIN_CONFIDENCE held before this fix, so platinum/diamond's
-// behavior is unchanged by this batch. `let`, not `const`: overwritten in
-// main() from tuning_state.min_confidence when available — see
-// fetchTuningState().
-let minConfidenceForUnbandedTiers = 68;
+// Result-based markets to steer away from when priced this short — an
+// extremely tight price on any of these can still be upset (a draw, a cup
+// shock, a keeper's bad day). Double Chance is the only one of these that
+// actually reaches odds this low (as tight as 1.1) — Home Win / Away Win
+// can NEVER trigger this guard, since their own odds band in
+// MARKET_CATALOG (markets.mjs) starts at 1.3: an outright win pick is
+// never substituted away for being "too safe." This guard exists purely
+// to catch an overly tight Double Chance price, not to steer away from
+// full wins — see FULL_WIN_MARKETS / ensureFullWinLeg below for the
+// separate "always incorporate a full win where necessary" logic.
+const RESULT_BASED_MARKETS = new Set([
+  'Home Win', 'Away Win', 'Double Chance 1X', 'Double Chance X2', 'Double Chance 12',
+]);
+const WIN_MARKET_MIN_ODDS = 1.3;
 
 /**
  * SELECTION STRATEGY (odds → market pick):
- *
  * Checks every market in the shared catalog (Match Winner, Goals
  * Over/Under, Both Teams Score, Double Chance) against this fixture's
- * bookmaker odds, and takes the HIGHEST-odds outcome that still clears
- * MIN_CONFIDENCE (the loose, band-derived admission floor above) — not
- * the lowest-odds/"safest" one.
+ * bookmaker odds, and takes the SAFEST viable outcome — i.e. whichever
+ * has the lowest odds / highest implied confidence — rather than picking
+ * randomly among them. If that safest outcome is a result-based market
+ * (see RESULT_BASED_MARKETS) priced below WIN_MARKET_MIN_ODDS, an Over
+ * Goals market is substituted instead when one's available. Skips the
+ * fixture entirely if nothing clears `minConfidence`, rather than forcing
+ * a low-quality pick just to fill a ticket.
  *
- * Rationale: the product goal is to hit each tier's cumulative odds
- * target using as FEW legs as possible (see pickFixturesForSlip's own
- * doc comment). A Double Chance price (1X/X2/12) covers two of three
- * possible results, so it's almost always priced lower than an outright
- * Home/Away Win on the same fixture — under a "lowest odds first" rule,
- * Double Chance gets picked on nearly every fixture, which then needs
- * MORE legs to reach any given cumulative target. Picking the highest
- * qualifying odds instead means outright Win markets (and other
- * higher-priced-but-still-confident outcomes) get chosen naturally,
- * without needing to special-case any one market type.
- *
- * The old RESULT_BASED_MARKETS/WIN_MARKET_MIN_ODDS guard (which used to
- * substitute away an overly tight Double Chance price for a Goals
- * market) remains removed as dead code under this rule.
- *
- * Skips the fixture entirely if nothing clears MIN_CONFIDENCE, rather
- * than forcing a low-quality pick just to fill a ticket. The STORED
- * confidence (fixtures.confidence, and what tier-specific quality gates
- * downstream compare against) is still the clipped display value —
- * only the admission decision itself now uses the raw one.
+ * `minConfidence` is passed in by the caller (fetchPricedFixtures), sourced
+ * from tuning_state via fetchTuningState() — this function no longer closes
+ * over the module-level MIN_CONFIDENCE constant directly, so self-tune.mjs's
+ * weekly adjustments actually take effect here.
  */
-function pickMarketFromOdds(oddsResponse) {
+function pickMarketFromOdds(oddsResponse, minConfidence) {
   const bookmaker = oddsResponse?.[0]?.bookmakers?.[0];
   if (!bookmaker) return null;
 
   const viable = collectViableOutcomes(bookmaker.bets);
   if (viable.length === 0) return null;
 
-  const qualifying = viable.filter((o) => rawConfidence(o.odds) >= MIN_CONFIDENCE);
-  if (qualifying.length === 0) return null; // nothing on this fixture clears the floor
+  const sorted = [...viable].sort((a, b) => a.odds - b.odds);
+  let chosen = sorted[0]; // lowest odds = safest, by default
 
-  const chosen = [...qualifying].sort((a, b) => b.odds - a.odds)[0]; // highest odds that still qualifies
+  const isResultMarket = RESULT_BASED_MARKETS.has(chosen.market);
+  if (isResultMarket && chosen.odds < WIN_MARKET_MIN_ODDS) {
+    const goalsAlt = sorted.find((o) => o.market === 'Over 1.5 Goals' || o.market === 'Over 2.5 Goals');
+    if (goalsAlt) {
+      chosen = goalsAlt;
+    } else {
+      // No Goals-market alternative for this fixture — fall back to the
+      // next-safest non-result-based option if one exists (e.g. BTTS),
+      // rather than the too-short result-based price.
+      const nonResult = sorted.find((o) => !RESULT_BASED_MARKETS.has(o.market));
+      if (nonResult) chosen = nonResult;
+      // If truly nothing else is viable, the short price is accepted
+      // rather than dropping the fixture entirely.
+    }
+  }
 
-  return { market: chosen.market, odds: chosen.odds, confidence: impliedConfidence(chosen.odds) };
+  const confidence = impliedConfidence(chosen.odds);
+  if (confidence < minConfidence) return null; // too uncertain even at its safest — skip this fixture
+
+  return { market: chosen.market, odds: chosen.odds, confidence };
+}
+
+function impliedConfidence(odds) {
+  const raw = Math.round((1 / odds) * 100);
+  return Math.min(95, Math.max(55, raw)); // clipped to a sane display range
 }
 
 // --- Assemble tickets from the priced-fixture pool ---------------------------
 
-/** Narrows the pool to the tier's own average-leg-odds band, or — for tiers with no band (platinum, diamond) — to the real tunable confidence floor. */
+// Tiers with fewer than 7 matches favor safer, more heavily-favored picks:
+// their fixture pool is restricted to legs priced at 1.77 or below rather
+// than the full odds range used for Gold and up.
+const SMALL_TICKET_TIERS = new Set(['mega', 'bronze', 'silver']); // matchCount < 7
+const SMALL_TICKET_MAX_ODDS = 1.77;
+
+/** Narrows the pool to safer, lower-odds picks for tiers under 7 matches. */
 function poolForTier(pool, tier) {
-  const band = LEG_ODDS_BAND[tier];
-  if (band) return pool.filter((p) => p.odds >= band[0] && p.odds <= band[1]);
-  return pool.filter((p) => p.confidence >= minConfidenceForUnbandedTiers);
+  if (!SMALL_TICKET_TIERS.has(tier)) return pool;
+  return pool.filter((p) => p.odds <= SMALL_TICKET_MAX_ODDS);
 }
 
 // No single match can appear in more than this many of the day's tickets,
-// across every tier combined. "Zero cross-contamination": a fixture used
-// in one tier's ticket must never appear in another tier's ticket the
-// same day, so that if that one fixture fails, it ruins only the single
-// ticket it's on — not multiple tickets across the portfolio at once.
-// Lowered from 3 to 1 this batch; the previous value of 3 deliberately
-// allowed reuse so a thin fixture pool wouldn't starve every tier — that
-// tradeoff is now made the other way on purpose. Expect more skipped
-// slips on days with a thin fixture pool as a direct consequence.
-const MAX_FIXTURE_APPEARANCES_PER_DAY = 1;
+// across every tier combined. Without this cap, a small fixture pool can
+// end up reused in nearly every ticket — meaning one unexpected result
+// takes down the whole day's slate at once instead of just a few tickets.
+const MAX_FIXTURE_APPEARANCES_PER_DAY = 3;
 
 function computeTotalOdds(picks) {
   return Math.round(picks.reduce((acc, p) => acc * p.odds, 1) * 100) / 100;
@@ -688,8 +667,8 @@ function ensureFullWinLeg(picks, pool, usageCount, targetRange) {
   const candidate = candidates[0];
 
   if (!targetRange) {
-    // No odds band to protect — swap out the current highest-odds leg for
-    // the full-win candidate.
+    // No odds band to protect (Weekly Lite/Titan/Weekender) — swap out
+    // the current highest-odds leg for the full-win candidate.
     const highestIdx = picks.reduce((hi, p, i) => (p.odds > picks[hi].odds ? i : hi), 0);
     const next = [...picks];
     next[highestIdx] = candidate;
@@ -733,8 +712,8 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
   });
 
   if (!targetRange) {
-    // No target range to hit — just take the safest available up to the
-    // max, as before.
+    // No target range to hit (Weekly Lite/Titan/Weekender, "Mixed") —
+    // just take the safest available up to the max, as before.
     if (ranked.length < maxMatchCount) return [];
     return ensureFullWinLeg(ranked.slice(0, maxMatchCount), pool, usageCount, null);
   }
@@ -802,40 +781,36 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
   return ensureFullWinLeg(picks, pool, usageCount, targetRange);
 }
 
-// ---------------------------------------------------------------------------
-// SAINTS_LOCK_MIN_CONFIDENCE — bug fix (this batch, surfaced while fixing
-// MIN_CONFIDENCE above; PRE-EXISTING, not introduced by tonight's other
-// changes).
+// Fallback used only if tuning_state can't be read (see fetchTuningState).
+// Saint's Lock demands a far higher confidence bar than any other tier —
+// "next to impossible to get wrong" framing means this should almost never
+// miss.
 //
-// Saint's Lock demands a higher confidence bar than any other tier, but
-// it must be REACHABLE within its own TIER_ODDS_TARGET.saints_lock range
-// ([1.5, 2.0]) — impliedConfidence() in that range tops out at ~67 (odds
-// = 1.5) and bottoms at 55, clipped (odds = 2.0). The previous value of
-// 85 was simply unreachable anywhere within the [1.5, 2.0] band Saint's
-// Lock actually draws from. Verified directly: the
-// `qualifying` filter in buildSaintsLockTickets below could never match
-// anything, so the "minimum 1/day fallback" branch (originally meant for
-// rare bad days) was running on literally every generation — Saint's
-// Lock's stated 85% bar was never actually being enforced.
-//
-// Lowered to a value genuinely achievable at the safer end of the band
-// while still meaningfully excluding its riskier half — a judgment call,
-// not a derived constant like MIN_CONFIDENCE above (there's no single
-// "correct" value here, only a range that's at least reachable: ~55–67).
-// Tunable via tuning_state.saints_lock_min_confidence — see
-// fetchTuningState() in main(); self-tune.mjs's own bounds for this
-// parameter were widened to match (55–67, were 80–92 — also unreachable).
-let SAINTS_LOCK_MIN_CONFIDENCE = 62; // was 85
+// NOTE: this hardcoded value (85) is KNOWN to be mathematically unreachable
+// within Saint's Lock's own [1.5, 2.0] target odds band — impliedConfidence()
+// tops out at 67% for odds of 1.5 (round(1/1.5*100) = 67). It's left as-is
+// here deliberately, as the documented fallback-of-last-resort constant,
+// rather than silently "corrected" in code — the real fix is
+// tuning_state.saints_lock_min_confidence (corrected to 62 via
+// supabase/migrations/004b_fix_saints_lock_seed.sql), which is what
+// generation actually uses whenever that table is reachable. If you ever
+// see the "falling back to hardcoded defaults" warning in the logs for
+// this value, Saint's Lock will effectively run on its emergency
+// fallback-pick path every time until the underlying Supabase issue is
+// fixed — treat that warning as high-priority if it appears.
+const SAINTS_LOCK_MIN_CONFIDENCE = 85;
 
 /**
  * Dedicated selection for Saint's Lock — unlike every other tier (which
  * uses pickFixturesForSlip's least-used/safest-first logic), this picks
  * strictly the highest-confidence qualifying fixtures in the whole day's
  * pool, filtered to the 1.5–2.0 odds band and the much higher confidence
- * floor above. Respects the same staggered-release slot logic as every
- * other tier (see nextSlotFor) — at most one new Saint's Lock ticket is
- * produced per run, honoring the min-1/max-2-per-day guarantee across the
- * day's two scheduled runs rather than both at once.
+ * floor passed in as `saintsLockMinConfidence` (sourced from tuning_state,
+ * falling back to the SAINTS_LOCK_MIN_CONFIDENCE constant above — see
+ * fetchTuningState). Respects the same staggered-release slot logic as
+ * every other tier (see nextSlotFor) — at most one new Saint's Lock ticket
+ * is produced per run, honoring the min-1/max-2-per-day guarantee across
+ * the day's two scheduled runs rather than both at once.
  *
  * NOTE: the "always incorporate a full win where necessary" guarantee
  * (see ensureFullWinLeg, used by the generic per-tier loop below)
@@ -845,7 +820,7 @@ let SAINTS_LOCK_MIN_CONFIDENCE = 62; // was 85
  * outright-win fixture just to satisfy a market-type preference would
  * directly contradict that.
  */
-function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
+function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, saintsLockMinConfidence) {
   const config = TIER_CONFIG.find((c) => c.tier === 'saints_lock');
   const [minOdds, maxOdds] = TIER_ODDS_TARGET.saints_lock;
 
@@ -855,12 +830,12 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
   };
 
   let qualifying = dailyPool
-    .filter((p) => inOddsRange(p) && p.confidence >= SAINTS_LOCK_MIN_CONFIDENCE)
+    .filter((p) => inOddsRange(p) && p.confidence >= saintsLockMinConfidence)
     .sort((a, b) => b.confidence - a.confidence);
 
-  // Minimum 1/day guarantee: if nothing clears the strict 85% bar on the
-  // FIRST slip of the day, relax to the single best-available fixture in
-  // the odds range rather than shipping zero. Still quality-first — this
+  // Minimum 1/day guarantee: if nothing clears the strict confidence bar on
+  // the FIRST slip of the day, relax to the single best-available fixture
+  // in the odds range rather than shipping zero. Still quality-first — this
   // only ever applies to slot 0, since a second slot at reduced confidence
   // would defeat the "next to impossible" positioning.
   let usedFallback = false;
@@ -871,7 +846,7 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
       usedFallback = true;
       // eslint-disable-next-line no-console
       console.warn(
-        `Saint's Lock: no fixture cleared ${SAINTS_LOCK_MIN_CONFIDENCE}% today — ` +
+        `Saint's Lock: no fixture cleared ${saintsLockMinConfidence}% today — ` +
           `using best available (${fallback[0].confidence}%) to meet the minimum-1-per-day guarantee.`
       );
     }
@@ -904,7 +879,7 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
   return { tickets, ticketMatches, fixturesUsed: [pick], usedFallback };
 }
 
-function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, now) {
+function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, now, saintsLockMinConfidence) {
   const today = dateStr(now);
   const availableAtIso = new Date(now.getTime() + AVAILABILITY_DELAY_MS).toISOString();
   const tickets = [];
@@ -917,7 +892,7 @@ function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, now) {
   // stricter confidence bar than every other category.
   const saintsLockSlot = nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get('saints_lock'));
   if (saintsLockSlot !== null) {
-    const saintsLock = buildSaintsLockTickets(dailyPool, usageCount, today, saintsLockSlot, now);
+    const saintsLock = buildSaintsLockTickets(dailyPool, usageCount, today, saintsLockSlot, now, saintsLockMinConfidence);
     tickets.push(...saintsLock.tickets);
     ticketMatches.push(...saintsLock.ticketMatches);
     saintsLock.fixturesUsed.forEach((f) => fixturesUsed.set(f.fixtureId, f));
@@ -981,51 +956,6 @@ function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, now) {
   return { tickets, ticketMatches, fixturesUsed: Array.from(fixturesUsed.values()) };
 }
 
-/**
- * Reads the live auto-tuned parameter values written by
- * scripts/self-tune.mjs (supabase/migrations/004_self_improvement.sql's
- * tuning_state table). Falls back to this file's own hardcoded defaults
- * on any read failure — a Supabase hiccup, or the migration not yet
- * applied, must never block a whole generation run.
- *
- * min_confidence is applied ONLY to platinum/diamond (see
- * minConfidenceForUnbandedTiers / poolForTier) — deliberately NOT used to
- * override MIN_CONFIDENCE, the shared pricing-time admission floor
- * derived from HIGHEST_PERMITTED_LEG_ODDS. self-tune.mjs only ever RAISES
- * min_confidence (never lowers it); if that tuned value fed the shared
- * floor instead, self-tune.mjs would eventually re-narrow it far enough
- * to reintroduce the exact silver-through-weekender blocking bug this
- * batch just fixed — autonomously, weeks from now, with no code change
- * to point to. Scoping it to the two unbanded tiers avoids that risk
- * entirely while still letting Layer 2 auto-tuning do something real.
- *
- * KNOWN LIMITATION, not fixed in this pass: self-tune.mjs's own evidence-
- * gathering (fetchGradedFixtures) reasons about ALL graded fixtures
- * across every tier, not just platinum/diamond's — so the win-rate
- * evidence behind a tuned min_confidence value no longer purely reflects
- * the population it now governs. Narrowing that query to only
- * platinum/diamond fixtures would need a tier join (fixtures has no tier
- * column directly; it'd go through ticket_matches/tickets) — real
- * additional work, flagged rather than done here.
- */
-async function fetchTuningState(supabase) {
-  try {
-    const { data, error } = await supabase
-      .from('tuning_state')
-      .select('min_confidence, saints_lock_min_confidence')
-      .eq('id', 1)
-      .maybeSingle();
-    if (error || !data) {
-      console.warn('Could not read tuning_state — using this file\'s hardcoded defaults for this run.');
-      return null;
-    }
-    return data;
-  } catch (err) {
-    console.warn('tuning_state read threw — using this file\'s hardcoded defaults for this run:', err.message);
-    return null;
-  }
-}
-
 // --- Main ---------------------------------------------------------------------
 
 async function main() {
@@ -1042,14 +972,9 @@ async function main() {
   const supabase = getSupabaseAdmin();
 
   const tuning = await fetchTuningState(supabase);
-  if (tuning?.min_confidence != null) {
-    minConfidenceForUnbandedTiers = tuning.min_confidence;
-    console.log(`Using tuned min_confidence for platinum/diamond: ${minConfidenceForUnbandedTiers}`);
-  }
-  if (tuning?.saints_lock_min_confidence != null) {
-    SAINTS_LOCK_MIN_CONFIDENCE = tuning.saints_lock_min_confidence;
-    console.log(`Using tuned saints_lock_min_confidence: ${SAINTS_LOCK_MIN_CONFIDENCE}`);
-  }
+  console.log(
+    `Using min_confidence=${tuning.minConfidence}%, saints_lock_min_confidence=${tuning.saintsLockMinConfidence}% (from tuning_state).`
+  );
 
   console.log('Checking today\'s existing slips (staggered-release state)...');
   const slipState = await fetchTodaysSlipState(supabase, todayStr);
@@ -1063,19 +988,35 @@ async function main() {
   }
 
   console.log('Fetching daily fixture pool...');
-  const dailyPool = await fetchPricedFixtures(dailyDates, MAX_ODDS_LOOKUPS_PER_RUN, today);
+  const dailyPool = await fetchPricedFixtures(dailyDates, MAX_ODDS_LOOKUPS_PER_RUN, today, {
+    supabase,
+    minConfidence: tuning.minConfidence,
+  });
   console.log(`Priced ${dailyPool.length} fixtures for today.`);
 
   console.log('Fetching weekly fixture pool (for Weekly Lite / Weekly Titan)...');
-  const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN, today);
+  const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN, today, {
+    supabase,
+    minConfidence: tuning.minConfidence,
+  });
   console.log(`Priced ${weeklyPool.length} fixtures for the week ahead.`);
 
   console.log('Fetching Weekender pool (upcoming Sat+Sun)...');
   const weekendDates = upcomingWeekendDates(today);
-  const weekenderPool = await fetchPricedFixtures(weekendDates, MAX_ODDS_LOOKUPS_PER_RUN, today);
+  const weekenderPool = await fetchPricedFixtures(weekendDates, MAX_ODDS_LOOKUPS_PER_RUN, today, {
+    supabase,
+    minConfidence: tuning.minConfidence,
+  });
   console.log(`Priced ${weekenderPool.length} fixtures for the weekend (${weekendDates.join(', ')}).`);
 
-  const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, today);
+  const { tickets, ticketMatches, fixturesUsed } = buildTickets(
+    dailyPool,
+    weeklyPool,
+    weekenderPool,
+    slipState,
+    today,
+    tuning.saintsLockMinConfidence
+  );
 
   if (tickets.length === 0) {
     console.warn('No tickets could be assembled this run — not enough priced fixtures, or every eligible category was skipped. Nothing written.');
@@ -1093,6 +1034,8 @@ async function main() {
     market: f.market,
     odds: f.odds,
     confidence: f.confidence,
+    model_probability: f.modelProbability,
+    model_available: f.modelAvailable,
   }));
 
   const { error: fixturesErr } = await supabase.from('fixtures').upsert(fixtureRows, { onConflict: 'id' });
