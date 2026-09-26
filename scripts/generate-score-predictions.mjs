@@ -13,13 +13,27 @@
 // PREDICTION SOURCE: scripts/lib/teamModel.mjs's own Poisson expected-goals
 // model — previously wired in ONLY as a silent cross-check
 // (scripts/lib/modelCrossCheck.mjs), never surfaced to users. This script
-// is the first consumer that surfaces the model's own full scoreline grid
-// directly, via the new topScoreline field on getOwnModelForFixture's
-// result. Same honesty rule as the rest of the pipeline: if the model
-// doesn't have enough graded history for either team yet
-// (MIN_SAMPLE_MATCHES in teamModel.mjs), that fixture is skipped entirely
-// rather than guessing — coverage is expected to be PARTIAL early on and
-// grow as scripts/backfill-team-history.mjs accumulates more history.
+// surfaces the model's own full scoreline grid directly, via the
+// topScoreline field on getOwnModelForFixture's result. Same honesty rule
+// as the rest of the pipeline: if the model doesn't have enough graded
+// history for either team yet, that fixture is skipped entirely rather
+// than guessing — coverage is expected to be PARTIAL early on and grow as
+// scripts/backfill-team-history.mjs accumulates more history.
+//
+// SELF-IMPROVEMENT LOOP: at the start of every run, this script reads the
+// LIVE min_sample_matches threshold from score_model_tuning_state (see
+// supabase/migrations/006_score_prediction_tuning.sql), falling back to
+// teamModel.mjs's own DEFAULT_MIN_SAMPLE_MATCHES on any read failure —
+// same defensive "never let a Supabase hiccup break generation" pattern
+// generate-tickets.mjs already uses for its own tuning_state read. That
+// threshold is bounded-auto-tuned weekly by
+// scripts/self-tune-score-model.mjs, based on real accuracy evidence from
+// scripts/analyze-score-predictions.mjs's daily reconciliation — this
+// script also stamps each row with the REAL sample sizes the model found
+// for both teams (home_team_sample_size / away_team_sample_size) and
+// which threshold was live (min_sample_matches_used), so that tuning can
+// later backtest genuinely against real historical rows rather than
+// comparing different days against each other.
 //
 // NEEDS NO BOOKMAKER ODDS AT ALL — the model works from `team_match_history`
 // alone, so this script costs API-Football requests only for the day's
@@ -39,25 +53,21 @@
 // rather than imported from generate-tickets.mjs — matches the existing
 // project pattern of small, intentionally-separate copies for scripts with
 // different purposes (see e.g. scripts/lib/supabaseAdmin.mjs vs
-// src/lib/supabaseAdmin.ts, or sendBrevoEmail duplicated between
-// scripts/lib/lifecycleEmail.mjs and src/lib/lifecycleEmail.ts). If the
-// allowlist or exclusion rules ever change, update both this file and
-// generate-tickets.mjs.
+// src/lib/supabaseAdmin.ts). If the allowlist or exclusion rules ever
+// change, update both this file and generate-tickets.mjs.
 //
 // ADDITIONALLY applies isWomensCompetition (scripts/lib/womensLeagueFilter.mjs)
 // — that filter module already exists in the repo per the stated
 // men's-only product decision, but generate-tickets.mjs does NOT currently
-// import/apply it (only isAmateurOrYouthLeague is wired in there). That
-// looks like a pre-existing gap in generate-tickets.mjs, not something
-// fixed here — flagging it rather than silently patching an unrelated,
-// already-working file. This script applies it since it's a clean, small
-// addition and matches the stated product intent.
+// import/apply it. That looks like a pre-existing gap in
+// generate-tickets.mjs, not something fixed here — flagging it rather than
+// silently patching an unrelated, already-working file.
 // ---------------------------------------------------------------------------
 import { getFixturesForDate } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { isAmateurOrYouthLeague } from './lib/leagueQuality.mjs';
 import { isWomensCompetition } from './lib/womensLeagueFilter.mjs';
-import { getOwnModelForFixture } from './lib/teamModel.mjs';
+import { getOwnModelForFixture, DEFAULT_MIN_SAMPLE_MATCHES } from './lib/teamModel.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -99,9 +109,9 @@ function loadLeagueAllowlist() {
 const LEAGUE_ALLOWLIST = loadLeagueAllowlist();
 
 // Mirrors EXCLUDED_TEAMS in generate-tickets.mjs — same integrity-driven
-// business decision (see the note there), applied here too since it should
-// hold everywhere the pipeline touches these clubs, not just in ticket
-// selection. Keep both lists in sync if this is ever populated for real.
+// business decision, applied here too since it should hold everywhere the
+// pipeline touches these clubs, not just in ticket selection. Keep both
+// lists in sync if this is ever populated for real.
 const EXCLUDED_TEAMS = new Set([
   // 'Example FC',
 ]);
@@ -131,6 +141,27 @@ function dateStr(d) {
   return d.toISOString().slice(0, 10);
 }
 
+/**
+ * Reads the live, bounded-auto-tuned min_sample_matches threshold from
+ * score_model_tuning_state — see scripts/self-tune-score-model.mjs.
+ * Falls back to teamModel.mjs's own DEFAULT_MIN_SAMPLE_MATCHES on ANY
+ * failure (missing migration, transient Supabase error, etc.) so a tuning
+ * read hiccup never blocks a day's predictions from generating.
+ */
+async function fetchMinSampleMatches(supabase) {
+  try {
+    const { data, error } = await supabase
+      .from('score_model_tuning_state')
+      .select('min_sample_matches')
+      .eq('id', 1)
+      .single();
+    if (error || !data) return DEFAULT_MIN_SAMPLE_MATCHES;
+    return data.min_sample_matches;
+  } catch {
+    return DEFAULT_MIN_SAMPLE_MATCHES;
+  }
+}
+
 async function main() {
   const now = new Date();
   const today = dateStr(now);
@@ -158,6 +189,9 @@ async function main() {
   }
 
   const supabase = getSupabaseAdmin();
+  const minSampleMatches = await fetchMinSampleMatches(supabase);
+  console.log(`Using min_sample_matches = ${minSampleMatches} (live tuned value, or the default if unread).`);
+
   const rows = [];
   let skippedNoModel = 0;
 
@@ -176,6 +210,7 @@ async function main() {
         awayTeamId,
         homeTeamName,
         awayTeamName,
+        minSampleMatches,
       });
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -199,6 +234,9 @@ async function main() {
       predicted_home_score: model.topScoreline.home,
       predicted_away_score: model.topScoreline.away,
       probability: model.topScoreline.probability,
+      home_team_sample_size: model.sampleInfo.homeTeamMatches,
+      away_team_sample_size: model.sampleInfo.awayTeamMatches,
+      min_sample_matches_used: minSampleMatches,
     });
   }
 
