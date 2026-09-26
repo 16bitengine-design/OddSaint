@@ -858,6 +858,76 @@ export function scorePredictionsByFixtureId(predictions: ScorePrediction[]): Map
   return new Map(predictions.map((p) => [p.fixtureId, p]));
 }
 
+export interface ScorePredictionDayAccuracy {
+  date: string; // 'YYYY-MM-DD'
+  correct: number;
+  incorrect: number;
+  stillPending: number;
+  /** Correct / (correct + incorrect) * 100. Null if nothing decided yet for that day. */
+  hitRatePct: number | null;
+  minSampleMatchesUsed: number | null;
+}
+
+/**
+ * Reads the last `days` calendar days of exact-score-prediction accuracy —
+ * one row per day, written by scripts/analyze-score-predictions.mjs once
+ * that day's predictions have had time to be graded (see
+ * supabase/migrations/006_score_prediction_tuning.sql). Most recent first
+ * (today is index 0). A day with nothing generated/reconciled yet simply
+ * isn't in the table and is filled here with an honest "no data"
+ * placeholder — same pattern as fetchPerformanceHistory, no fabricated
+ * numbers. Public/ungated by design, same as ticket performance history —
+ * this is a track-record transparency feature ("graded in the open"), not
+ * the predictions themselves.
+ */
+export async function fetchScorePredictionAccuracyHistory(days: number = 14): Promise<ScorePredictionDayAccuracy[]> {
+  const today = new Date();
+  const start = new Date(today);
+  start.setDate(start.getDate() - (days - 1));
+
+  const byDate = new Map<string, ScorePredictionDayAccuracy>();
+  try {
+    const { data, error } = await supabase
+      .from('score_prediction_daily_accuracy')
+      .select('ticket_date, correct, incorrect, still_pending, hit_rate_pct, min_sample_matches_used')
+      .gte('ticket_date', dateKey(start))
+      .lte('ticket_date', dateKey(today));
+    if (!error && data) {
+      data.forEach((row: any) => {
+        byDate.set(row.ticket_date, {
+          date: row.ticket_date,
+          correct: row.correct,
+          incorrect: row.incorrect,
+          stillPending: row.still_pending,
+          hitRatePct: row.hit_rate_pct,
+          minSampleMatchesUsed: row.min_sample_matches_used ?? null,
+        });
+      });
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[Odd Saint] fetchScorePredictionAccuracyHistory failed:', err);
+  }
+
+  const history: ScorePredictionDayAccuracy[] = [];
+  for (let i = 0; i < days; i++) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const key = dateKey(d);
+    history.push(
+      byDate.get(key) ?? {
+        date: key,
+        correct: 0,
+        incorrect: 0,
+        stillPending: 0,
+        hitRatePct: null,
+        minSampleMatchesUsed: null,
+      }
+    );
+  }
+  return history;
+}
+
 // ---------------------------------------------------------------------------
 // Admin-editable app settings
 // ---------------------------------------------------------------------------
