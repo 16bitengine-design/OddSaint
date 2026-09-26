@@ -1,0 +1,35 @@
+name: Odd Saint — Generate Score Predictions
+
+# Once daily at 02:30 UTC (05:30 EAT) — a 30-minute safety margin ahead of
+# the 6am EAT product deadline for this feature (see
+# scripts/generate-score-predictions.mjs). Deliberately its OWN single-run
+# schedule, NOT tied to generate-tickets.yml's twice-daily staggered-release
+# slots — this feature is one list per day, not a staggered release, and it
+# needs no bookmaker odds lookups so it's cheap enough to run well ahead of
+# time. Can also be triggered manually from the Actions tab.
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate today's score predictions
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/generate-score-predictions.mjs
