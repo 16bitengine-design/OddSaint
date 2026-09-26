@@ -24,6 +24,9 @@ import {
   ANONYMOUS_TRIAL_DAYS,
   SIGNED_UP_TRIAL_DAYS,
   getTrialPolicy,
+  fetchScorePredictions,
+  scorePredictionsByFixtureId,
+  fetchScorePredictionAccuracyHistory,
   type Ticket,
   type Match,
   type MatchStatus,
@@ -33,6 +36,8 @@ import {
   type ArchiveAccess,
   type TrialPolicy,
   type AvailableFixture,
+  type ScorePrediction,
+  type ScorePredictionDayAccuracy,
 } from '@/lib/dataFetcher';
 import {
   submitFeedback,
@@ -42,6 +47,7 @@ import {
   type FeedbackRow,
 } from '@/lib/feedback';
 import { adminGrantAccess, type GrantableProduct } from '@/lib/adminGrant';
+import { ScorePredictionsSection, ScorePredictionAccuracyHistory } from './ScorePredictions';
 
 // ---------------------------------------------------------------------------
 // Color tokens — Odd Saint brand
@@ -224,10 +230,13 @@ function MatchRow({
   match,
   blurred,
   onSelect,
+  predictedScore,
 }: {
   match: Match;
   blurred: boolean;
   onSelect?: (match: Match) => void;
+  /** From scripts/generate-score-predictions.mjs via score_predictions — the model's single most likely final scoreline for this fixture, if one was generated today. Optional: most days most matches simply won't have one yet (see the honest-partial-coverage note in dataFetcher.ts's fetchScorePredictions). */
+  predictedScore?: { home: number; away: number };
 }) {
   return (
     <div
@@ -263,6 +272,11 @@ function MatchRow({
           <div style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 1 }}>
             {match.league} ({match.country}) · {match.market}
           </div>
+          {predictedScore && (
+            <div style={{ fontSize: 10, color: COLORS.textMuted, marginTop: 1, fontWeight: 600 }}>
+              Predicted score: {predictedScore.home}-{predictedScore.away}
+            </div>
+          )}
           {match.finalHomeScore !== undefined && match.finalAwayScore !== undefined ? (
             <div
               style={{
@@ -921,6 +935,7 @@ function TicketCard({
   onSignUp,
   onSelectMatch,
   onEditAsAdmin,
+  predictionByFixtureId,
 }: {
   ticket: Ticket;
   trialActive: boolean;
@@ -929,6 +944,8 @@ function TicketCard({
   onSignUp: () => void;
   onSelectMatch: (match: Match) => void;
   onEditAsAdmin: (ticket: Ticket) => void;
+  /** From src/app/page.tsx's Page component — scripts/generate-score-predictions.mjs's output keyed by fixture ID, so an unlocked match row can show its predicted scoreline alongside the odds. Optional — the ticket archive currently doesn't pass this (predictions are only generated for "today"), so past-day tickets simply show no predicted-score line, which is honest since none exists for that date. */
+  predictionByFixtureId?: Map<string, ScorePrediction>;
 }) {
   const [open, setOpen] = useState(false);
   const overallStatus = getTicketStatus(ticket);
@@ -1129,9 +1146,22 @@ function TicketCard({
             </div>
           ) : (
             <div>
-              {ticket.matches.map((m) => (
-                <MatchRow key={m.id} match={m} blurred={false} onSelect={onSelectMatch} />
-              ))}
+              {ticket.matches.map((m) => {
+                const prediction = predictionByFixtureId?.get(m.id);
+                return (
+                  <MatchRow
+                    key={m.id}
+                    match={m}
+                    blurred={false}
+                    onSelect={onSelectMatch}
+                    predictedScore={
+                      prediction
+                        ? { home: prediction.predictedHomeScore, away: prediction.predictedAwayScore }
+                        : undefined
+                    }
+                  />
+                );
+              })}
             </div>
           )}
         </div>
@@ -3054,8 +3084,6 @@ export default function Page() {
   const [pricingProduct, setPricingProduct] = useState<'subscription' | 'saints_lock'>('subscription');
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [history, setHistory] = useState<DayPerformance[]>([]);
-  // Collapsed by default — expands when the user taps "View performance
-  // history →" in Hero (onViewHistory toggles this).
   const [showHistory, setShowHistory] = useState(false);
   const [loading, setLoading] = useState(true);
   const [ticketsLoading, setTicketsLoading] = useState(true);
@@ -3063,6 +3091,10 @@ export default function Page() {
   const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
   const [showFeedbackAdmin, setShowFeedbackAdmin] = useState(false);
   const [showGrantAccess, setShowGrantAccess] = useState(false);
+  // Exact-score predictions feature (see scripts/generate-score-predictions.mjs,
+  // src/lib/dataFetcher.ts, src/app/ScorePredictions.tsx).
+  const [scorePredictions, setScorePredictions] = useState<ScorePrediction[]>([]);
+  const [scoreAccuracyHistory, setScoreAccuracyHistory] = useState<ScorePredictionDayAccuracy[]>([]);
 
   const isAdmin = archiveAccess.level === 'admin';
 
@@ -3124,6 +3156,18 @@ export default function Page() {
         // eslint-disable-next-line no-console
         console.error('[Odd Saint] Failed to load trial policy, using defaults:', err);
       });
+    fetchScorePredictions()
+      .then(setScorePredictions)
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('[Odd Saint] Failed to load score predictions:', err);
+      });
+    fetchScorePredictionAccuracyHistory(14)
+      .then(setScoreAccuracyHistory)
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('[Odd Saint] Failed to load score prediction accuracy:', err);
+      });
   }, []);
 
   // Access model: every ticket is free once someone signs up, so the only
@@ -3140,6 +3184,9 @@ export default function Page() {
     () => getTrialDaysRemaining(anonTrialStart, trialPolicy.anonymousDays),
     [anonTrialStart, trialPolicy]
   );
+  // O(1) lookup from a ticket's fixture ID to that day's score prediction —
+  // see MatchRow's predictedScore prop / TicketCard's predictionByFixtureId prop.
+  const predictionByFixtureId = useMemo(() => scorePredictionsByFixtureId(scorePredictions), [scorePredictions]);
 
   // Dormant — no paid tier is currently linked from anywhere in the UI
   // (every ticket is free after sign-up for now), but PricingModal,
@@ -3322,6 +3369,7 @@ export default function Page() {
         />
 
         {showHistory && <PerformanceHistory history={history} />}
+        {showHistory && <ScorePredictionAccuracyHistory history={scoreAccuracyHistory} />}
 
         {/* Trial banner */}
         <div
@@ -3379,6 +3427,15 @@ export default function Page() {
           </div>
         )}
 
+        {/* Exact-score predictions — daily, broader-than-tickets list (see
+            scripts/generate-score-predictions.mjs). Same access gating as a
+            standard ticket tier: admin / signed-in / trial active. */}
+        <ScorePredictionsSection
+          predictions={scorePredictions}
+          unlocked={isAdmin || !!userEmail || trialActive}
+          onSignUp={() => setShowLoginModal(true)}
+        />
+
         {/* Ticket feed with in-feed ad injection */}
         {feedItems.map((item, idx) =>
           item.kind === 'ad' ? (
@@ -3395,6 +3452,7 @@ export default function Page() {
               onSignUp={() => setShowLoginModal(true)}
               onSelectMatch={setSelectedMatch}
               onEditAsAdmin={setEditingTicket}
+              predictionByFixtureId={predictionByFixtureId}
             />
           )
         )}
