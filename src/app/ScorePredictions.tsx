@@ -16,7 +16,7 @@
 // pure display + blur/prompt shell rather than re-deriving access logic.
 // ---------------------------------------------------------------------------
 import { useState } from 'react';
-import type { ScorePrediction } from '@/lib/dataFetcher';
+import type { ScorePrediction, ScorePredictionDayAccuracy } from '@/lib/dataFetcher';
 
 const COLORS = {
   surface: '#ffffff',
@@ -217,6 +217,75 @@ export function ScorePredictionsSection({
       <div style={{ fontSize: 10, color: COLORS.textMuted, marginTop: 12, lineHeight: 1.5 }}>
         Model's own most-likely scoreline per match — a statistical opinion, not a guarantee. Exact-score
         predictions are inherently low-probability; treat these as analysis, not a promise.
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Exact-score accuracy history — a PUBLIC, UNGATED transparency view of
+// score_prediction_daily_accuracy (see scripts/analyze-score-predictions.mjs
+// and supabase/migrations/006_score_prediction_tuning.sql). Deliberately
+// not behind the same trial/sign-up gate as ScorePredictionsSection above —
+// this is a track-record disclosure ("graded in the open"), same product
+// positioning as PerformanceHistory for ticket tiers in page.tsx, not the
+// predictions themselves. Rendered alongside PerformanceHistory under the
+// same "View performance history" toggle in page.tsx.
+// ---------------------------------------------------------------------------
+export function ScorePredictionAccuracyHistory({ history }: { history: ScorePredictionDayAccuracy[] }) {
+  const hasAnyData = history.some((d) => d.correct + d.incorrect + d.stillPending > 0);
+  if (!hasAnyData) return null;
+
+  return (
+    <div
+      style={{
+        background: COLORS.surfaceAlt,
+        border: `1px solid ${COLORS.border}`,
+        borderTop: `1px solid ${COLORS.hairline}`,
+        borderRadius: 12,
+        padding: 14,
+        marginBottom: 16,
+      }}
+    >
+      <div style={{ fontFamily: FONT_DISPLAY, fontSize: 14, fontWeight: 700, color: COLORS.textPrimary, marginBottom: 10 }}>
+        Exact-score accuracy — last {history.length} days
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {history.map((day) => {
+          const decided = day.correct + day.incorrect;
+          const correctPct = decided > 0 ? (day.correct / decided) * 100 : 0;
+          return (
+            <div key={day.date} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ width: 74, fontSize: 11, color: COLORS.textMuted, flexShrink: 0 }}>{day.date.slice(5)}</div>
+              <div
+                style={{
+                  flex: 1,
+                  height: 8,
+                  borderRadius: 999,
+                  background: 'rgba(18,36,28,0.06)',
+                  overflow: 'hidden',
+                  display: 'flex',
+                }}
+              >
+                {decided > 0 && <div style={{ width: `${correctPct}%`, background: COLORS.emerald }} />}
+              </div>
+              <div style={{ width: 100, fontSize: 10.5, color: COLORS.textMuted, textAlign: 'right', flexShrink: 0 }}>
+                {decided === 0
+                  ? day.stillPending > 0
+                    ? `${day.stillPending} pending`
+                    : '—'
+                  : `${day.hitRatePct ?? 0}% · ${decided}`}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ fontSize: 10, color: COLORS.textMuted, marginTop: 10, lineHeight: 1.5 }}>
+        Exact-score hit rate = correct scorelines ÷ decided predictions (sample size shown after the dot). A
+        single-scoreline pick is inherently low-probability — sitting well under 50% is expected, not a sign
+        of error. Days with nothing decided yet show as pending or "—", never a fabricated rate.
       </div>
     </div>
   );
