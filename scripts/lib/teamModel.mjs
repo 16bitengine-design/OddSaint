@@ -33,7 +33,21 @@
 //      "attack strength" / "defense strength").
 //   4. The two teams' strengths combine into an expected-goals figure for
 //      THIS fixture, which the Poisson distribution turns into real
-//      probabilities for Over/Under lines, BTTS, and Home/Draw/Away.
+//      probabilities for Over/Under lines, BTTS, Home/Draw/Away — AND,
+//      as of the exact-score-prediction feature, a ranked list of full
+//      scorelines (e.g. "2-1 is the single most likely final score").
+//
+// SELF-IMPROVEMENT: the ONE knob this model exposes for bounded auto-
+// tuning (see scripts/self-tune-score-model.mjs) is minSampleMatches —
+// how many graded home/away matches a team needs before its profile is
+// trusted at all. DEFAULT_MIN_SAMPLE_MATCHES below is this module's own
+// hardcoded default, still used as-is by scripts/lib/modelCrossCheck.mjs
+// (ticket-generation cross-check, if/when that's actually wired in) and
+// by any other caller that doesn't pass an override. scripts/generate-
+// score-predictions.mjs instead reads a LIVE, separately-tuned value from
+// score_model_tuning_state and passes it in explicitly — so tuning
+// score-prediction accuracy can never silently change ticket-selection
+// behavior, even though both features share this one file.
 //
 // HONEST LIMITATIONS (read before wiring this into generation):
 //   - `team_match_history` combines two sources: fixtures the pipeline has
@@ -43,8 +57,9 @@
 //      backfill-team-history.mjs's BUDGET WARNING for why the backfill is
 //      deliberately gradual, not instant.
 //   - Small samples produce unstable estimates. This module refuses to
-//      return a confident model for either team below MIN_SAMPLE_MATCHES —
-//      it returns `null` rather than fabricating a number from 2-3 games.
+//      return a confident model for either team below the effective
+//      minSampleMatches — it returns `null` rather than fabricating a
+//      number from 2-3 games.
 //   - If a fixture's team_id is missing (e.g. an older, pre-migration row,
 //      or a data source that didn't supply one), this module returns
 //      unavailable rather than falling back to name matching — the whole
@@ -52,14 +67,23 @@
 //   - This model has NO knowledge of injuries, suspensions, lineup news,
 //      weather, or anything a bookmaker's live market pricing already
 //      accounts for. It should supplement bookmaker consensus, not
-//      override it — see the integration note at the bottom of this file.
+//      override it — see the integration notes at the bottom of this file.
+//   - The exact-scoreline ranking is the SAME grid the market
+//      probabilities are already derived from — it is not a separate,
+//      more-precise model. A single scoreline pick is inherently a much
+//      lower-probability, lower-hit-rate claim than a market like
+//      "Over 1.5 Goals" (which sums many grid cells together). That's
+//      expected for an exact-score feature, not a bug — never inflate or
+//      round this to look more confident than the math actually is.
 // ---------------------------------------------------------------------------
 
-// A team needs at least this many graded matches (at the relevant venue —
-// home matches for home-team stats, away matches for away-team stats)
-// before its scoring profile is trusted at all. Below this, the model
-// returns insufficient-data rather than guessing.
-const MIN_SAMPLE_MATCHES = 5;
+// Default minimum graded matches (at the relevant venue) a team needs
+// before its scoring profile is trusted at all. Exported so callers that
+// want to reason about or display the default (e.g. a report script) can
+// reference it instead of hardcoding "5" a second time. See the
+// SELF-IMPROVEMENT note above for how this differs from a per-call
+// override.
+export const DEFAULT_MIN_SAMPLE_MATCHES = 5;
 
 // How far back to look for both the team's own profile and the league
 // baseline — recent form matters more than a full season, and this keeps
@@ -71,6 +95,12 @@ const LEAGUE_BASELINE_LOOKBACK_DAYS = 120;
 // covers effectively all realistic football scorelines (P(10+ goals) for
 // one side is vanishingly small even for a very strong attack).
 const MAX_GOALS_MODELED = 8;
+
+// How many ranked scorelines getOwnModelForFixture returns (topScorelines).
+// topScoreline is always just the first of these. 3 is enough for a caller
+// that wants to show "or maybe 2-0 / 1-1" alternates without hauling the
+// full 81-cell grid around.
+const TOP_SCORELINES_RETURNED = 3;
 
 function poissonPMF(k, lambda) {
   // P(exactly k goals) given expected goals lambda.
@@ -87,11 +117,16 @@ function poissonPMF(k, lambda) {
  * and away scoring rates are genuinely different and shouldn't be blended.
  * Queried by team_id, NOT team name — see the TEAM IDENTITY note above.
  *
- * Returns null if teamId is missing, or fewer than MIN_SAMPLE_MATCHES are
+ * `minSampleMatches` lets a caller apply a stricter (or looser) trust
+ * threshold than DEFAULT_MIN_SAMPLE_MATCHES without changing this
+ * module's own default for every other caller — see the SELF-IMPROVEMENT
+ * note at the top of this file.
+ *
+ * Returns null if teamId is missing, or fewer than minSampleMatches are
  * on record — the caller must treat that as "no model available for this
  * fixture," not as zero goals.
  */
-async function getTeamVenueProfile(supabase, teamId, venue) {
+async function getTeamVenueProfile(supabase, teamId, venue, minSampleMatches = DEFAULT_MIN_SAMPLE_MATCHES) {
   if (!teamId) return null;
 
   const { data, error } = await supabase
@@ -102,7 +137,7 @@ async function getTeamVenueProfile(supabase, teamId, venue) {
     .order('kickoff', { ascending: false })
     .limit(TEAM_LOOKBACK_MATCHES);
 
-  if (error || !data || data.length < MIN_SAMPLE_MATCHES) return null;
+  if (error || !data || data.length < minSampleMatches) return null;
 
   const avgFor = data.reduce((sum, r) => sum + r.goals_for, 0) / data.length;
   const avgAgainst = data.reduce((sum, r) => sum + r.goals_against, 0) / data.length;
@@ -117,8 +152,12 @@ async function getTeamVenueProfile(supabase, teamId, venue) {
  * have enough graded history of its own — a brand-new regional league
  * added via resolve-leagues.mjs won't have this yet, and guessing a
  * plausible generic baseline is safer than returning nothing.
+ *
+ * Reuses the same `minSampleMatches` threshold as getTeamVenueProfile —
+ * same "how much history do we trust" semantic, kept as one shared
+ * concept rather than a second, separately-tuned constant.
  */
-async function getLeagueBaseline(supabase, league) {
+async function getLeagueBaseline(supabase, league, minSampleMatches = DEFAULT_MIN_SAMPLE_MATCHES) {
   const cutoffISO = new Date(Date.now() - LEAGUE_BASELINE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString();
 
   const { data, error } = await supabase
@@ -132,7 +171,7 @@ async function getLeagueBaseline(supabase, league) {
   const GENERIC_HOME_AVG = 1.45; // long-run real-world approximate averages —
   const GENERIC_AWAY_AVG = 1.15; // used only until a league has its own graded sample
 
-  if (error || !data || data.length < MIN_SAMPLE_MATCHES) {
+  if (error || !data || data.length < minSampleMatches) {
     return { avgHomeGoals: GENERIC_HOME_AVG, avgAwayGoals: GENERIC_AWAY_AVG, sampleSize: 0, isGeneric: true };
   }
 
@@ -142,25 +181,33 @@ async function getLeagueBaseline(supabase, league) {
 }
 
 /**
- * Turns a pair of expected-goals figures into real probabilities for every
- * market this model can speak to. Sums the full home-goals × away-goals
- * probability grid rather than any shortcut formula, so results stay exact
- * for whatever MAX_GOALS_MODELED is set to.
+ * Builds the full home-goals × away-goals probability grid for a pair of
+ * expected-goals figures. Extracted as its own step so BOTH the
+ * market-probability aggregation AND the exact-scoreline ranking below can
+ * be derived from the SAME grid instead of computing it twice per fixture.
  */
-function probabilitiesFromExpectedGoals(homeXG, awayXG) {
-  const grid = []; // grid[h][a] = P(home scores h AND away scores a)
+function buildGoalGrid(homeXG, awayXG) {
+  const grid = [];
   for (let h = 0; h <= MAX_GOALS_MODELED; h++) {
     grid.push([]);
     for (let a = 0; a <= MAX_GOALS_MODELED; a++) {
       grid[h].push(poissonPMF(h, homeXG) * poissonPMF(a, awayXG));
     }
   }
+  return grid;
+}
 
+/**
+ * Sums the full home-goals × away-goals probability grid into every market
+ * this model can speak to. Sums the full grid rather than any shortcut
+ * formula, so results stay exact for whatever MAX_GOALS_MODELED is set to.
+ */
+function marketProbabilitiesFromGrid(grid) {
   let homeWin = 0, awayWin = 0, draw = 0, bttsYes = 0;
   const overThreshold = { 1.5: 0, 2.5: 0, 3.5: 0 };
 
-  for (let h = 0; h <= MAX_GOALS_MODELED; h++) {
-    for (let a = 0; a <= MAX_GOALS_MODELED; a++) {
+  for (let h = 0; h < grid.length; h++) {
+    for (let a = 0; a < grid[h].length; a++) {
       const p = grid[h][a];
       if (h > a) homeWin += p;
       else if (a > h) awayWin += p;
@@ -190,31 +237,76 @@ function probabilitiesFromExpectedGoals(homeXG, awayXG) {
 }
 
 /**
+ * Turns a pair of expected-goals figures into real probabilities for every
+ * market this model can speak to. Kept as a public wrapper around
+ * buildGoalGrid + marketProbabilitiesFromGrid for backward compatibility
+ * with any existing caller that only wants market probabilities (not the
+ * scoreline ranking) from a raw (homeXG, awayXG) pair.
+ */
+function probabilitiesFromExpectedGoals(homeXG, awayXG) {
+  return marketProbabilitiesFromGrid(buildGoalGrid(homeXG, awayXG));
+}
+
+/**
+ * Ranks every cell in a goal grid by probability, highest first, and
+ * returns the top `limit` as exact scorelines — e.g.
+ * [{ home: 1, away: 0, probability: 0.14 }, ...]. This is the "predicted
+ * exact score" feature's own selection: the single highest-probability
+ * cell in the grid, not a market-level aggregate like Over/Under or Home
+ * Win (which each sum many cells together and are therefore much more
+ * likely to actually hit).
+ */
+function topScorelinesFromGrid(grid, limit = TOP_SCORELINES_RETURNED) {
+  const cells = [];
+  for (let h = 0; h < grid.length; h++) {
+    for (let a = 0; a < grid[h].length; a++) {
+      cells.push({ home: h, away: a, probability: grid[h][a] });
+    }
+  }
+  cells.sort((x, y) => y.probability - x.probability);
+  return cells.slice(0, limit);
+}
+
+/**
  * Main entry point. Returns either:
- *   { available: true, probabilities: {...}, homeXG, awayXG, sampleInfo }
+ *   { available: true, probabilities: {...}, topScoreline: {...}, topScorelines: [...], homeXG, awayXG, sampleInfo }
  *   { available: false, reason: '...' }
  *
  * `available: false` is the expected, normal outcome for most fixtures
- * early on — most teams simply won't have MIN_SAMPLE_MATCHES of graded
- * home/away history yet, and the backfill (scripts/backfill-team-history.mjs)
- * is deliberately gradual. Callers MUST treat that as "no second opinion
- * for this fixture," not as a signal to skip the fixture — the bookmaker
- * consensus in lib/markets.mjs remains fully sufficient on its own.
+ * early on — most teams simply won't have enough graded home/away history
+ * yet, and the backfill (scripts/backfill-team-history.mjs) is
+ * deliberately gradual. Callers MUST treat that as "no second opinion for
+ * this fixture" (or, for scripts/generate-score-predictions.mjs, "no
+ * exact-score prediction for this fixture today") — never fabricate a
+ * fallback guess. The bookmaker consensus in lib/markets.mjs remains fully
+ * sufficient on its own for ticket generation regardless.
  *
  * `homeTeamId`/`awayTeamId` MUST be API-Football's own numeric team IDs
  * (see f.teams.home.id / f.teams.away.id in a /fixtures response) — not
  * team names. If either is missing, this returns unavailable rather than
  * falling back to name matching.
+ *
+ * `minSampleMatches` (optional): overrides DEFAULT_MIN_SAMPLE_MATCHES for
+ * this call only — see the SELF-IMPROVEMENT note at the top of this file.
+ * `sampleInfo.homeTeamMatches`/`awayTeamMatches` in the returned object is
+ * always the REAL count the model found (regardless of which threshold
+ * was used to decide availability), so callers like scripts/generate-
+ * score-predictions.mjs can persist it for later, genuine backtesting of
+ * "what would a different threshold have done" — see
+ * scripts/self-tune-score-model.mjs.
  */
-export async function getOwnModelForFixture(supabase, { league, homeTeamId, awayTeamId, homeTeamName, awayTeamName }) {
+export async function getOwnModelForFixture(
+  supabase,
+  { league, homeTeamId, awayTeamId, homeTeamName, awayTeamName, minSampleMatches = DEFAULT_MIN_SAMPLE_MATCHES }
+) {
   if (!homeTeamId || !awayTeamId) {
     return { available: false, reason: 'Missing team ID for one or both sides — cannot look up history reliably.' };
   }
 
   const [homeProfile, awayProfile, baseline] = await Promise.all([
-    getTeamVenueProfile(supabase, homeTeamId, 'home'),
-    getTeamVenueProfile(supabase, awayTeamId, 'away'),
-    getLeagueBaseline(supabase, league),
+    getTeamVenueProfile(supabase, homeTeamId, 'home', minSampleMatches),
+    getTeamVenueProfile(supabase, awayTeamId, 'away', minSampleMatches),
+    getLeagueBaseline(supabase, league, minSampleMatches),
   ]);
 
   if (!homeProfile) {
@@ -238,11 +330,16 @@ export async function getOwnModelForFixture(supabase, { league, homeTeamId, away
   const homeXG = homeAttackStrength * awayDefenseStrength * baseline.avgHomeGoals;
   const awayXG = awayAttackStrength * homeDefenseStrength * baseline.avgAwayGoals;
 
-  const probabilities = probabilitiesFromExpectedGoals(homeXG, awayXG);
+  const grid = buildGoalGrid(homeXG, awayXG);
+  const probabilities = marketProbabilitiesFromGrid(grid);
+  const topScorelines = topScorelinesFromGrid(grid);
+  const topScoreline = topScorelines[0] ?? null;
 
   return {
     available: true,
     probabilities,
+    topScoreline,
+    topScorelines,
     homeXG: Math.round(homeXG * 100) / 100,
     awayXG: Math.round(awayXG * 100) / 100,
     sampleInfo: {
@@ -255,12 +352,32 @@ export async function getOwnModelForFixture(supabase, { league, homeTeamId, away
 }
 
 // ---------------------------------------------------------------------------
-// INTEGRATION NOTE — already wired into generate-tickets.mjs as a
-// cross-check (Option A: the own model can only flag a bookmaker-chosen
-// pick as too uncertain, never add confidence on its own — see
-// crossCheckWithOwnModel in generate-tickets.mjs). Once enough graded
-// history has accumulated, scripts/analyze-performance.mjs is the place to
-// check whether flagged fixtures actually correlated with real misses,
-// before considering the blended-confidence approach (Option B) described
-// in earlier notes.
+// INTEGRATION NOTES:
+//
+// 1. Cross-check (scripts/lib/modelCrossCheck.mjs), intended as a
+//    ticket-selection safety net (Option A: the own model can only flag a
+//    bookmaker-chosen pick as too uncertain, never add confidence on its
+//    own) — see the KNOWN VERIFICATION ITEM below.
+//
+// 2. Exact-score predictions (scripts/generate-score-predictions.mjs), the
+//    first caller to surface topScoreline/topScorelines directly to users
+//    rather than using this module purely as an internal cross-check.
+//    Deliberately broader coverage than ticket generation — every eligible
+//    fixture the model has enough history for, not just fixtures picked
+//    for a ticket — and deliberately skips fixtures where `available` is
+//    false rather than ever fabricating a scoreline guess. Its own
+//    minSampleMatches is read live from score_model_tuning_state and
+//    bounded-auto-tuned weekly by scripts/self-tune-score-model.mjs,
+//    completely independent of this file's DEFAULT_MIN_SAMPLE_MATCHES.
+//
+// KNOWN VERIFICATION ITEM (pre-existing, not touched by the exact-score
+// feature above): scripts/lib/modelCrossCheck.mjs imports a
+// `computeMatchProbabilities` export from this file, but this file only
+// ever exports `getOwnModelForFixture` and `DEFAULT_MIN_SAMPLE_MATCHES` —
+// no such export exists. modelCrossCheck.mjs's own header already flags
+// this as an unverified assumption. As written, anything that actually
+// imports modelCrossCheck.mjs would throw at load time. Left as-is here
+// since fixing it means deciding modelCrossCheck.mjs's real intended
+// shape, which is outside this feature's scope — flagging again so it
+// doesn't get lost.
 // ---------------------------------------------------------------------------
