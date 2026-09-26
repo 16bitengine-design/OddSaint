@@ -1,0 +1,34 @@
+name: Odd Saint — Score Prediction Accuracy Report
+
+# Once daily at 01:00 UTC — well after scripts/grade-tickets.mjs's
+# 3-hourly cycle has had many passes at reconciling the previous day's
+# fixtures. Reads yesterday's score_predictions, reports real hit-rate
+# statistics to this run's step summary, and logs one row to
+# score_prediction_daily_accuracy for trend tracking. REPORT ONLY except
+# for that one append — changes nothing else automatically. Can also be
+# triggered manually from the Actions tab.
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build score prediction accuracy report
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/analyze-score-predictions.mjs

@@ -1,0 +1,38 @@
+name: Odd Saint — Self-Tune Score Model (Bounded Auto-Adjust)
+
+# Weekly, Sunday 05:30 UTC — offset 30 min from the existing ticket
+# self-tune.yml's 05:00 UTC slot purely to avoid two jobs starting in the
+# same minute; they touch entirely separate tables, so this is hygiene,
+# not a real dependency. Can also be triggered manually from the Actions
+# tab.
+#
+# This job only ever writes to Supabase's score_model_tuning_state /
+# score_model_tuning_log tables (see scripts/self-tune-score-model.mjs and
+# supabase/migrations/006_score_prediction_tuning.sql) — it never touches
+# git, so it needs no `contents: write` permission and can never fail a
+# build or open a PR.
+on:
+  schedule:
+    - cron: '30 5 * * 0'
+  workflow_dispatch: {}
+
+jobs:
+  self-tune-score-model:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run bounded score-model auto-tuning
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/self-tune-score-model.mjs
