@@ -24,9 +24,6 @@ import {
   ANONYMOUS_TRIAL_DAYS,
   SIGNED_UP_TRIAL_DAYS,
   getTrialPolicy,
-  fetchScorePredictions,
-  scorePredictionsByFixtureId,
-  fetchScorePredictionAccuracyHistory,
   type Ticket,
   type Match,
   type MatchStatus,
@@ -36,8 +33,6 @@ import {
   type ArchiveAccess,
   type TrialPolicy,
   type AvailableFixture,
-  type ScorePrediction,
-  type ScorePredictionDayAccuracy,
 } from '@/lib/dataFetcher';
 import {
   submitFeedback,
@@ -47,7 +42,6 @@ import {
   type FeedbackRow,
 } from '@/lib/feedback';
 import { adminGrantAccess, type GrantableProduct } from '@/lib/adminGrant';
-import { ScorePredictionsSection, ScorePredictionAccuracyHistory } from './ScorePredictions';
 
 // ---------------------------------------------------------------------------
 // Color tokens — Odd Saint brand
@@ -230,13 +224,10 @@ function MatchRow({
   match,
   blurred,
   onSelect,
-  predictedScore,
 }: {
   match: Match;
   blurred: boolean;
   onSelect?: (match: Match) => void;
-  /** From scripts/generate-score-predictions.mjs via score_predictions — the model's single most likely final scoreline for this fixture, if one was generated today. Optional: most days most matches simply won't have one yet (see the honest-partial-coverage note in dataFetcher.ts's fetchScorePredictions). */
-  predictedScore?: { home: number; away: number };
 }) {
   return (
     <div
@@ -272,11 +263,6 @@ function MatchRow({
           <div style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 1 }}>
             {match.league} ({match.country}) · {match.market}
           </div>
-          {predictedScore && (
-            <div style={{ fontSize: 10, color: COLORS.textMuted, marginTop: 1, fontWeight: 600 }}>
-              Predicted score: {predictedScore.home}-{predictedScore.away}
-            </div>
-          )}
           {match.finalHomeScore !== undefined && match.finalAwayScore !== undefined ? (
             <div
               style={{
@@ -935,7 +921,6 @@ function TicketCard({
   onSignUp,
   onSelectMatch,
   onEditAsAdmin,
-  predictionByFixtureId,
 }: {
   ticket: Ticket;
   trialActive: boolean;
@@ -944,8 +929,6 @@ function TicketCard({
   onSignUp: () => void;
   onSelectMatch: (match: Match) => void;
   onEditAsAdmin: (ticket: Ticket) => void;
-  /** From src/app/page.tsx's Page component — scripts/generate-score-predictions.mjs's output keyed by fixture ID, so an unlocked match row can show its predicted scoreline alongside the odds. Optional — the ticket archive currently doesn't pass this (predictions are only generated for "today"), so past-day tickets simply show no predicted-score line, which is honest since none exists for that date. */
-  predictionByFixtureId?: Map<string, ScorePrediction>;
 }) {
   const [open, setOpen] = useState(false);
   const overallStatus = getTicketStatus(ticket);
@@ -1146,22 +1129,9 @@ function TicketCard({
             </div>
           ) : (
             <div>
-              {ticket.matches.map((m) => {
-                const prediction = predictionByFixtureId?.get(m.id);
-                return (
-                  <MatchRow
-                    key={m.id}
-                    match={m}
-                    blurred={false}
-                    onSelect={onSelectMatch}
-                    predictedScore={
-                      prediction
-                        ? { home: prediction.predictedHomeScore, away: prediction.predictedAwayScore }
-                        : undefined
-                    }
-                  />
-                );
-              })}
+              {ticket.matches.map((m) => (
+                <MatchRow key={m.id} match={m} blurred={false} onSelect={onSelectMatch} />
+              ))}
             </div>
           )}
         </div>
@@ -3091,10 +3061,12 @@ export default function Page() {
   const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
   const [showFeedbackAdmin, setShowFeedbackAdmin] = useState(false);
   const [showGrantAccess, setShowGrantAccess] = useState(false);
-  // Exact-score predictions feature (see scripts/generate-score-predictions.mjs,
-  // src/lib/dataFetcher.ts, src/app/ScorePredictions.tsx).
-  const [scorePredictions, setScorePredictions] = useState<ScorePrediction[]>([]);
-  const [scoreAccuracyHistory, setScoreAccuracyHistory] = useState<ScorePredictionDayAccuracy[]>([]);
+  // Which release batch (release_slot) tab the visitor currently has
+  // selected — null means "no explicit choice yet," in which case the
+  // most recently released batch is shown by default (see activeBatchSlot
+  // below). Separate tabs per batch, per product decision: batches are no
+  // longer merged into one continuous tier-grouped feed.
+  const [selectedBatchSlot, setSelectedBatchSlot] = useState<number | null>(null);
 
   const isAdmin = archiveAccess.level === 'admin';
 
@@ -3156,18 +3128,6 @@ export default function Page() {
         // eslint-disable-next-line no-console
         console.error('[Odd Saint] Failed to load trial policy, using defaults:', err);
       });
-    fetchScorePredictions()
-      .then(setScorePredictions)
-      .catch((err) => {
-        // eslint-disable-next-line no-console
-        console.error('[Odd Saint] Failed to load score predictions:', err);
-      });
-    fetchScorePredictionAccuracyHistory(14)
-      .then(setScoreAccuracyHistory)
-      .catch((err) => {
-        // eslint-disable-next-line no-console
-        console.error('[Odd Saint] Failed to load score prediction accuracy:', err);
-      });
   }, []);
 
   // Access model: every ticket is free once someone signs up, so the only
@@ -3184,9 +3144,6 @@ export default function Page() {
     () => getTrialDaysRemaining(anonTrialStart, trialPolicy.anonymousDays),
     [anonTrialStart, trialPolicy]
   );
-  // O(1) lookup from a ticket's fixture ID to that day's score prediction —
-  // see MatchRow's predictedScore prop / TicketCard's predictionByFixtureId prop.
-  const predictionByFixtureId = useMemo(() => scorePredictionsByFixtureId(scorePredictions), [scorePredictions]);
 
   // Dormant — no paid tier is currently linked from anywhere in the UI
   // (every ticket is free after sign-up for now), but PricingModal,
@@ -3196,6 +3153,45 @@ export default function Page() {
     setPricingProduct(ticket?.tier === 'saints_lock' ? 'saints_lock' : 'subscription');
     setShowPricing(true);
   }
+
+  // ---------------------------------------------------------------------
+  // Batch grouping — group today's accessible tickets by release_slot so
+  // each release batch (e.g. the morning drop vs the afternoon drop) shows
+  // as its own separate tab/view rather than being merged into one
+  // continuous tier-grouped feed. Each batch is internally still ordered
+  // tier-first via TIER_CONFIG (same ordering fetchRealTicketsForDate
+  // already applies to `tickets`), since grouping happens on top of that
+  // existing order, not by re-sorting. Declared here (before the loading
+  // early-return below) since these are hooks — calling them after a
+  // conditional return would violate the Rules of Hooks.
+  // ---------------------------------------------------------------------
+  const batches = useMemo(() => {
+    const bySlot = new Map<number, Ticket[]>();
+    tickets.forEach((t) => {
+      const slot = t.releaseSlot ?? 0;
+      if (!bySlot.has(slot)) bySlot.set(slot, []);
+      bySlot.get(slot)!.push(t);
+    });
+    return Array.from(bySlot.entries()).sort(([a], [b]) => a - b);
+  }, [tickets]);
+
+  // Default to the most recently released batch (highest slot number)
+  // rather than always slot 0, so a first-time visitor sees the freshest
+  // tickets by default; falls back to the first available batch if the
+  // previously selected slot no longer exists in today's data (e.g. after
+  // midnight rollover or an admin edit).
+  const activeBatchSlot = useMemo(() => {
+    if (batches.length === 0) return null;
+    if (selectedBatchSlot !== null && batches.some(([slot]) => slot === selectedBatchSlot)) {
+      return selectedBatchSlot;
+    }
+    return batches[batches.length - 1][0];
+  }, [batches, selectedBatchSlot]);
+
+  const activeBatchTickets = useMemo(
+    () => batches.find(([slot]) => slot === activeBatchSlot)?.[1] ?? [],
+    [batches, activeBatchSlot]
+  );
 
   if (loading) {
     return (
@@ -3218,10 +3214,14 @@ export default function Page() {
   }
 
   // Interleave a single in-feed ad slot right after the Bronze slips end
-  // and before Gold begins.
+  // and before Gold begins — scoped to the ACTIVE batch only now, since
+  // each batch tab renders its own independent feed. `batches`,
+  // `activeBatchSlot`, and `activeBatchTickets` are computed above (before
+  // the early return) since they're hooks; this block is plain
+  // object-building, safe to run only on the loaded render.
   const feedItems: Array<{ kind: 'ticket'; ticket: Ticket } | { kind: 'ad' }> = [];
-  const lastBronzeIndex = tickets.map((t) => t.tier).lastIndexOf('bronze');
-  tickets.forEach((t, idx) => {
+  const lastBronzeIndex = activeBatchTickets.map((t) => t.tier).lastIndexOf('bronze');
+  activeBatchTickets.forEach((t, idx) => {
     feedItems.push({ kind: 'ticket', ticket: t });
     if (idx === lastBronzeIndex && lastBronzeIndex !== -1) feedItems.push({ kind: 'ad' });
   });
@@ -3369,7 +3369,6 @@ export default function Page() {
         />
 
         {showHistory && <PerformanceHistory history={history} />}
-        {showHistory && <ScorePredictionAccuracyHistory history={scoreAccuracyHistory} />}
 
         {/* Trial banner */}
         <div
@@ -3427,14 +3426,50 @@ export default function Page() {
           </div>
         )}
 
-        {/* Exact-score predictions — daily, broader-than-tickets list (see
-            scripts/generate-score-predictions.mjs). Same access gating as a
-            standard ticket tier: admin / signed-in / trial active. */}
-        <ScorePredictionsSection
-          predictions={scorePredictions}
-          unlocked={isAdmin || !!userEmail || trialActive}
-          onSignUp={() => setShowLoginModal(true)}
-        />
+        {/* Batch tabs — one tab per release_slot released so far today (or
+            for whatever day fetchLatestTickets fell back to). Hidden when
+            there's only one batch, since a single-tab bar adds nothing.
+            Each tab's own label uses that batch's first ticket's
+            availableAt — same formatReleaseTime helper already used on
+            each TicketCard's "Released HH:MM" badge, so the tab label and
+            the per-card badge always agree. */}
+        {batches.length > 1 && (
+          <div
+            style={{
+              display: 'flex',
+              gap: 6,
+              marginBottom: 14,
+              overflowX: 'auto',
+              WebkitOverflowScrolling: 'touch',
+            }}
+          >
+            {batches.map(([slot, slotTickets]) => {
+              const active = slot === activeBatchSlot;
+              const releasedAt = slotTickets[0]?.availableAt;
+              return (
+                <button
+                  key={slot}
+                  onClick={() => setSelectedBatchSlot(slot)}
+                  style={{
+                    flexShrink: 0,
+                    fontFamily: FONT_BODY,
+                    fontSize: 12,
+                    fontWeight: 700,
+                    padding: '7px 14px',
+                    borderRadius: 999,
+                    border: active ? 'none' : `1px solid ${COLORS.border}`,
+                    background: active ? COLORS.emerald : 'transparent',
+                    color: active ? '#ffffff' : COLORS.textMuted,
+                    cursor: 'pointer',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {releasedAt ? `Batch · ${formatReleaseTime(releasedAt)}` : `Batch ${slot + 1}`}
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         {/* Ticket feed with in-feed ad injection */}
         {feedItems.map((item, idx) =>
@@ -3452,7 +3487,6 @@ export default function Page() {
               onSignUp={() => setShowLoginModal(true)}
               onSelectMatch={setSelectedMatch}
               onEditAsAdmin={setEditingTicket}
-              predictionByFixtureId={predictionByFixtureId}
             />
           )
         )}
