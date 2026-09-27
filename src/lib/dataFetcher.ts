@@ -201,23 +201,34 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
     const links = [...(row.ticket_matches ?? [])].sort(
       (a: any, b: any) => a.sort_order - b.sort_order
     );
-    const matches: Match[] = links.map((link: any) => {
-      const f = link.fixtures;
-      return {
-        id: String(f.id),
-        league: f.league,
-        country: f.country,
-        homeTeam: f.home_team,
-        awayTeam: f.away_team,
-        market: f.market,
-        odds: f.odds,
-        kickoff: f.kickoff,
-        status: f.result_status as MatchStatus,
-        confidence: f.confidence,
-        finalHomeScore: f.final_home_score ?? undefined,
-        finalAwayScore: f.final_away_score ?? undefined,
-      };
-    });
+    // Defensive: Supabase/PostgREST can return a to-one relationship join
+    // (ticket_matches -> fixtures) shaped as either a single object or a
+    // one-element array, depending on how the foreign key is detected —
+    // see the same Array.isArray guard already used in
+    // recomputeTicketTotals below for this identical join shape. Links
+    // with no resolvable fixture are dropped rather than producing a
+    // match with undefined fields.
+    const matches: Match[] = links
+      .map((link: any) => {
+        const f = Array.isArray(link.fixtures) ? link.fixtures[0] : link.fixtures;
+        if (!f) return null;
+        const match: Match = {
+          id: String(f.id),
+          league: f.league,
+          country: f.country,
+          homeTeam: f.home_team,
+          awayTeam: f.away_team,
+          market: f.market,
+          odds: f.odds,
+          kickoff: f.kickoff,
+          status: f.result_status as MatchStatus,
+          confidence: f.confidence,
+          finalHomeScore: f.final_home_score ?? undefined,
+          finalAwayScore: f.final_away_score ?? undefined,
+        };
+        return match;
+      })
+      .filter((m): m is Match => m !== null);
 
     return {
       id: row.id,
@@ -644,8 +655,16 @@ async function fetchRealHistoryRange(days: number): Promise<Map<string, DayPerfo
     byDate.get(key)!.push(row);
   });
 
+  // Same defensive guard as fetchRealTicketsForDate above and
+  // recomputeTicketTotals below — the ticket_matches -> fixtures join can
+  // come back as a one-element array rather than a plain object.
   const statusesOfRow = (row: any): MatchStatus[] =>
-    (row.ticket_matches ?? []).map((tm: any) => tm.fixtures?.result_status).filter(Boolean);
+    (row.ticket_matches ?? [])
+      .map((tm: any) => {
+        const f = Array.isArray(tm.fixtures) ? tm.fixtures[0] : tm.fixtures;
+        return f?.result_status;
+      })
+      .filter(Boolean);
 
   byDate.forEach((rows, day) => {
     const byTier: Partial<Record<TicketTier, TierStats>> = {};
