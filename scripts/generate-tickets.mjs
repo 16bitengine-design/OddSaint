@@ -750,15 +750,22 @@ const SAINTS_LOCK_MIN_CONFIDENCE = 85;
  * outright-win fixture just to satisfy a market-type preference would
  * directly contradict that.
  *
- * POLICY UPDATE — guarantee applies per BATCH now, not once per day: if
- * nothing clears the strict 85% bar for a given slot, relax to the single
- * best-available fixture in the odds range rather than shipping zero for
- * that batch, so every released batch shows a Saint's Lock ticket. This
- * is a deliberate change from the original "min 1, max 2/day" design (see
- * CLAUDE.md §8) toward "exactly one per batch, always," to match the
- * per-batch tab UI. A batch can still ship zero if dailyPool has no
- * fixture at all in the 1.5–2.4 odds band for that run — this guarantee
- * cannot manufacture a pick from nothing.
+ * POLICY UPDATE — HARD per-batch guarantee: every released batch gets a
+ * Saint's Lock ticket. Two fallback tiers apply in order if the strict
+ * 85% confidence bar isn't cleared:
+ *   1. Best-available fixture still within the 1.5–2.4 odds band
+ *      (any confidence).
+ *   2. If the odds band itself has nothing usable today, best-available
+ *      fixture ANYWHERE in the day's priced pool, regardless of odds band
+ *      (see usedOutOfBand below) — the ticket's odds_range then shows the
+ *      pick's own actual odds rather than the "1.5-2.4" label, since that
+ *      label would otherwise be actively wrong.
+ * This is a deliberate reversal of Saint's Lock's original "min 1, max
+ * 2/day, quality-over-quantity most strictly of all" design (see CLAUDE.md
+ * §8 in "CLAUDE.md — Batch & Range Revision.md") toward "one per batch,
+ * always" — a batch only ships zero Saint's Lock tickets if the ENTIRE
+ * day's priced pool has nothing usable left, in which case every other
+ * tier also failed to assemble a slip that run.
  */
 function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
   const config = TIER_CONFIG.find((c) => c.tier === 'saints_lock');
@@ -773,10 +780,10 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
     .filter((p) => inOddsRange(p) && p.confidence >= SAINTS_LOCK_MIN_CONFIDENCE)
     .sort((a, b) => b.confidence - a.confidence);
 
-  // Per-batch guarantee: if nothing clears the strict 85% bar for THIS
-  // slot, relax to the single best-available fixture in the odds range
-  // rather than shipping zero for this batch. Applies to every slot now
-  // (previously only slot 0) — see the POLICY UPDATE note above.
+  // TIER 1 fallback — per-batch guarantee: if nothing clears the strict
+  // 85% bar for THIS slot, relax to the single best-available fixture in
+  // the odds range rather than shipping zero for this batch. Applies to
+  // every slot (see the POLICY UPDATE note above).
   let usedFallback = false;
   if (qualifying.length === 0) {
     const fallback = dailyPool.filter(inOddsRange).sort((a, b) => b.confidence - a.confidence);
@@ -791,6 +798,38 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
     }
   }
 
+  // TIER 2 fallback — HARD GUARANTEE: if the 1.5–2.4 odds band has no
+  // usable fixture at all today (not just none above 85%), widen to the
+  // single best-confidence fixture anywhere in the day's priced pool,
+  // regardless of odds band, rather than skip this batch's Saint's Lock
+  // ticket. This is a deliberate, explicit reversal of Saint's Lock's
+  // odds-band restriction for the rare case the band is completely empty
+  // — product requirement is "every released batch has a Saint's Lock
+  // ticket," with no exception for a thin day, short of the pool having
+  // literally zero usable fixtures at all (in which case every other tier
+  // fails to assemble that run too — see main()'s "No tickets could be
+  // assembled" log).
+  let usedOutOfBand = false;
+  if (qualifying.length === 0) {
+    const usableAnywhere = (p) => (usageCount.get(p.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY;
+    const lastResort = dailyPool.filter(usableAnywhere).sort((a, b) => b.confidence - a.confidence);
+    if (lastResort.length > 0) {
+      qualifying = [lastResort[0]];
+      usedOutOfBand = true;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `Saint's Lock (slot ${slot}): no fixture at all in the ${minOdds}-${maxOdds} odds band today — ` +
+          `widening to best available anywhere in the pool (odds ${lastResort[0].odds}, ` +
+          `confidence ${lastResort[0].confidence}%) to guarantee one ticket per released batch. ` +
+          `This pick falls OUTSIDE Saint's Lock's normal odds range — flag for review if this recurs often.`
+      );
+    }
+  }
+
+  // True impossibility only: the entire day's priced pool has nothing
+  // usable left (every fixture already at MAX_FIXTURE_APPEARANCES_PER_DAY,
+  // or dailyPool itself is empty). If this happens, every other tier also
+  // failed to assemble a slip this run.
   if (qualifying.length === 0) return { tickets: [], ticketMatches: [], fixturesUsed: [] };
 
   const pick = qualifying[0];
@@ -806,7 +845,12 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
       tier: 'saints_lock',
       slip_label: null, // Saint's Lock is marketed as one pick at a time, not "1 of 2" — see frontend countdown banner
       match_count: 1,
-      odds_range: config.oddsRange,
+      // Deliberately NOT config.oddsRange when usedOutOfBand — showing
+      // "1.5-2.4" next to an actual price outside that band would be a
+      // real display inconsistency, the same class of bug just fixed for
+      // every other tier's TOLERANCE. A single-match ticket's own price
+      // IS its true range, so fall back to that string in this case.
+      odds_range: usedOutOfBand ? `${pick.odds}` : config.oddsRange,
       total_odds: pick.odds,
       is_free: false,
       release_slot: slot,
@@ -815,7 +859,7 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
   ];
   const ticketMatches = [{ ticket_id: ticketId, fixture_id: pick.fixtureId, sort_order: 0 }];
 
-  return { tickets, ticketMatches, fixturesUsed: [pick], usedFallback };
+  return { tickets, ticketMatches, fixturesUsed: [pick], usedFallback, usedOutOfBand };
 }
 
 function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, now) {
