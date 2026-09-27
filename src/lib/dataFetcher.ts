@@ -907,3 +907,50 @@ export async function getArchiveAccess(userId: string | null): Promise<ArchiveAc
     return { level: 'none' };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Score predictions — RESTORED TYPE-ONLY STUBS (build-fix, incomplete)
+// ---------------------------------------------------------------------------
+// src/app/ScorePredictions.tsx imports these two types but every actual
+// data-fetching function that used to populate them (e.g. whatever pulled
+// from a `score_predictions` table / `score_prediction_daily_accuracy`
+// view — see the comments in ScorePredictions.tsx referencing
+// scripts/generate-score-predictions.mjs, scripts/analyze-score-
+// predictions.mjs, and supabase/migrations/006_score_prediction_tuning.sql)
+// was NOT present in the source content this file was rewritten from, and
+// is NOT reconstructed here — inventing a table/column shape would risk
+// silently querying the wrong thing rather than surfacing a clear error.
+//
+// These two shapes are restored ONLY because every field on them is
+// directly, unambiguously readable from ScorePredictions.tsx's own usage
+// (prediction.homeTeam, prediction.status, day.hitRatePct, etc.) — this
+// is reading the real consumer contract, not guessing. This restores the
+// TypeScript build (ScorePredictions.tsx is type-checked by Next.js even
+// though nothing currently imports/renders the component from page.tsx),
+// but the feature itself is NOT wired back up:
+//   - No function here actually returns ScorePrediction[] or
+//     ScorePredictionDayAccuracy[] from Supabase.
+//   - page.tsx does not import or render ScorePredictionsSection /
+//     ScorePredictionAccuracyHistory at all right now.
+// Provide the original fetcher implementation (or the real table/view
+// schema) to restore this properly instead of leaving it dead code.
+export interface ScorePrediction {
+  fixtureId: string;
+  homeTeam: string;
+  awayTeam: string;
+  league: string;
+  country: string;
+  kickoff: string; // ISO date string
+  status: 'pending' | 'correct' | 'incorrect';
+  predictedHomeScore: number;
+  predictedAwayScore: number;
+}
+
+export interface ScorePredictionDayAccuracy {
+  date: string; // 'YYYY-MM-DD'
+  correct: number;
+  incorrect: number;
+  stillPending: number;
+  /** Correct ÷ (correct + incorrect) as a whole-number percent, or null if nothing decided yet. */
+  hitRatePct: number | null;
+}
