@@ -6,7 +6,10 @@ the initial launch + payment/feedback/self-improvement/audit batches.
 ("TIER CONFIG SYNC") and the "min 1, max 2/day" Saint's Lock guarantee
 language in the original §8 — those sections' underlying database schema
 and file locations are still accurate, only the specific numbers/policy
-described in them have changed. Do not follow the old figures.**
+described in them have changed. Do not follow the old figures. Note also
+that the Saint's Lock guarantee below was itself revised once further
+within this same document (see the "HARD GUARANTEE" heading) — follow
+that version, not an earlier draft of this same addendum.**
 
 ---
 
@@ -77,33 +80,63 @@ tolerance — monitor before loosening further.
 
 ---
 
-## UPDATED — 8. SAINT'S LOCK: GUARANTEE NOW PER-BATCH, NOT PER-DAY
+## UPDATED — 8. SAINT'S LOCK: HARD GUARANTEE, ONE TICKET PER BATCH, NO EXCEPTIONS
 
 **This supersedes the "Min 1, max 2 per day" guarantee described in the
-original §8.** `buildSaintsLockTickets()`'s fallback-to-best-available
-logic previously only fired for slot 0 (`if (qualifying.length === 0 &&
-slot === 0)`) — if nothing cleared the 85% confidence bar
-(`SAINTS_LOCK_MIN_CONFIDENCE`) by the time the afternoon run fired, that
-batch's Saint's Lock ticket was simply skipped.
+original §8, and also supersedes the first revision of this section
+(the "per-batch, but can still ship zero if the odds band is empty"
+version).** `buildSaintsLockTickets()`'s fallback-to-best-available logic
+went through two changes in this revision:
 
-**New policy: every released batch gets a Saint's Lock ticket**, not just
-the first one of the day. The `slot === 0` gate was removed — the
-fallback (relax to the single best-available fixture in the 1.5–2.4 odds
-band, regardless of confidence) now applies to every slot.
+1. First fix: the fallback's `slot === 0` gate was removed, so a batch no
+   longer needed to be the FIRST of the day to get a relaxed-confidence
+   fallback pick.
+2. Second fix (this one): a batch could still ship **zero** Saint's Lock
+   tickets if the 1.5–2.4 odds band had no usable fixture at all that run
+   — not just none above 85% confidence, literally none in that price
+   range. Product requirement is now stronger: **every released batch has
+   a Saint's Lock ticket, full stop**, so a second fallback tier was added.
 
-**Known trade-off, deliberately accepted, not fixed:** this is a real
-reversal of Saint's Lock's original "next to impossible to get wrong,
-quality over quantity most strictly of all" design principle. A second
-batch on a day with a weak fixture pool can now ship a Saint's Lock pick
-meaningfully below 85% confidence, under the same "ultra-high-confidence"
-branding as a batch that did clear the bar. A true zero-ticket case still
-exists — if the odds-range pool for that batch has literally no fixture
-at all (not just none above 85%), the ticket is still skipped; this
-guarantee cannot manufacture a pick from nothing.
+**Current behavior — two fallback tiers, applied in order:**
 
-If a middle-ground floor (e.g. never fall below 75%, skip the batch
-rather than go lower) is wanted later, that's a follow-up change to the
-fallback condition in `buildSaintsLockTickets()`, not implemented here.
+1. **Best available within the 1.5–2.4 odds band**, any confidence, if
+   nothing clears the 85% bar (`SAINTS_LOCK_MIN_CONFIDENCE`).
+2. **Best available ANYWHERE in the day's priced pool**, regardless of
+   odds band, if the band itself has nothing usable that run. When this
+   tier fires, the written ticket's `odds_range` field is set to the
+   pick's own actual odds (e.g. `"4.2"`) rather than the tier's normal
+   `"1.5-2.4"` label — showing that label next to a price outside the
+   band would be a real display inconsistency, the same class of issue
+   already fixed for the tolerance/odds-range work elsewhere in this
+   revision.
+
+A batch now ships zero Saint's Lock tickets **only** if the entire day's
+priced fixture pool has nothing usable left at all (every fixture already
+at `MAX_FIXTURE_APPEARANCES_PER_DAY`, or nothing was priced that run) — in
+which case every other tier also fails to assemble a slip that run; this
+is no longer a Saint's Lock-specific gap.
+
+**Known trade-off, deliberately accepted, not fixed:** this is a real,
+and now stronger, reversal of Saint's Lock's original "next to impossible
+to get wrong, quality over quantity most strictly of all" design
+principle. A Saint's Lock ticket can now carry odds meaningfully outside
+its normal 1.5–2.4 range and/or confidence well below 85%, under the same
+"ultra-high-confidence" branding as a normal pick. No confidence floor
+was added to the second fallback tier — it takes the single best-available
+fixture however low its confidence actually is, since "every batch has a
+ticket, no exceptions" was the explicit requirement.
+
+**Operational signal to watch:** both fallback tiers log a `console.warn`
+in the GitHub Actions run output; tier 2 specifically flags itself as
+worth reviewing if it recurs often. Frequent tier-2 warnings are a signal
+that the 1.5–2.4 odds band itself may be too narrow for the actual daily
+fixture pool — check `scripts/analyze-performance.mjs`'s output rather
+than just accepting the fallback as permanent behavior.
+
+If a middle-ground floor (e.g. never fall below 60% confidence even in
+tier 2, skip the batch instead of going lower) is wanted later, that's a
+follow-up change to the fallback conditions in `buildSaintsLockTickets()`,
+not implemented here.
 
 ---
 
@@ -159,8 +192,12 @@ early return, where it belongs.
   weekly_titan/weekender), `TOLERANCE` (30% → 8%, both call sites),
   `pickFixturesForSlip()` (new `minMatchCount` param + min-leg top-up
   pass), `buildTickets()` (passes `config.minMatchCount` through),
-  `buildSaintsLockTickets()` (fallback gate now applies to every slot,
-  not just slot 0)
+  `buildSaintsLockTickets()` — patched twice in this revision: first to
+  remove the slot-0-only gate on the confidence-relaxed fallback, then to
+  add a second, odds-band-widening fallback tier so a batch's Saint's
+  Lock ticket is guaranteed even when the 1.5–2.4 band is completely
+  empty that run (see the updated §8 above for both tiers' exact
+  behavior)
 - `src/lib/dataFetcher.ts` — `TIER_CONFIG` synced to match (ceiling
   values + odds-range display strings)
 - `src/app/page.tsx` — release-batch tabs (`batches`/`activeBatchSlot`/
