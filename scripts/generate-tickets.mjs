@@ -732,15 +732,34 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange, minMa
 // most strictly of all.
 const SAINTS_LOCK_MIN_CONFIDENCE = 85;
 
+// Product rule: Saint's Lock only ever picks a straight win (Home/Away) or
+// Over 2.5 Goals — never BTTS, Double Chance, Under, or Over 1.5/3.5, even
+// as a fallback. Reuses FULL_WIN_MARKETS (already shared with
+// ensureFullWinLeg) rather than duplicating the 'Home Win'/'Away Win'
+// strings a second time.
+//
+// KNOWN LIMITATION: dailyPool holds only ONE market per fixture — whichever
+// pickMarketFromOdds() judged safest overall for that fixture, shared
+// across every tier. Filtering by market here means Saint's Lock can only
+// draw from fixtures whose OVERALL safest market already happened to be
+// one of these three — not every fixture that has a good Over 2.5 or
+// straight-win price specifically. This can shrink Saint's Lock's
+// effective pool and make the fallback tiers below fire more often. A
+// fuller fix (a dedicated per-fixture market lookup for Saint's Lock,
+// independent of the shared pool's single recorded market) would remove
+// this limitation but is a larger change — not implemented here.
+const SAINTS_LOCK_ALLOWED_MARKETS = new Set([...FULL_WIN_MARKETS, 'Over 2.5 Goals']);
+
 /**
  * Dedicated selection for Saint's Lock — unlike every other tier (which
  * uses pickFixturesForSlip's least-used/safest-first logic), this picks
  * strictly the highest-confidence qualifying fixtures in the whole day's
- * pool, filtered to the 1.5–2.0 odds band and the much higher confidence
- * floor above. Respects the same staggered-release slot logic as every
- * other tier (see nextSlotFor) — at most one new Saint's Lock ticket is
- * produced per run, honoring the min-1/max-2-per-day guarantee across the
- * day's two scheduled runs rather than both at once.
+ * pool, filtered to the 1.5–2.0 odds band, SAINTS_LOCK_ALLOWED_MARKETS,
+ * and the much higher confidence floor above. Respects the same
+ * staggered-release slot logic as every other tier (see nextSlotFor) — at
+ * most one new Saint's Lock ticket is produced per run, honoring the
+ * min-1/max-2-per-day guarantee across the day's two scheduled runs
+ * rather than both at once.
  *
  * NOTE: the "always incorporate a full win where necessary" guarantee
  * (see ensureFullWinLeg, used by the generic per-tier loop below)
@@ -760,20 +779,23 @@ const SAINTS_LOCK_MIN_CONFIDENCE = 85;
  *      (see usedOutOfBand below) — the ticket's odds_range then shows the
  *      pick's own actual odds rather than the "1.5-2.4" label, since that
  *      label would otherwise be actively wrong.
- * This is a deliberate reversal of Saint's Lock's original "min 1, max
- * 2/day, quality-over-quantity most strictly of all" design (see CLAUDE.md
- * §8 in "CLAUDE.md — Batch & Range Revision.md") toward "one per batch,
- * always" — a batch only ships zero Saint's Lock tickets if the ENTIRE
- * day's priced pool has nothing usable left, in which case every other
- * tier also failed to assemble a slip that run.
+ * BOTH fallback tiers still only draw from SAINTS_LOCK_ALLOWED_MARKETS —
+ * the market restriction is never relaxed, even as a last resort. A batch
+ * only ships zero Saint's Lock tickets if the ENTIRE day's priced pool has
+ * nothing usable in an allowed market at all, in which case (given the
+ * KNOWN LIMITATION above) other tiers may still succeed even when Saint's
+ * Lock cannot — that asymmetry is new as of this market restriction; it
+ * was not true before, when Saint's Lock could fall back to any market.
  */
 function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
   const config = TIER_CONFIG.find((c) => c.tier === 'saints_lock');
   const [minOdds, maxOdds] = TIER_ODDS_TARGET.saints_lock;
 
+  const isAllowedMarket = (p) => SAINTS_LOCK_ALLOWED_MARKETS.has(p.market);
+
   const inOddsRange = (p) => {
     const used = usageCount.get(p.fixtureId) ?? 0;
-    return used < MAX_FIXTURE_APPEARANCES_PER_DAY && p.odds >= minOdds && p.odds <= maxOdds;
+    return used < MAX_FIXTURE_APPEARANCES_PER_DAY && p.odds >= minOdds && p.odds <= maxOdds && isAllowedMarket(p);
   };
 
   let qualifying = dailyPool
@@ -782,8 +804,9 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
 
   // TIER 1 fallback — per-batch guarantee: if nothing clears the strict
   // 85% bar for THIS slot, relax to the single best-available fixture in
-  // the odds range rather than shipping zero for this batch. Applies to
-  // every slot (see the POLICY UPDATE note above).
+  // the odds range (still market-restricted) rather than shipping zero
+  // for this batch. Applies to every slot (see the POLICY UPDATE note
+  // above).
   let usedFallback = false;
   if (qualifying.length === 0) {
     const fallback = dailyPool.filter(inOddsRange).sort((a, b) => b.confidence - a.confidence);
@@ -802,34 +825,36 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
   // usable fixture at all today (not just none above 85%), widen to the
   // single best-confidence fixture anywhere in the day's priced pool,
   // regardless of odds band, rather than skip this batch's Saint's Lock
-  // ticket. This is a deliberate, explicit reversal of Saint's Lock's
-  // odds-band restriction for the rare case the band is completely empty
-  // — product requirement is "every released batch has a Saint's Lock
-  // ticket," with no exception for a thin day, short of the pool having
-  // literally zero usable fixtures at all (in which case every other tier
-  // fails to assemble that run too — see main()'s "No tickets could be
-  // assembled" log).
+  // ticket. STILL restricted to SAINTS_LOCK_ALLOWED_MARKETS — the market
+  // rule is never relaxed, only the odds band is. Product requirement is
+  // "every released batch has a Saint's Lock ticket," with no exception
+  // for a thin day, short of the pool having literally zero usable
+  // straight-win/Over-2.5 fixtures at all.
   let usedOutOfBand = false;
   if (qualifying.length === 0) {
-    const usableAnywhere = (p) => (usageCount.get(p.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY;
+    const usableAnywhere = (p) =>
+      (usageCount.get(p.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY && isAllowedMarket(p);
     const lastResort = dailyPool.filter(usableAnywhere).sort((a, b) => b.confidence - a.confidence);
     if (lastResort.length > 0) {
       qualifying = [lastResort[0]];
       usedOutOfBand = true;
       // eslint-disable-next-line no-console
       console.warn(
-        `Saint's Lock (slot ${slot}): no fixture at all in the ${minOdds}-${maxOdds} odds band today — ` +
-          `widening to best available anywhere in the pool (odds ${lastResort[0].odds}, ` +
-          `confidence ${lastResort[0].confidence}%) to guarantee one ticket per released batch. ` +
-          `This pick falls OUTSIDE Saint's Lock's normal odds range — flag for review if this recurs often.`
+        `Saint's Lock (slot ${slot}): no fixture in an allowed market (Home Win/Away Win/Over 2.5 Goals) ` +
+          `within the ${minOdds}-${maxOdds} odds band today — widening to best available anywhere in the ` +
+          `pool (odds ${lastResort[0].odds}, confidence ${lastResort[0].confidence}%, market ${lastResort[0].market}) ` +
+          `to guarantee one ticket per released batch. This pick falls OUTSIDE Saint's Lock's normal odds ` +
+          `range — flag for review if this recurs often.`
       );
     }
   }
 
   // True impossibility only: the entire day's priced pool has nothing
-  // usable left (every fixture already at MAX_FIXTURE_APPEARANCES_PER_DAY,
-  // or dailyPool itself is empty). If this happens, every other tier also
-  // failed to assemble a slip this run.
+  // usable left in an allowed market (every such fixture already at
+  // MAX_FIXTURE_APPEARANCES_PER_DAY, or none were ever priced with a
+  // Home Win/Away Win/Over 2.5 Goals market today — see the KNOWN
+  // LIMITATION note above for why that can happen even on a day other
+  // tiers succeed).
   if (qualifying.length === 0) return { tickets: [], ticketMatches: [], fixturesUsed: [] };
 
   const pick = qualifying[0];
