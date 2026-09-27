@@ -73,24 +73,26 @@ export interface TierConfig {
 
 // Tier definitions per the product spec.
 //
-// Platinum/Diamond/Weekly Lite/Weekly Titan match counts are each ONE
-// FEWER than their "standard" size (10/15/20/30) — a deliberate reduction
-// to raise real-world win probability by cutting one compounding leg of
-// bookmaker margin per ticket. MUST stay in sync with TIER_CONFIG in
-// scripts/generate-tickets.mjs — the two representations had drifted out
-// of sync before this fix (dataFetcher.ts still showed the old 10/15/20/30
-// figures while the real pipeline had already moved to 9/14/19/29).
+// UPDATED (batch/range revision): each tier's real min-max match-count
+// range and odds-target band now live in scripts/generate-tickets.mjs's
+// TIER_CONFIG/TIER_ODDS_TARGET — this frontend copy MUST stay in sync
+// with that file (the two representations drifted out of sync once
+// before; see git history). `matchCount` here is the display ceiling —
+// a given real ticket's actual leg count (`match_count` on the DB row,
+// surfaced as Ticket.matchCount) can be anywhere from the tier's real
+// minimum up to this ceiling and is read from Supabase per-ticket, not
+// derived from this constant.
 export const TIER_CONFIG: TierConfig[] = [
-  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
-  { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
-  { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
-  { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
-  { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
-  { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
-  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
-  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
-  { tier: 'weekender', label: 'Weekender', matchCount: 35, oddsRange: 'Mixed', alwaysFree: false },
-  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2', alwaysFree: false },
+  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 3, oddsRange: '1.5-3', alwaysFree: true },
+  { tier: 'bronze', label: 'Bronze', matchCount: 5, oddsRange: '3-7', alwaysFree: false },
+  { tier: 'silver', label: 'Silver', matchCount: 7, oddsRange: '7-12', alwaysFree: false },
+  { tier: 'gold', label: 'Gold', matchCount: 9, oddsRange: '20-30', alwaysFree: false },
+  { tier: 'platinum', label: 'Platinum', matchCount: 11, oddsRange: '70-300', alwaysFree: false },
+  { tier: 'diamond', label: 'Diamond', matchCount: 13, oddsRange: '300-2500', alwaysFree: false },
+  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 15, oddsRange: '2500-10000', alwaysFree: false },
+  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 17, oddsRange: '10000+', alwaysFree: false },
+  { tier: 'weekender', label: 'Weekender', matchCount: 25, oddsRange: '12000+', alwaysFree: false },
+  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2.4', alwaysFree: false },
 ];
 
 /**
@@ -780,152 +782,6 @@ export async function fetchTeamHistory(teamName: string, limit: number = 10): Pr
 /** A plain web-search URL for a team — the "external search" fallback, since a live news API needs a backend to hold its key safely (this app has none). */
 export function webSearchUrlForTeam(teamName: string): string {
   return `https://www.google.com/search?q=${encodeURIComponent(`${teamName} football news`)}`;
-}
-
-// ---------------------------------------------------------------------------
-// Exact-score predictions
-// ---------------------------------------------------------------------------
-// Reads scripts/generate-score-predictions.mjs's output (see
-// supabase/migrations/005_score_predictions.sql) — a daily, BROADER-than-
-// tickets list: every eligible fixture the team model (scripts/lib/
-// teamModel.mjs, Poisson expected-goals) had enough history to score, not
-// just fixtures picked for a ticket. Coverage is necessarily partial —
-// only fixtures the model had MIN_SAMPLE_MATCHES of graded team history
-// for get a row at all; that's an honest limitation, not a bug, and grows
-// as scripts/backfill-team-history.mjs accumulates more history over time.
-//
-// ACCESS GATING for this feature is a frontend/UX decision, same as ticket
-// tiers (see ScorePredictionsSection in src/app/ScorePredictions.tsx) —
-// same admin/signed-in/trial-active rule as a standard ticket, not
-// always-free like Mega Day and not sign-up-mandatory like Saint's Lock.
-
-export interface ScorePrediction {
-  fixtureId: string;
-  league: string;
-  /** Nation/country the league is from (e.g. "England" for the Premier League). */
-  country: string;
-  homeTeam: string;
-  awayTeam: string;
-  kickoff: string; // ISO date string
-  predictedHomeScore: number;
-  predictedAwayScore: number;
-  /** The model's own probability (0-1) for this exact scoreline — informational only, not a confidence guarantee. */
-  probability: number | null;
-  status: 'pending' | 'correct' | 'incorrect';
-  actualHomeScore?: number;
-  actualAwayScore?: number;
-}
-
-/**
- * Reads a given date's exact-score predictions (defaults to today).
- * Returns [] on any failure or if nothing has been generated yet for that
- * date — same honest-empty-state pattern as fetchTickets, no mock
- * fallback, no fabricated scorelines.
- */
-export async function fetchScorePredictions(date: Date = new Date()): Promise<ScorePrediction[]> {
-  try {
-    const { data, error } = await supabase
-      .from('score_predictions')
-      .select(
-        'id, league, country, home_team, away_team, kickoff, predicted_home_score, predicted_away_score, probability, result_status, actual_home_score, actual_away_score'
-      )
-      .eq('ticket_date', dateKey(date))
-      .order('kickoff', { ascending: true });
-    if (error || !data) return [];
-    return data.map((row: any) => ({
-      fixtureId: String(row.id),
-      league: row.league,
-      country: row.country,
-      homeTeam: row.home_team,
-      awayTeam: row.away_team,
-      kickoff: row.kickoff,
-      predictedHomeScore: row.predicted_home_score,
-      predictedAwayScore: row.predicted_away_score,
-      probability: row.probability,
-      status: row.result_status as ScorePrediction['status'],
-      actualHomeScore: row.actual_home_score ?? undefined,
-      actualAwayScore: row.actual_away_score ?? undefined,
-    }));
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn('[Odd Saint] fetchScorePredictions failed:', err);
-    return [];
-  }
-}
-
-/** Keys a list of predictions by fixture ID, for O(1) lookup when rendering the per-match badge inside an existing ticket's MatchRow (see src/app/page.tsx). */
-export function scorePredictionsByFixtureId(predictions: ScorePrediction[]): Map<string, ScorePrediction> {
-  return new Map(predictions.map((p) => [p.fixtureId, p]));
-}
-
-export interface ScorePredictionDayAccuracy {
-  date: string; // 'YYYY-MM-DD'
-  correct: number;
-  incorrect: number;
-  stillPending: number;
-  /** Correct / (correct + incorrect) * 100. Null if nothing decided yet for that day. */
-  hitRatePct: number | null;
-  minSampleMatchesUsed: number | null;
-}
-
-/**
- * Reads the last `days` calendar days of exact-score-prediction accuracy —
- * one row per day, written by scripts/analyze-score-predictions.mjs once
- * that day's predictions have had time to be graded (see
- * supabase/migrations/006_score_prediction_tuning.sql). Most recent first
- * (today is index 0). A day with nothing generated/reconciled yet simply
- * isn't in the table and is filled here with an honest "no data"
- * placeholder — same pattern as fetchPerformanceHistory, no fabricated
- * numbers. Public/ungated by design, same as ticket performance history —
- * this is a track-record transparency feature ("graded in the open"), not
- * the predictions themselves.
- */
-export async function fetchScorePredictionAccuracyHistory(days: number = 14): Promise<ScorePredictionDayAccuracy[]> {
-  const today = new Date();
-  const start = new Date(today);
-  start.setDate(start.getDate() - (days - 1));
-
-  const byDate = new Map<string, ScorePredictionDayAccuracy>();
-  try {
-    const { data, error } = await supabase
-      .from('score_prediction_daily_accuracy')
-      .select('ticket_date, correct, incorrect, still_pending, hit_rate_pct, min_sample_matches_used')
-      .gte('ticket_date', dateKey(start))
-      .lte('ticket_date', dateKey(today));
-    if (!error && data) {
-      data.forEach((row: any) => {
-        byDate.set(row.ticket_date, {
-          date: row.ticket_date,
-          correct: row.correct,
-          incorrect: row.incorrect,
-          stillPending: row.still_pending,
-          hitRatePct: row.hit_rate_pct,
-          minSampleMatchesUsed: row.min_sample_matches_used ?? null,
-        });
-      });
-    }
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn('[Odd Saint] fetchScorePredictionAccuracyHistory failed:', err);
-  }
-
-  const history: ScorePredictionDayAccuracy[] = [];
-  for (let i = 0; i < days; i++) {
-    const d = new Date(today);
-    d.setDate(d.getDate() - i);
-    const key = dateKey(d);
-    history.push(
-      byDate.get(key) ?? {
-        date: key,
-        correct: 0,
-        incorrect: 0,
-        stillPending: 0,
-        hitRatePct: null,
-        minSampleMatchesUsed: null,
-      }
-    );
-  }
-  return history;
 }
 
 // ---------------------------------------------------------------------------
