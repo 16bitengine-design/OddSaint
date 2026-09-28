@@ -6,9 +6,23 @@
 // requests/minute and a 7,500/day cap. This client self-throttles to stay
 // comfortably under the per-minute limit, and retries with backoff if a
 // 429 slips through anyway, rather than crashing the whole run.
+//
+// CHANGES IN THIS VERSION
+//   1. getFixturesByIds() now splits ids into batches of 20 — API-Football's
+//      /fixtures?ids= rejects more than 20 ids ("Maximum of 20 ids allowed")
+//      and returned an empty response, which made grading silently grade
+//      nothing while the workflow still showed green.
+//   2. apiFootballGet() now THROWS when the response's `errors` field is
+//      non-empty, instead of only logging a warning and returning []. A
+//      rejected request can no longer look like "no data".
+//      Callers that already wrap calls in try/catch (fetchPricedFixtures,
+//      the backfill/resolve scripts) keep working: they log and skip.
 // ---------------------------------------------------------------------------
 
 const API_BASE = 'https://v3.football.api-sports.io';
+
+// API-Football hard limit for the `ids` parameter of /fixtures.
+const MAX_IDS_PER_REQUEST = 20;
 
 // Pro plan allows 300 requests/minute — stay comfortably under that with a
 // safety margin, and share this limiter across every call this process
@@ -48,6 +62,15 @@ function requireApiKey() {
   return key;
 }
 
+/** API-Football returns `errors` as [] when clean, or an object/array of messages when a request was rejected. */
+function extractErrors(json) {
+  const errors = json?.errors;
+  if (!errors) return null;
+  if (Array.isArray(errors)) return errors.length > 0 ? errors : null;
+  if (typeof errors === 'object') return Object.keys(errors).length > 0 ? errors : null;
+  return null;
+}
+
 async function apiFootballGet(path, params = {}, attempt = 1) {
   const key = requireApiKey();
   const url = new URL(`${API_BASE}${path}`);
@@ -79,10 +102,15 @@ async function apiFootballGet(path, params = {}, attempt = 1) {
   }
 
   const json = await res.json();
-  if (json.errors && Object.keys(json.errors).length > 0) {
-    // eslint-disable-next-line no-console
-    console.warn('API-Football returned errors:', json.errors);
+
+  // A rejected request (bad parameter, plan limit, suspended key, etc.)
+  // comes back HTTP 200 with a populated `errors` field and an empty
+  // `response`. Treat that as a failure, not as "no results".
+  const errors = extractErrors(json);
+  if (errors) {
+    throw new Error(`API-Football rejected ${path} (${url.search}): ${JSON.stringify(errors)}`);
   }
+
   return json.response ?? [];
 }
 
@@ -96,13 +124,34 @@ export async function getOddsForFixture(fixtureId) {
   return apiFootballGet('/odds', { fixture: fixtureId });
 }
 
-/** Re-fetch specific fixtures by ID — used to check final scores for grading. */
+/**
+ * Re-fetch specific fixtures by ID — used to check final scores for grading.
+ * API-Football allows at most 20 ids per request, so larger lists are split
+ * into batches. If any batch fails, the error propagates (grading should
+ * not pretend it succeeded).
+ */
 export async function getFixturesByIds(ids) {
-  if (ids.length === 0) return [];
-  return apiFootballGet('/fixtures', { ids: ids.join('-') });
+  if (!ids || ids.length === 0) return [];
+  const results = [];
+  for (let i = 0; i < ids.length; i += MAX_IDS_PER_REQUEST) {
+    const chunk = ids.slice(i, i + MAX_IDS_PER_REQUEST);
+    const batch = await apiFootballGet('/fixtures', { ids: chunk.join('-') });
+    results.push(...batch);
+  }
+  return results;
 }
 
 /** All leagues/cups API-Football has for a given country name. */
 export async function getLeaguesByCountry(country) {
   return apiFootballGet('/leagues', { country });
+}
+
+/** Current-season teams for a league — used by scripts/resolve-teams.mjs. */
+export async function getTeamsForLeague(leagueId, season) {
+  return apiFootballGet('/teams', { league: leagueId, season });
+}
+
+/** A team's most recent `last` fixtures — used by scripts/backfill-team-history.mjs. */
+export async function getFixturesForTeam(teamId, last = 20) {
+  return apiFootballGet('/fixtures', { team: teamId, last });
 }
