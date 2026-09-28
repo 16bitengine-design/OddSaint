@@ -90,7 +90,21 @@ async function main() {
       `(${pendingFixtures.length} ticket-graded, ${pendingPredictions.length} score-predicted, overlap not double-counted)...`
   );
 
+  // getFixturesByIds() splits into batches of 20 (API-Football's max) and
+  // throws if API-Football rejects a request, so a broken call fails the
+  // run loudly instead of silently grading nothing.
   const results = await getFixturesByIds(Array.from(idSet));
+
+  // Sanity guard: we asked about fixtures old enough to have finished, so
+  // getting back ZERO fixtures means something is wrong (bad key, plan
+  // limit, wrong IDs) — fail the run so it shows red in GitHub Actions.
+  if (results.length === 0) {
+    throw new Error(
+      `API-Football returned 0 fixtures for ${idSet.size} requested id(s) — grading cannot proceed.`
+    );
+  }
+  console.log(`API-Football returned ${results.length} of ${idSet.size} requested fixture(s).`);
+
   const resultById = new Map(results.map((r) => [r.fixture.id, r]));
 
   /** Returns { homeScore, awayScore } if this fixture is finished with a real final score, else null. */
