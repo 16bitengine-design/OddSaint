@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import Link from 'next/link';
 import { supabase } from '@/lib/supabaseClient';
 import {
   fetchTickets,
@@ -1997,6 +1998,8 @@ function LoginModal({ onSent, onClose }: { onSent: (email: string) => void; onCl
             <IndemnificationNotice compact />
           </div>
 
+          {/* Terms + Privacy links open in a new tab so tapping one never
+              discards the email the visitor has already typed. */}
           <label
             style={{
               display: 'flex',
@@ -2015,7 +2018,27 @@ function LoginModal({ onSent, onClose }: { onSent: (email: string) => void; onCl
               onChange={(e) => setAgreed(e.target.checked)}
               style={{ marginTop: 2 }}
             />
-            I have read and accept the Hold-Harmless Indemnification Agreement.
+            <span>
+              I have read and accept the Hold-Harmless Indemnification Agreement, the{' '}
+              <a
+                href="/terms"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: COLORS.emerald, textDecoration: 'underline', textUnderlineOffset: 2 }}
+              >
+                Terms of Service
+              </a>{' '}
+              and the{' '}
+              <a
+                href="/privacy"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: COLORS.emerald, textDecoration: 'underline', textUnderlineOffset: 2 }}
+              >
+                Privacy Policy
+              </a>
+              .
+            </span>
           </label>
 
           {/* Marketing consent — deliberately a separate, optional checkbox,
@@ -3024,6 +3047,23 @@ function Footer() {
         </div>
       )}
 
+      {/* Always-visible links to the standalone legal pages
+          (src/app/terms/page.tsx, src/app/privacy/page.tsx). */}
+      <div style={{ display: 'flex', gap: 14, marginTop: 14, fontSize: 11.5 }}>
+        <Link
+          href="/terms"
+          style={{ color: COLORS.textMuted, textDecoration: 'underline', textUnderlineOffset: 3 }}
+        >
+          Terms of Service
+        </Link>
+        <Link
+          href="/privacy"
+          style={{ color: COLORS.textMuted, textDecoration: 'underline', textUnderlineOffset: 3 }}
+        >
+          Privacy Policy
+        </Link>
+      </div>
+
       <div style={{ fontSize: 10.5, color: COLORS.textMuted, marginTop: 14, lineHeight: 1.5 }}>
         © {new Date().getFullYear()} Odd Saint.
       </div>
@@ -3061,12 +3101,6 @@ export default function Page() {
   const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
   const [showFeedbackAdmin, setShowFeedbackAdmin] = useState(false);
   const [showGrantAccess, setShowGrantAccess] = useState(false);
-  // Which release batch (release_slot) tab the visitor currently has
-  // selected — null means "no explicit choice yet," in which case the
-  // most recently released batch is shown by default (see activeBatchSlot
-  // below). Separate tabs per batch, per product decision: batches are no
-  // longer merged into one continuous tier-grouped feed.
-  const [selectedBatchSlot, setSelectedBatchSlot] = useState<number | null>(null);
 
   const isAdmin = archiveAccess.level === 'admin';
 
@@ -3154,45 +3188,6 @@ export default function Page() {
     setShowPricing(true);
   }
 
-  // ---------------------------------------------------------------------
-  // Batch grouping — group today's accessible tickets by release_slot so
-  // each release batch (e.g. the morning drop vs the afternoon drop) shows
-  // as its own separate tab/view rather than being merged into one
-  // continuous tier-grouped feed. Each batch is internally still ordered
-  // tier-first via TIER_CONFIG (same ordering fetchRealTicketsForDate
-  // already applies to `tickets`), since grouping happens on top of that
-  // existing order, not by re-sorting. Declared here (before the loading
-  // early-return below) since these are hooks — calling them after a
-  // conditional return would violate the Rules of Hooks.
-  // ---------------------------------------------------------------------
-  const batches = useMemo(() => {
-    const bySlot = new Map<number, Ticket[]>();
-    tickets.forEach((t) => {
-      const slot = t.releaseSlot ?? 0;
-      if (!bySlot.has(slot)) bySlot.set(slot, []);
-      bySlot.get(slot)!.push(t);
-    });
-    return Array.from(bySlot.entries()).sort(([a], [b]) => a - b);
-  }, [tickets]);
-
-  // Default to the most recently released batch (highest slot number)
-  // rather than always slot 0, so a first-time visitor sees the freshest
-  // tickets by default; falls back to the first available batch if the
-  // previously selected slot no longer exists in today's data (e.g. after
-  // midnight rollover or an admin edit).
-  const activeBatchSlot = useMemo(() => {
-    if (batches.length === 0) return null;
-    if (selectedBatchSlot !== null && batches.some(([slot]) => slot === selectedBatchSlot)) {
-      return selectedBatchSlot;
-    }
-    return batches[batches.length - 1][0];
-  }, [batches, selectedBatchSlot]);
-
-  const activeBatchTickets = useMemo(
-    () => batches.find(([slot]) => slot === activeBatchSlot)?.[1] ?? [],
-    [batches, activeBatchSlot]
-  );
-
   if (loading) {
     return (
       <div
@@ -3214,14 +3209,10 @@ export default function Page() {
   }
 
   // Interleave a single in-feed ad slot right after the Bronze slips end
-  // and before Gold begins — scoped to the ACTIVE batch only now, since
-  // each batch tab renders its own independent feed. `batches`,
-  // `activeBatchSlot`, and `activeBatchTickets` are computed above (before
-  // the early return) since they're hooks; this block is plain
-  // object-building, safe to run only on the loaded render.
+  // and before Gold begins.
   const feedItems: Array<{ kind: 'ticket'; ticket: Ticket } | { kind: 'ad' }> = [];
-  const lastBronzeIndex = activeBatchTickets.map((t) => t.tier).lastIndexOf('bronze');
-  activeBatchTickets.forEach((t, idx) => {
+  const lastBronzeIndex = tickets.map((t) => t.tier).lastIndexOf('bronze');
+  tickets.forEach((t, idx) => {
     feedItems.push({ kind: 'ticket', ticket: t });
     if (idx === lastBronzeIndex && lastBronzeIndex !== -1) feedItems.push({ kind: 'ad' });
   });
@@ -3423,51 +3414,6 @@ export default function Page() {
             }}
           >
             Saint's Lock requires a free account to access — sign in to continue.
-          </div>
-        )}
-
-        {/* Batch tabs — one tab per release_slot released so far today (or
-            for whatever day fetchLatestTickets fell back to). Hidden when
-            there's only one batch, since a single-tab bar adds nothing.
-            Each tab's own label uses that batch's first ticket's
-            availableAt — same formatReleaseTime helper already used on
-            each TicketCard's "Released HH:MM" badge, so the tab label and
-            the per-card badge always agree. */}
-        {batches.length > 1 && (
-          <div
-            style={{
-              display: 'flex',
-              gap: 6,
-              marginBottom: 14,
-              overflowX: 'auto',
-              WebkitOverflowScrolling: 'touch',
-            }}
-          >
-            {batches.map(([slot, slotTickets]) => {
-              const active = slot === activeBatchSlot;
-              const releasedAt = slotTickets[0]?.availableAt;
-              return (
-                <button
-                  key={slot}
-                  onClick={() => setSelectedBatchSlot(slot)}
-                  style={{
-                    flexShrink: 0,
-                    fontFamily: FONT_BODY,
-                    fontSize: 12,
-                    fontWeight: 700,
-                    padding: '7px 14px',
-                    borderRadius: 999,
-                    border: active ? 'none' : `1px solid ${COLORS.border}`,
-                    background: active ? COLORS.emerald : 'transparent',
-                    color: active ? '#ffffff' : COLORS.textMuted,
-                    cursor: 'pointer',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  {releasedAt ? `Batch · ${formatReleaseTime(releasedAt)}` : `Batch ${slot + 1}`}
-                </button>
-              );
-            })}
           </div>
         )}
 
