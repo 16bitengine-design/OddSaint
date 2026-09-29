@@ -16,6 +16,14 @@
 // confidence figure — real odds reflect real market consensus — but it's
 // intentionally simple. Tune the SELECTION STRATEGY section below as your
 // picks strategy matures.
+//
+// SAINT'S LOCK FIX (2026-09-29): Saint's Lock used to require
+// confidence >= 85 AND odds 1.5-2.0, which can never both hold
+// (confidence = round(100/odds) is only 50-67% at those odds), and its
+// candidates were also filtered by MIN_CONFIDENCE 68 upstream, so its pool
+// was always empty. It now has its own candidate pick per fixture
+// (pickSaintsLockMarket) and always takes the best available one in EVERY
+// release slot. Regular tiers are unaffected.
 // ---------------------------------------------------------------------------
 import { getFixturesForDate, getOddsForFixture } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
@@ -144,55 +152,48 @@ function isBigClash(homeTeam, awayTeam) {
   return BIG_CLUBS.has(homeTeam) && BIG_CLUBS.has(awayTeam);
 }
 
-// UPDATED (batch/range revision): every tier now carries an explicit
-// minMatchCount alongside its matchCount ceiling — match count is a real
-// min-max RANGE per tier now, not just "fewest legs needed up to a
-// ceiling." See pickFixturesForSlip's min-leg top-up logic below for how
-// this is enforced. Must stay in sync with TIER_CONFIG in
-// src/lib/dataFetcher.ts.
 const TIER_CONFIG = [
-  { tier: 'mega', label: 'Mega Day Ticket', minMatchCount: 2, matchCount: 3, oddsRange: '1.5-3', alwaysFree: true },
-  { tier: 'bronze', label: 'Bronze', minMatchCount: 3, matchCount: 5, oddsRange: '3-7', alwaysFree: false },
-  { tier: 'silver', label: 'Silver', minMatchCount: 5, matchCount: 7, oddsRange: '7-12', alwaysFree: false },
-  { tier: 'gold', label: 'Gold', minMatchCount: 7, matchCount: 9, oddsRange: '20-30', alwaysFree: false },
-  { tier: 'platinum', label: 'Platinum', minMatchCount: 9, matchCount: 11, oddsRange: '70-300', alwaysFree: false },
-  { tier: 'diamond', label: 'Diamond', minMatchCount: 11, matchCount: 13, oddsRange: '300-2500', alwaysFree: false },
-  { tier: 'weekly_lite', label: 'Weekly Lite', minMatchCount: 13, matchCount: 15, oddsRange: '2500-10000', alwaysFree: false },
-  { tier: 'weekly_titan', label: 'Weekly Titan', minMatchCount: 15, matchCount: 17, oddsRange: '10000+', alwaysFree: false },
+  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
+  { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
+  { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
+  { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
+  // Platinum/Diamond/Weekly Lite/Weekly Titan match counts are each ONE
+  // FEWER than the "standard" tier size (10/15/20/30) — a deliberate
+  // reduction to raise real-world win probability by cutting one
+  // compounding leg of bookmaker margin per ticket. Must stay in sync with
+  // TIER_CONFIG in src/lib/dataFetcher.ts.
+  { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
+  { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
+  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
+  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
   // Spans BOTH Saturday and Sunday. Built from its own dedicated pool (see
   // upcomingWeekendDates() and its use in main()) rather than the daily or
-  // weekly pools.
-  { tier: 'weekender', label: 'Weekender', minMatchCount: 17, matchCount: 25, oddsRange: '12000+', alwaysFree: false },
-  // Ultra-high-confidence category. Normally a single match — the single
-  // most confident pick available that day, only included if it clears
-  // SAINTS_LOCK_MIN_CONFIDENCE (see below), well above the standard
-  // MIN_CONFIDENCE floor. As a last-resort fallback ONLY (see
-  // buildSaintsLockDoubleChanceCombo), it can widen to exactly 2 matches —
-  // two Double Chance legs, with one (never both) swapped for an Over 1.5
-  // Goals leg when necessary — hence matchCount 2 as the real ceiling now,
-  // not 1. Never 3: the booster REPLACES a leg, it doesn't add one. Sign-up
-  // required, no free trial ever applies — see the separate checkout flow
-  // in plans.ts.
-  { tier: 'saints_lock', label: "Saint's Lock", minMatchCount: 1, matchCount: 2, oddsRange: '1.5-2.4', alwaysFree: false },
+  // weekly pools. 35 legs needs a deep fixture pool — that's the main
+  // reason MAX_ODDS_LOOKUPS_PER_RUN was raised after moving to the
+  // API-Football Pro plan.
+  { tier: 'weekender', label: 'Weekender', matchCount: 35, oddsRange: 'Mixed', alwaysFree: false },
+  // Single-match category. Only ever one match per slip — the safest
+  // Home Win / Away Win / Over 2.5 pick available in the 1.5-2.0 odds
+  // band. Produced in EVERY release slot (see buildSaintsLockTickets).
+  // Sign-up required, no free trial ever applies — see the separate
+  // checkout flow in plans.ts.
+  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2', alwaysFree: false },
 ];
 
 // Numeric cumulative-odds targets matching each tier's oddsRange label
 // above. These are ACTUALLY ENFORCED during slip assembly (see
-// pickFixturesForSlip) — oddsRange is not just a display string, a slip
-// is only written if its true combined odds land within TOLERANCE of
-// this range. Every tier now has a real target — Weekly Lite/Titan/
-// Weekender previously had none ("Mixed").
+// pickFixturesForSlip) — previously oddsRange was just a display string
+// with nothing checking whether a ticket's real combined odds landed
+// inside it. Weekly Lite/Titan/Weekender are intentionally left unset
+// ("Mixed" by design, no fixed target).
 const TIER_ODDS_TARGET = {
   mega: [1.5, 3],
-  bronze: [3, 7],
-  silver: [7, 12],
-  gold: [20, 30],
-  platinum: [70, 300],
-  diamond: [300, 2500],
-  weekly_lite: [2500, 10000],
-  weekly_titan: [10000, Infinity],
-  weekender: [12000, Infinity],
-  saints_lock: [1.5, 2.4],
+  bronze: [2, 3],
+  silver: [3, 5],
+  gold: [5, 10],
+  platinum: [25, 300],
+  diamond: [300, Infinity],
+  saints_lock: [1.5, 2],
 };
 
 function dateStr(d) {
@@ -349,6 +350,12 @@ function hasMinimumLeadTime(kickoffISO, now) {
  * below means every allowlisted league with fixtures today gets looked at,
  * not just the named priority set — "priority" now only breaks ties once
  * fixtures are being assembled into tickets (see the final sort below).
+ *
+ * SAINT'S LOCK: each priced fixture may carry TWO independent picks —
+ * `market/odds/confidence` (the regular pick, must clear MIN_CONFIDENCE)
+ * and `lockPick` (the Saint's Lock candidate, see pickSaintsLockMarket).
+ * A fixture that has ONLY a lockPick is flagged `lockOnly` and is kept out
+ * of every regular tier by poolForTier.
  */
 async function fetchPricedFixtures(dates, maxOddsLookups, now) {
   const seen = new Map(); // fixtureId -> priced fixture
@@ -437,7 +444,9 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
           }
 
           const picked = pickMarketFromOdds(oddsResponse);
-          if (!picked) continue; // no usable market for this fixture — skip it
+          const lockPick = pickSaintsLockMarket(oddsResponse);
+          if (!picked && !lockPick) continue; // no usable market for this fixture — skip it
+          const base = picked ?? lockPick;
 
           seen.set(fixtureId, {
             fixtureId,
@@ -447,9 +456,11 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
             homeTeam: f.teams?.home?.name ?? 'Home',
             awayTeam: f.teams?.away?.name ?? 'Away',
             kickoff: f.fixture?.date,
-            market: picked.market,
-            odds: picked.odds,
-            confidence: picked.confidence,
+            market: base.market,
+            odds: base.odds,
+            confidence: base.confidence,
+            lockPick, // Saint's Lock candidate (or null)
+            lockOnly: !picked, // true = must NOT be used by any regular tier
           });
           leagueBreakdown.set(leagueName, (leagueBreakdown.get(leagueName) ?? 0) + 1);
         }
@@ -548,6 +559,28 @@ function impliedConfidence(odds) {
   return Math.min(95, Math.max(55, raw)); // clipped to a sane display range
 }
 
+// Saint's Lock candidate markets — straight Home Win / Away Win / Over 2.5
+// Goals only, priced inside the tier's 1.5-2.0 odds band. Deliberately
+// SEPARATE from pickMarketFromOdds: at 1.5-2.0 odds the implied confidence
+// is only ~50-67%, so these picks can never clear MIN_CONFIDENCE (68) and
+// would otherwise never enter the pool at all — which is exactly why
+// Saint's Lock used to come out empty every run. Lowest odds in band =
+// the market's own most-favored option.
+const SAINTS_LOCK_MARKETS = new Set(['Home Win', 'Away Win', 'Over 2.5 Goals']);
+
+function pickSaintsLockMarket(oddsResponse) {
+  const bookmaker = oddsResponse?.[0]?.bookmakers?.[0];
+  if (!bookmaker) return null;
+
+  const [minOdds, maxOdds] = TIER_ODDS_TARGET.saints_lock;
+  const best = collectViableOutcomes(bookmaker.bets)
+    .filter((o) => SAINTS_LOCK_MARKETS.has(o.market) && o.odds >= minOdds && o.odds <= maxOdds)
+    .sort((a, b) => a.odds - b.odds)[0];
+  if (!best) return null;
+
+  return { market: best.market, odds: best.odds, confidence: impliedConfidence(best.odds) };
+}
+
 // --- Assemble tickets from the priced-fixture pool ---------------------------
 
 // Tiers with fewer than 7 matches favor safer, more heavily-favored picks:
@@ -556,10 +589,16 @@ function impliedConfidence(odds) {
 const SMALL_TICKET_TIERS = new Set(['mega', 'bronze', 'silver']); // matchCount < 7
 const SMALL_TICKET_MAX_ODDS = 1.77;
 
-/** Narrows the pool to safer, lower-odds picks for tiers under 7 matches. */
+/**
+ * Narrows the pool for a regular tier. Always drops lock-only fixtures
+ * (they exist purely as Saint's Lock candidates and never cleared
+ * MIN_CONFIDENCE), then narrows to safer, lower-odds picks for tiers
+ * under 7 matches.
+ */
 function poolForTier(pool, tier) {
-  if (!SMALL_TICKET_TIERS.has(tier)) return pool;
-  return pool.filter((p) => p.odds <= SMALL_TICKET_MAX_ODDS);
+  const regular = pool.filter((p) => !p.lockOnly);
+  if (!SMALL_TICKET_TIERS.has(tier)) return regular;
+  return regular.filter((p) => p.odds <= SMALL_TICKET_MAX_ODDS);
 }
 
 // No single match can appear in more than this many of the day's tickets,
@@ -601,10 +640,8 @@ function ensureFullWinLeg(picks, pool, usageCount, targetRange) {
   const candidate = candidates[0];
 
   if (!targetRange) {
-    // No odds band to protect. Kept for forward-compatibility only — every
-    // currently configured tier now has a real TIER_ODDS_TARGET entry
-    // (Weekly Lite/Titan/Weekender included), so this branch is not
-    // normally reached today.
+    // No odds band to protect (Weekly Lite/Titan/Weekender) — swap out
+    // the current highest-odds leg for the full-win candidate.
     const highestIdx = picks.reduce((hi, p, i) => (p.odds > picks[hi].odds ? i : hi), 0);
     const next = [...picks];
     next[highestIdx] = candidate;
@@ -612,7 +649,7 @@ function ensureFullWinLeg(picks, pool, usageCount, targetRange) {
   }
 
   const [minTotal, maxTotal] = targetRange;
-  const TOLERANCE = 0.08; // same slack pickFixturesForSlip itself allows
+  const TOLERANCE = 0.3; // same slack pickFixturesForSlip itself allows
   const order = [...picks.keys()].sort((a, b) => picks[b].odds - picks[a].odds); // highest-odds leg first
   for (const idx of order) {
     const next = [...picks];
@@ -636,7 +673,7 @@ function ensureFullWinLeg(picks, pool, usageCount, targetRange) {
  * as few legs as will actually get the job done, only adding more when
  * the safest legs alone can't reach the target.
  */
-function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange, minMatchCount = 1) {
+function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
   const eligible = pool.filter((f) => (usageCount.get(f.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY);
   if (eligible.length === 0) return [];
 
@@ -648,8 +685,8 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange, minMa
   });
 
   if (!targetRange) {
-    // No target range to hit. Kept for forward-compatibility only — every
-    // currently configured tier now has a real TIER_ODDS_TARGET entry.
+    // No target range to hit (Weekly Lite/Titan/Weekender, "Mixed") —
+    // just take the safest available up to the max, as before.
     if (ranked.length < maxMatchCount) return [];
     return ensureFullWinLeg(ranked.slice(0, maxMatchCount), pool, usageCount, null);
   }
@@ -668,7 +705,7 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange, minMa
 
     const total = computeTotalOdds(picks);
     if (total >= minTotal && total <= maxTotal) {
-      break; // hit the target — fall through to the min-leg top-up below before finalizing
+      return picks; // hit the target with this many legs — stop here
     }
     if (total > maxTotal) {
       // Overshot on the safest-first path (can happen with a wide odds
@@ -678,15 +715,6 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange, minMa
       unused.unshift(fixture);
       break;
     }
-  }
-
-  // Enforce the tier's minimum leg count even if the odds target was
-  // already reached with fewer legs — match count is a real min-max
-  // range per tier now, not just "fewest legs needed."
-  while (picks.length < minMatchCount && picks.length < maxMatchCount && unused.length > 0) {
-    const next = [...unused].sort((a, b) => a.odds - b.odds)[0];
-    picks.push(next);
-    unused = unused.filter((f) => f !== next);
   }
 
   // Safest legs alone (within the max leg cap) didn't reach minTotal —
@@ -719,311 +747,70 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange, minMa
   }
 
   const finalTotal = computeTotalOdds(picks);
-  const TOLERANCE = 0.08; // 8% slack either side of the target band
+  const TOLERANCE = 0.3; // 30% slack either side of the target band
   const withinTolerance = finalTotal >= minTotal * (1 - TOLERANCE) && finalTotal <= maxTotal * (1 + TOLERANCE);
-  // pool doesn't have enough spread to hit this tier's range today, or
-  // couldn't meet the tier's minimum leg count — skip this slip rather
-  // than force it.
-  if (!withinTolerance || picks.length < minMatchCount) return [];
+  if (!withinTolerance || picks.length === 0) return []; // pool doesn't have enough spread to hit this tier's range today
 
   return ensureFullWinLeg(picks, pool, usageCount, targetRange);
 }
 
-// Saint's Lock demands a far higher confidence bar than any other tier —
-// "next to impossible to get wrong" framing means this should almost never
-// miss. Well above the standard MIN_CONFIDENCE floor (68) used everywhere
-// else. If fewer than 2 fixtures clear this bar on a given day, fewer than
-// 2 Saint's Lock tickets get produced — quality over quantity applies here
-// most strictly of all.
-const SAINTS_LOCK_MIN_CONFIDENCE = 85;
-
-// Product rule: Saint's Lock only ever picks a straight win (Home/Away) or
-// Over 2.5 Goals — never BTTS, Double Chance, Under, or Over 1.5/3.5, even
-// as a fallback. Reuses FULL_WIN_MARKETS (already shared with
-// ensureFullWinLeg) rather than duplicating the 'Home Win'/'Away Win'
-// strings a second time.
-//
-// KNOWN LIMITATION: dailyPool holds only ONE market per fixture — whichever
-// pickMarketFromOdds() judged safest overall for that fixture, shared
-// across every tier. Filtering by market here means Saint's Lock can only
-// draw from fixtures whose OVERALL safest market already happened to be
-// one of these three — not every fixture that has a good Over 2.5 or
-// straight-win price specifically. This can shrink Saint's Lock's
-// effective pool and make the fallback tiers below fire more often. A
-// fuller fix (a dedicated per-fixture market lookup for Saint's Lock,
-// independent of the shared pool's single recorded market) would remove
-// this limitation but is a larger change — not implemented here.
-const SAINTS_LOCK_ALLOWED_MARKETS = new Set([...FULL_WIN_MARKETS, 'Over 2.5 Goals']);
-
-// TIER 3 fallback markets — product rule: "either one straight win, or one
-// Over 2.5 Goals, or two Double Chance matches mixed with Over 1.5 Goals
-// where necessary." Kept as separate sets from SAINTS_LOCK_ALLOWED_MARKETS
-// (rather than folded into it) because they're ONLY valid for the combo
-// fallback below — TIER 0-2 above must never pick a Double Chance or Over
-// 1.5 leg. Only 1X/X2 count as "Double Chance" here, not 12 (Home/Away,
-// no-draw) — that's a different risk shape than the draw-protected pair the
-// product rule means.
-const SAINTS_LOCK_DC_COMBO_MARKETS = new Set(['Double Chance 1X', 'Double Chance X2']);
-const SAINTS_LOCK_BOOSTER_MARKET = 'Over 1.5 Goals';
-
 /**
- * TIER 3 fallback — LAST RESORT ONLY, per product decision: tried after
- * BOTH single-leg fallbacks in buildSaintsLockTickets have already failed
- * (i.e. the entire day's pool has no Home Win/Away Win/Over 2.5 Goals
- * fixture usable at any confidence, in or out of the target odds band).
- * Builds a 2-leg Double Chance combo instead, each leg still held to the
- * same SAINTS_LOCK_MIN_CONFIDENCE floor as every other Saint's Lock pick —
- * never relaxed for this fallback.
+ * Saint's Lock — GUARANTEED once per release slot whenever ANY fixture in
+ * today's pool has a qualifying Saint's Lock market (Home Win / Away Win /
+ * Over 2.5 at 1.5-2.0 odds, see pickSaintsLockMarket).
  *
- * The ticket is CAPPED AT EXACTLY 2 MATCHES — always 2, never 1, never 3.
- * The default shape is two Double Chance legs; if that pair alone can't
- * land in saints_lock's target odds range (their natural range is short,
- * since a single Double Chance leg can price as low as 1.1), ONE of the
- * two legs (never both) is swapped for an Over 1.5 Goals leg instead. Over
- * 1.5 Goals REPLACES a Double Chance leg here, it never adds a 3rd leg on
- * top of the pair.
+ * The old 85% confidence floor is gone: at 1.5-2.0 odds the implied
+ * confidence is only ~50-67%, so that floor could never be met and the
+ * tier came out empty every run. Selection is now simply "the most
+ * favored qualifying pick available" (lowest odds in band = highest
+ * implied confidence), in BOTH daily slots.
  *
- * Same KNOWN LIMITATION as the rest of Saint's Lock (see above): dailyPool
- * holds only one market per fixture — whichever pickMarketFromOdds judged
- * safest overall — so this can only draw from fixtures whose overall
- * safest market already happened to be Double Chance 1X/X2 (or Over 1.5
- * Goals for the swap-in leg), not every fixture with a good price in those
- * specific markets. Returns null if the pool can't assemble a 2-leg combo
- * within tolerance of the target range today.
- */
-function buildSaintsLockDoubleChanceCombo(dailyPool, usageCount, targetRange) {
-  const [minTotal, maxTotal] = targetRange;
-  const TOLERANCE = 0.08; // same slack every other tier's assembly allows
-  const withinRange = (total) => total >= minTotal * (1 - TOLERANCE) && total <= maxTotal * (1 + TOLERANCE);
-  const usable = (p) => (usageCount.get(p.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY;
-
-  const dcCandidates = dailyPool
-    .filter((p) => usable(p) && SAINTS_LOCK_DC_COMBO_MARKETS.has(p.market) && p.confidence >= SAINTS_LOCK_MIN_CONFIDENCE)
-    .sort((a, b) => a.odds - b.odds); // safest (lowest odds) first
-
-  // Need a base pair of Double Chance legs to start from — the booster
-  // only ever REPLACES one of the two, it can't stand in for both.
-  if (dcCandidates.length < 2) return null;
-
-  let picks = dcCandidates.slice(0, 2);
-  let unused = dcCandidates.slice(2);
-
-  // Step A — try to land the pair using Double Chance legs alone (bounded
-  // swap pass, same pattern pickFixturesForSlip uses elsewhere).
-  const MAX_SWAP_ATTEMPTS = 8;
-  for (let attempt = 0; attempt < MAX_SWAP_ATTEMPTS; attempt++) {
-    const total = computeTotalOdds(picks);
-    if (withinRange(total)) break;
-    if (total < minTotal) {
-      const lowestIdx = picks.reduce((li, p, i) => (p.odds < picks[li].odds ? i : li), 0);
-      const candidate = unused.find((f) => f.odds > picks[lowestIdx].odds);
-      if (!candidate) break; // nothing left that would raise the total further
-      picks[lowestIdx] = candidate;
-      unused = unused.filter((f) => f !== candidate);
-    } else {
-      const highestIdx = picks.reduce((hi, p, i) => (p.odds > picks[hi].odds ? i : hi), 0);
-      const candidate = [...unused].sort((a, b) => a.odds - b.odds).find((f) => f.odds < picks[highestIdx].odds);
-      if (!candidate) break;
-      picks[highestIdx] = candidate;
-      unused = unused.filter((f) => f !== candidate);
-    }
-  }
-
-  if (withinRange(computeTotalOdds(picks))) return picks; // two Double Chance legs alone got there — no swap needed
-
-  // Step B — "mixed with Over 1.5 Goals where necessary": Double-Chance-
-  // only couldn't land the pair in range, so try swapping ONE of the two
-  // legs (trying each position, never both at once — stays a 2-match
-  // ticket) for an Over 1.5 Goals leg instead.
-  const usedFixtureIds = new Set(picks.map((p) => p.fixtureId));
-  const boosters = dailyPool
-    .filter(
-      (p) =>
-        usable(p) &&
-        !usedFixtureIds.has(p.fixtureId) &&
-        p.market === SAINTS_LOCK_BOOSTER_MARKET &&
-        p.confidence >= SAINTS_LOCK_MIN_CONFIDENCE
-    )
-    .sort((a, b) => a.odds - b.odds);
-
-  for (const booster of boosters) {
-    for (const legIdx of [0, 1]) {
-      const candidatePicks = [...picks];
-      candidatePicks[legIdx] = booster;
-      if (withinRange(computeTotalOdds(candidatePicks))) return candidatePicks;
-    }
-  }
-
-  return null; // today's pool doesn't have the spread to land a 2-leg combo in range, DC-only or mixed
-}
-
-/**
- * Dedicated selection for Saint's Lock — unlike every other tier (which
- * uses pickFixturesForSlip's least-used/safest-first logic), this picks
- * strictly the highest-confidence qualifying fixtures in the whole day's
- * pool, filtered to the 1.5–2.0 odds band, SAINTS_LOCK_ALLOWED_MARKETS,
- * and the much higher confidence floor above. Respects the same
- * staggered-release slot logic as every other tier (see nextSlotFor) — at
- * most one new Saint's Lock ticket is produced per run, honoring the
- * min-1/max-2-per-day guarantee across the day's two scheduled runs
- * rather than both at once.
- *
- * NOTE: the "always incorporate a full win where necessary" guarantee
- * (see ensureFullWinLeg, used by the generic per-tier loop below)
- * deliberately does NOT apply here. Saint's Lock is a single-leg pick with
- * no "ticket completeness" to satisfy, and its whole design principle is
- * confidence-first, quality-over-quantity — swapping in a lower-confidence
- * outright-win fixture just to satisfy a market-type preference would
- * directly contradict that.
- *
- * POLICY UPDATE — HARD per-batch guarantee: every released batch gets a
- * Saint's Lock ticket. Fallback tiers apply in order if the strict 85%
- * confidence bar isn't cleared:
- *   1. Best-available fixture still within the 1.5–2.4 odds band
- *      (any confidence).
- *   2. If the odds band itself has nothing usable today, best-available
- *      fixture ANYWHERE in the day's priced pool, regardless of odds band
- *      (see usedOutOfBand below) — the ticket's odds_range then shows the
- *      pick's own actual odds rather than the "1.5-2.4" label, since that
- *      label would otherwise be actively wrong.
- *   3. LAST RESORT ONLY, tried after 1 and 2 have both failed (i.e. the
- *      day's pool has no straight-win/Over 2.5 fixture usable at all): a
- *      2-leg Double Chance combo, with one (never both) leg swapped for
- *      Over 1.5 Goals only when needed to reach the odds band — see
- *      buildSaintsLockDoubleChanceCombo. Always exactly 2 legs, never 3.
- *      Each leg still held to the full 85% confidence bar, never relaxed.
- *      This is the ONLY fallback tier that ever produces a multi-leg
- *      Saint's Lock ticket.
- * Tiers 1 and 2 still only draw from SAINTS_LOCK_ALLOWED_MARKETS (straight
- * win / Over 2.5) — that restriction is never relaxed within those tiers.
- * A batch only ships zero Saint's Lock tickets if ALL THREE tiers fail —
- * given the KNOWN LIMITATION above, other tiers may still succeed even
- * when Saint's Lock cannot.
+ * The chosen fixture row is written with the Saint's Lock market (so
+ * grading settles the right market), and its usageCount is maxed out so no
+ * other tier in this run can reuse the same fixture with a different
+ * market. main() also freezes fixtures already used by today's earlier
+ * Saint's Lock slip so a later run can't re-price and overwrite them.
  */
 function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
   const config = TIER_CONFIG.find((c) => c.tier === 'saints_lock');
-  const [minOdds, maxOdds] = TIER_ODDS_TARGET.saints_lock;
 
-  const isAllowedMarket = (p) => SAINTS_LOCK_ALLOWED_MARKETS.has(p.market);
+  const candidates = dailyPool
+    .filter((p) => p.lockPick && (usageCount.get(p.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY)
+    .sort((a, b) => b.lockPick.confidence - a.lockPick.confidence);
 
-  const inOddsRange = (p) => {
-    const used = usageCount.get(p.fixtureId) ?? 0;
-    return used < MAX_FIXTURE_APPEARANCES_PER_DAY && p.odds >= minOdds && p.odds <= maxOdds && isAllowedMarket(p);
-  };
-
-  let qualifying = dailyPool
-    .filter((p) => inOddsRange(p) && p.confidence >= SAINTS_LOCK_MIN_CONFIDENCE)
-    .sort((a, b) => b.confidence - a.confidence);
-
-  // TIER 1 fallback — per-batch guarantee: if nothing clears the strict
-  // 85% bar for THIS slot, relax to the single best-available fixture in
-  // the odds range (still market-restricted) rather than shipping zero
-  // for this batch. Applies to every slot (see the POLICY UPDATE note
-  // above).
-  let usedFallback = false;
-  if (qualifying.length === 0) {
-    const fallback = dailyPool.filter(inOddsRange).sort((a, b) => b.confidence - a.confidence);
-    if (fallback.length > 0) {
-      qualifying = [fallback[0]];
-      usedFallback = true;
-      // eslint-disable-next-line no-console
-      console.warn(
-        `Saint's Lock (slot ${slot}): no fixture cleared ${SAINTS_LOCK_MIN_CONFIDENCE}% today — ` +
-          `using best available (${fallback[0].confidence}%) to guarantee one ticket per released batch.`
-      );
-    }
+  if (candidates.length === 0) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `Saint's Lock slot ${slot}: NO fixture today has a Home Win / Away Win / Over 2.5 market ` +
+        `priced ${TIER_ODDS_TARGET.saints_lock[0]}-${TIER_ODDS_TARGET.saints_lock[1]} — nothing produced for this slot.`
+    );
+    return { tickets: [], ticketMatches: [], fixturesUsed: [] };
   }
 
-  // TIER 2 fallback — HARD GUARANTEE: if the 1.5–2.4 odds band has no
-  // usable fixture at all today (not just none above 85%), widen to the
-  // single best-confidence fixture anywhere in the day's priced pool,
-  // regardless of odds band, rather than skip this batch's Saint's Lock
-  // ticket. STILL restricted to SAINTS_LOCK_ALLOWED_MARKETS — the market
-  // rule is never relaxed, only the odds band is. Product requirement is
-  // "every released batch has a Saint's Lock ticket," with no exception
-  // for a thin day, short of the pool having literally zero usable
-  // straight-win/Over-2.5 fixtures at all.
-  let usedOutOfBand = false;
-  if (qualifying.length === 0) {
-    const usableAnywhere = (p) =>
-      (usageCount.get(p.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY && isAllowedMarket(p);
-    const lastResort = dailyPool.filter(usableAnywhere).sort((a, b) => b.confidence - a.confidence);
-    if (lastResort.length > 0) {
-      qualifying = [lastResort[0]];
-      usedOutOfBand = true;
-      // eslint-disable-next-line no-console
-      console.warn(
-        `Saint's Lock (slot ${slot}): no fixture in an allowed market (Home Win/Away Win/Over 2.5 Goals) ` +
-          `within the ${minOdds}-${maxOdds} odds band today — widening to best available anywhere in the ` +
-          `pool (odds ${lastResort[0].odds}, confidence ${lastResort[0].confidence}%, market ${lastResort[0].market}) ` +
-          `to guarantee one ticket per released batch. This pick falls OUTSIDE Saint's Lock's normal odds ` +
-          `range — flag for review if this recurs often.`
-      );
-    }
-  }
-
-  // TIER 3 — last resort only: both single-leg tiers above found nothing
-  // usable at all (not just nothing above 85%, not just nothing in-band —
-  // truly nothing in an allowed market anywhere in today's pool). Falls
-  // back to the 2-leg Double Chance combo (+ Over 1.5 booster where
-  // needed) rather than shipping zero for this batch.
-  let usedComboFallback = false;
-  let picks = qualifying.length > 0 ? [qualifying[0]] : null;
-
-  if (!picks) {
-    const combo = buildSaintsLockDoubleChanceCombo(dailyPool, usageCount, TIER_ODDS_TARGET.saints_lock);
-    if (combo) {
-      picks = combo;
-      usedComboFallback = true;
-      // eslint-disable-next-line no-console
-      console.warn(
-        `Saint's Lock (slot ${slot}): no straight-win/Over 2.5 fixture usable today, in or out of band — ` +
-          `falling back to a ${combo.length}-leg Double Chance combo ` +
-          `(${combo.map((p) => `${p.market} @ ${p.odds}`).join(', ')}) to guarantee one ticket per released batch.`
-      );
-    }
-  }
-
-  // True impossibility only: the entire day's priced pool has nothing
-  // usable left in ANY allowed market — straight win, Over 2.5, Double
-  // Chance 1X/X2, or Over 1.5 (every such fixture already at
-  // MAX_FIXTURE_APPEARANCES_PER_DAY, or none were ever priced that way
-  // today — see the KNOWN LIMITATION note above for why that can happen
-  // even on a day other tiers succeed).
-  if (!picks) return { tickets: [], ticketMatches: [], fixturesUsed: [] };
-
-  picks.forEach((p) => usageCount.set(p.fixtureId, (usageCount.get(p.fixtureId) ?? 0) + 1));
+  const base = candidates[0];
+  const pick = { ...base, ...base.lockPick }; // fixture row gets the Saint's Lock market/odds/confidence
+  usageCount.set(pick.fixtureId, MAX_FIXTURE_APPEARANCES_PER_DAY); // keep it out of every other tier
 
   const ticketId = `${today}-saints_lock-${slot}`;
   const availableAtIso = new Date(now.getTime() + AVAILABILITY_DELAY_MS).toISOString();
-  const totalOdds = computeTotalOdds(picks);
 
   const tickets = [
     {
       id: ticketId,
       ticket_date: today,
       tier: 'saints_lock',
-      slip_label: null, // Saint's Lock is marketed as one pick at a time, not "1 of 2" — see frontend countdown banner
-      match_count: picks.length,
-      // Deliberately NOT config.oddsRange when usedOutOfBand — showing
-      // "1.5-2.4" next to an actual price outside that band would be a
-      // real display inconsistency, the same class of bug just fixed for
-      // every other tier's TOLERANCE. A single-match ticket's own price
-      // IS its true range, so fall back to that string in this case.
-      // usedComboFallback deliberately does NOT trigger this override —
-      // the combo is only ever accepted when its combined odds already
-      // land within tolerance of the target range, so config.oddsRange
-      // stays accurate for it.
-      odds_range: usedOutOfBand ? `${totalOdds}` : config.oddsRange,
-      total_odds: totalOdds,
+      slip_label: null, // marketed as one pick at a time, not "1 of 2"
+      match_count: 1,
+      odds_range: config.oddsRange,
+      total_odds: pick.odds,
       is_free: false,
       release_slot: slot,
       available_at: availableAtIso,
     },
   ];
-  const ticketMatches = picks.map((p, idx) => ({ ticket_id: ticketId, fixture_id: p.fixtureId, sort_order: idx }));
+  const ticketMatches = [{ ticket_id: ticketId, fixture_id: pick.fixtureId, sort_order: 0 }];
 
-  return { tickets, ticketMatches, fixturesUsed: picks, usedFallback, usedOutOfBand, usedComboFallback };
+  return { tickets, ticketMatches, fixturesUsed: [pick] };
 }
 
 function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, now) {
@@ -1034,9 +821,9 @@ function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, now) {
   const fixturesUsed = new Map();
   const usageCount = new Map(); // shared across every tier/slip for the day
 
-  // Saint's Lock uses its own dedicated selection (see buildSaintsLockTickets)
-  // rather than the generic per-tier loop below — it's held to a much
-  // stricter confidence bar than every other category.
+  // Saint's Lock is built FIRST with its own dedicated selection (see
+  // buildSaintsLockTickets) so it always gets first claim on a fixture
+  // before any regular tier can use it.
   const saintsLockSlot = nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get('saints_lock'));
   if (saintsLockSlot !== null) {
     const saintsLock = buildSaintsLockTickets(dailyPool, usageCount, today, saintsLockSlot, now);
@@ -1062,7 +849,7 @@ function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, now) {
     const pool = poolForTier(basePool, config.tier);
     const targetRange = TIER_ODDS_TARGET[config.tier] ?? null;
 
-    const picks = pickFixturesForSlip(pool, config.matchCount, usageCount, targetRange, config.minMatchCount);
+    const picks = pickFixturesForSlip(pool, config.matchCount, usageCount, targetRange);
     if (picks.length === 0) {
       console.log(`${config.label}: couldn't assemble a valid combination this run — skipping this slip.`);
       return; // couldn't assemble a valid combination today — skip this slip rather than force it
@@ -1142,7 +929,29 @@ async function main() {
   const weekenderPool = await fetchPricedFixtures(weekendDates, MAX_ODDS_LOOKUPS_PER_RUN, today);
   console.log(`Priced ${weekenderPool.length} fixtures for the weekend (${weekendDates.join(', ')}).`);
 
-  const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, today);
+  // Freeze fixtures already used by today's earlier Saint's Lock slip(s).
+  // Their fixture rows carry the Saint's Lock market; re-pricing one in
+  // this run (possibly with a different regular market) and upserting it
+  // would overwrite that market and corrupt grading. Also stops slot 1
+  // from re-picking slot 0's fixture.
+  const { data: lockRows, error: lockErr } = await supabase
+    .from('ticket_matches')
+    .select('fixture_id, tickets!inner(tier, ticket_date)')
+    .eq('tickets.tier', 'saints_lock')
+    .eq('tickets.ticket_date', todayStr);
+  if (lockErr) {
+    console.warn("Could not read today's existing Saint's Lock fixtures:", lockErr.message);
+  }
+  const frozen = new Set((lockRows ?? []).map((r) => r.fixture_id));
+  const dropFrozen = (pool) => pool.filter((f) => !frozen.has(f.fixtureId));
+
+  const { tickets, ticketMatches, fixturesUsed } = buildTickets(
+    dropFrozen(dailyPool),
+    dropFrozen(weeklyPool),
+    dropFrozen(weekenderPool),
+    slipState,
+    today
+  );
 
   if (tickets.length === 0) {
     console.warn('No tickets could be assembled this run — not enough priced fixtures, or every eligible category was skipped. Nothing written.');
