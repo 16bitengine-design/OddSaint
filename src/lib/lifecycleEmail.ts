@@ -120,7 +120,7 @@ export function welcomeSubscriptionEmail() {
     subject: "You're in — welcome to Odd Saint",
     htmlContent: wrapEmail(
       `<h2 style="margin:0 0 10px;">Thanks for subscribing 🎉</h2>
-       <p>Your subscription is active — every tier, every day, no more watching ads or paying per ticket.</p>`,
+       <p>Your subscription is active — every ticket, every day, no more watching ads or paying per ticket.</p>`,
       "View today's tickets",
       SITE_URL
     ),

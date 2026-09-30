@@ -17,18 +17,9 @@ import { supabase } from './supabaseClient';
 
 export type MatchStatus = 'pending' | 'green' | 'red';
 
-
-export type TicketTier =
-  | 'mega'
-  | 'bronze'
-  | 'silver'
-  | 'gold'
-  | 'platinum'
-  | 'diamond'
-  | 'weekly_lite'
-  | 'weekly_titan'
-  | 'weekender'
-  | 'saints_lock';
+// The only ticket tiers that exist. Must stay in sync with TIER_CONFIG in
+// scripts/generate-tickets.mjs.
+export type TicketTier = 'mega' | 'duo' | 'saints_lock';
 
 export interface Match {
   id: string;
@@ -71,29 +62,20 @@ export interface TierConfig {
   alwaysFree: boolean;
 }
 
-// Tier definitions per the product spec.
-//
-// UPDATED (batch/range revision): each tier's real min-max match-count
-// range and odds-target band now live in scripts/generate-tickets.mjs's
-// TIER_CONFIG/TIER_ODDS_TARGET — this frontend copy MUST stay in sync
-// with that file (the two representations drifted out of sync once
-// before; see git history). `matchCount` here is the display ceiling —
-// a given real ticket's actual leg count (`match_count` on the DB row,
-// surfaced as Ticket.matchCount) can be anywhere from the tier's real
-// minimum up to this ceiling and is read from Supabase per-ticket, not
-// derived from this constant.
+// Tier definitions per the product spec. MUST stay in sync with TIER_CONFIG
+// in scripts/generate-tickets.mjs.
 export const TIER_CONFIG: TierConfig[] = [
-  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 3, oddsRange: '1.5-3', alwaysFree: true },
-  { tier: 'bronze', label: 'Bronze', matchCount: 5, oddsRange: '3-7', alwaysFree: false },
-  { tier: 'silver', label: 'Silver', matchCount: 7, oddsRange: '7-12', alwaysFree: false },
-  { tier: 'gold', label: 'Gold', matchCount: 9, oddsRange: '20-30', alwaysFree: false },
-  { tier: 'platinum', label: 'Platinum', matchCount: 11, oddsRange: '70-300', alwaysFree: false },
-  { tier: 'diamond', label: 'Diamond', matchCount: 13, oddsRange: '300-2500', alwaysFree: false },
-  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 15, oddsRange: '2500-10000', alwaysFree: false },
-  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 17, oddsRange: '10000+', alwaysFree: false },
-  { tier: 'weekender', label: 'Weekender', matchCount: 25, oddsRange: '12000+', alwaysFree: false },
-  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2.4', alwaysFree: false },
+  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
+  { tier: 'duo', label: 'Duo', matchCount: 2, oddsRange: '2-4', alwaysFree: false },
+  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2', alwaysFree: false },
 ];
+
+/**
+ * Tiers the app reads. Filtering every ticket query by this list means any
+ * leftover rows from tiers that have since been eliminated can never
+ * surface in the feed, archive, or performance history.
+ */
+export const DISPLAYED_TIERS: TicketTier[] = TIER_CONFIG.map((c) => c.tier);
 
 /**
  * Availability hours (UTC) — when each day's release slot actually
@@ -166,7 +148,8 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
         `id, tier, slip_label, match_count, odds_range, total_odds, is_free, release_slot, available_at,
          ticket_matches ( sort_order, fixtures ( id, league, country, home_team, away_team, kickoff, market, odds, confidence, result_status, final_home_score, final_away_score ) )`
       )
-      .eq('ticket_date', day);
+      .eq('ticket_date', day)
+      .in('tier', DISPLAYED_TIERS);
 
     if (result.error) {
       // eslint-disable-next-line no-console
@@ -201,34 +184,23 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
     const links = [...(row.ticket_matches ?? [])].sort(
       (a: any, b: any) => a.sort_order - b.sort_order
     );
-    // Defensive: Supabase/PostgREST can return a to-one relationship join
-    // (ticket_matches -> fixtures) shaped as either a single object or a
-    // one-element array, depending on how the foreign key is detected —
-    // see the same Array.isArray guard already used in
-    // recomputeTicketTotals below for this identical join shape. Links
-    // with no resolvable fixture are dropped rather than producing a
-    // match with undefined fields.
-    const matches: Match[] = links
-      .map((link: any) => {
-        const f = Array.isArray(link.fixtures) ? link.fixtures[0] : link.fixtures;
-        if (!f) return null;
-        const match: Match = {
-          id: String(f.id),
-          league: f.league,
-          country: f.country,
-          homeTeam: f.home_team,
-          awayTeam: f.away_team,
-          market: f.market,
-          odds: f.odds,
-          kickoff: f.kickoff,
-          status: f.result_status as MatchStatus,
-          confidence: f.confidence,
-          finalHomeScore: f.final_home_score ?? undefined,
-          finalAwayScore: f.final_away_score ?? undefined,
-        };
-        return match;
-      })
-      .filter((m): m is Match => m !== null);
+    const matches: Match[] = links.map((link: any) => {
+      const f = link.fixtures;
+      return {
+        id: String(f.id),
+        league: f.league,
+        country: f.country,
+        homeTeam: f.home_team,
+        awayTeam: f.away_team,
+        market: f.market,
+        odds: f.odds,
+        kickoff: f.kickoff,
+        status: f.result_status as MatchStatus,
+        confidence: f.confidence,
+        finalHomeScore: f.final_home_score ?? undefined,
+        finalAwayScore: f.final_away_score ?? undefined,
+      };
+    });
 
     return {
       id: row.id,
@@ -308,7 +280,7 @@ export async function fetchLatestTickets(): Promise<Ticket[]> {
 }
 
 /**
- * Fetch every slip for one tier on a given day (e.g. all of today's Gold slips).
+ * Fetch every slip for one tier on a given day (e.g. all of today's Duo slips).
  */
 export async function fetchTicketsByTier(tier: TicketTier, date: Date = new Date()): Promise<Ticket[]> {
   const all = await fetchTickets(date);
@@ -455,7 +427,7 @@ export async function getSaintsLockAccess(userId: string | null): Promise<Saints
 /**
  * Trial length in days for anonymous (not signed in) visitors — the only
  * access window left in the current model. Signing up now grants
- * permanent free access to every ticket, every tier, including Saint's
+ * permanent free access to every ticket, including Saint's
  * Lock (see the "Access model" note on TicketCard in src/app/page.tsx),
  * rather than a second time-limited window — so SIGNED_UP_TRIAL_DAYS and
  * POST_MILESTONE_SIGNED_UP_TRIAL_DAYS below are DORMANT: kept, and still
@@ -547,7 +519,7 @@ export function isWithinFreeTrial(startISO: string | null, totalDays: number): b
 // ---------------------------------------------------------------------------
 // Anonymous trial tracking
 // ---------------------------------------------------------------------------
-// Visitors get the full 30-day free trial WITHOUT creating an account. The
+// Visitors get the full free trial WITHOUT creating an account. The
 // trial clock starts the first time a browser hits the app and is stored in
 // localStorage on that device. Signing in later (magic link) is optional —
 // it's only needed once the trial ends, to unlock ads/payment/subscription
@@ -636,7 +608,8 @@ async function fetchRealHistoryRange(days: number): Promise<Map<string, DayPerfo
       .from('tickets')
       .select('id, ticket_date, tier, ticket_matches ( fixtures ( result_status ) )')
       .gte('ticket_date', dateKey(start))
-      .lte('ticket_date', dateKey(today));
+      .lte('ticket_date', dateKey(today))
+      .in('tier', DISPLAYED_TIERS);
 
     if (result.error) return map;
     data = result.data;
@@ -655,16 +628,8 @@ async function fetchRealHistoryRange(days: number): Promise<Map<string, DayPerfo
     byDate.get(key)!.push(row);
   });
 
-  // Same defensive guard as fetchRealTicketsForDate above and
-  // recomputeTicketTotals below — the ticket_matches -> fixtures join can
-  // come back as a one-element array rather than a plain object.
   const statusesOfRow = (row: any): MatchStatus[] =>
-    (row.ticket_matches ?? [])
-      .map((tm: any) => {
-        const f = Array.isArray(tm.fixtures) ? tm.fixtures[0] : tm.fixtures;
-        return f?.result_status;
-      })
-      .filter(Boolean);
+    (row.ticket_matches ?? []).map((tm: any) => tm.fixtures?.result_status).filter(Boolean);
 
   byDate.forEach((rows, day) => {
     const byTier: Partial<Record<TicketTier, TierStats>> = {};
@@ -925,51 +890,4 @@ export async function getArchiveAccess(userId: string | null): Promise<ArchiveAc
     console.warn('[Odd Saint] Archive access check failed, defaulting to no access:', err);
     return { level: 'none' };
   }
-}
-
-// ---------------------------------------------------------------------------
-// Score predictions — RESTORED TYPE-ONLY STUBS (build-fix, incomplete)
-// ---------------------------------------------------------------------------
-// src/app/ScorePredictions.tsx imports these two types but every actual
-// data-fetching function that used to populate them (e.g. whatever pulled
-// from a `score_predictions` table / `score_prediction_daily_accuracy`
-// view — see the comments in ScorePredictions.tsx referencing
-// scripts/generate-score-predictions.mjs, scripts/analyze-score-
-// predictions.mjs, and supabase/migrations/006_score_prediction_tuning.sql)
-// was NOT present in the source content this file was rewritten from, and
-// is NOT reconstructed here — inventing a table/column shape would risk
-// silently querying the wrong thing rather than surfacing a clear error.
-//
-// These two shapes are restored ONLY because every field on them is
-// directly, unambiguously readable from ScorePredictions.tsx's own usage
-// (prediction.homeTeam, prediction.status, day.hitRatePct, etc.) — this
-// is reading the real consumer contract, not guessing. This restores the
-// TypeScript build (ScorePredictions.tsx is type-checked by Next.js even
-// though nothing currently imports/renders the component from page.tsx),
-// but the feature itself is NOT wired back up:
-//   - No function here actually returns ScorePrediction[] or
-//     ScorePredictionDayAccuracy[] from Supabase.
-//   - page.tsx does not import or render ScorePredictionsSection /
-//     ScorePredictionAccuracyHistory at all right now.
-// Provide the original fetcher implementation (or the real table/view
-// schema) to restore this properly instead of leaving it dead code.
-export interface ScorePrediction {
-  fixtureId: string;
-  homeTeam: string;
-  awayTeam: string;
-  league: string;
-  country: string;
-  kickoff: string; // ISO date string
-  status: 'pending' | 'correct' | 'incorrect';
-  predictedHomeScore: number;
-  predictedAwayScore: number;
-}
-
-export interface ScorePredictionDayAccuracy {
-  date: string; // 'YYYY-MM-DD'
-  correct: number;
-  incorrect: number;
-  stillPending: number;
-  /** Correct ÷ (correct + incorrect) as a whole-number percent, or null if nothing decided yet. */
-  hitRatePct: number | null;
 }
