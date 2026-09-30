@@ -83,7 +83,7 @@ export default function TermsPage() {
             stated usage milestones are reached.
           </p>
           <p>
-            Paid plans grant access to premium ticket tiers for a fixed period (e.g. weekly, monthly, yearly)
+            Paid plans grant access to premium tickets for a fixed period (e.g. weekly, monthly, yearly)
             from the time of successful payment. <strong>Plans do not auto-renew</strong> — access simply
             expires at the end of the paid period unless you purchase again. Saint's Lock is a separate,
             single-match premium product with its own pricing and no free trial; it requires a registered
@@ -170,5 +170,4 @@ export default function TermsPage() {
       </div>
     </div>
   );
-      }
-
+}
