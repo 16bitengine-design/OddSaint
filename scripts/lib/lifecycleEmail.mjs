@@ -7,8 +7,8 @@
 //   2. tryClaimNotification    — idempotent send-ledger (insert-first)
 //   3. countSentToday          — Brevo free-tier daily-cap tracking
 //   4. Email templates         — welcome / daily nudges / ticket-ready copy
-//   5. notifySaintsLockReady / notifyWeeklyTicketReady — event-triggered
-//      senders, called directly from scripts/generate-tickets.mjs
+//   5. notifySaintsLockReady   — event-triggered sender, called directly
+//      from scripts/generate-tickets.mjs
 //
 // Kept separate from src/lib/lifecycleEmail.ts (the Vercel/Next.js
 // counterpart) because scripts/ isn't part of the Next.js build and src/
@@ -148,13 +148,13 @@ export function welcomeSubscriptionEmail() {
     subject: "You're in — welcome to Odd Saint",
     htmlContent: wrapEmail(
       `<h2 style="margin:0 0 10px;">Thanks for subscribing 🎉</h2>
-       <p>Your subscription is active — every tier, every day, no more watching ads or paying per ticket.</p>
+       <p>Your subscription is active — every ticket, every day, no more watching ads or paying per ticket.</p>
        <p>New batches drop twice daily. We'll keep you posted, but you can always check in anytime.</p>`,
       "View today's tickets",
       SITE_URL
     ),
     textContent:
-      "Thanks for subscribing to Odd Saint! Your subscription is active — every tier, every day. " +
+      "Thanks for subscribing to Odd Saint! Your subscription is active — every ticket, every day. " +
       `View today's tickets: ${SITE_URL}`,
   };
 }
@@ -177,7 +177,7 @@ export function dailySubscriptionNudgeEmail() {
     subject: "Today's tickets are live",
     htmlContent: wrapEmail(
       `<h2 style="margin:0 0 10px;">Today's slate is ready</h2>
-       <p>Bronze, Silver, Gold and more — curated and graded in the open. Subscribe to unlock every tier without ads or per-ticket fees.</p>`,
+       <p>Mega Day, Duo and Saint's Lock — curated and graded in the open. Subscribe to unlock every ticket without ads or per-ticket fees.</p>`,
       'See plans',
       `${SITE_URL}?utm_source=email&utm_campaign=daily_nudge`
     ),
@@ -211,33 +211,18 @@ export function saintsLockReadyEmail() {
   };
 }
 
-export function weeklyTicketReadyEmail(tierLabel) {
-  return {
-    subject: `${tierLabel} is ready for this week`,
-    htmlContent: wrapEmail(
-      `<h2 style="margin:0 0 10px;">${tierLabel} just dropped</h2>
-       <p>This week's curated accumulator is live now and stays up all week.</p>`,
-      'View it now',
-      `${SITE_URL}?utm_source=email&utm_campaign=weekly_ready`
-    ),
-    textContent: `${tierLabel} is ready for this week. View it: ${SITE_URL}`,
-  };
-}
-
 // ---------------------------------------------------------------------------
-// 5. Event-triggered "ticket ready" notifications
+// 5. Event-triggered "ticket ready" notification
 //
-// Called directly from generate-tickets.mjs right after a Saint's Lock or
-// weekly-cadence ticket is actually written this run — event-triggered,
-// not scheduled. Saint's Lock targets only people who do NOT yet have that
-// product (a subscribe-ask); weekly-tier tickets notify everyone with a
-// known email (a value notification, since Weekly Titan is free-forever
-// once signed in and Weekly Lite/weekend are subscription perks either way).
+// Called directly from generate-tickets.mjs right after a Saint's Lock
+// ticket is actually written this run — event-triggered, not scheduled.
+// Saint's Lock targets only people who do NOT yet have that product (a
+// subscribe-ask).
 //
 // PHASE 2 NOTE: WhatsApp delivery for this same event is deliberately not
 // implemented yet — it requires Meta Business verification and pre-approved
-// message templates, an account-level process outside this codebase. These
-// functions are written so a WhatsApp branch can be added alongside the
+// message templates, an account-level process outside this codebase. This
+// function is written so a WhatsApp branch can be added alongside the
 // email branch later without restructuring the caller.
 // ---------------------------------------------------------------------------
 export async function notifySaintsLockReady(supabase, ticketId) {
@@ -275,36 +260,4 @@ export async function notifySaintsLockReady(supabase, ticketId) {
     }
   }
   console.log(`Saint's Lock ready notification: sent ${sent} email(s).`);
-}
-
-export async function notifyWeeklyTicketReady(supabase, ticketId, tierLabel) {
-  const remaining = BREVO_DAILY_CAP - (await countSentToday(supabase));
-  if (remaining <= 0) {
-    console.log(`${tierLabel} ready notification: daily Brevo budget already used — skipping.`);
-    return;
-  }
-
-  const { data: profiles, error } = await supabase.from('user_profiles').select('user_id, email');
-  if (error) throw error;
-
-  const targets = (profiles ?? []).filter((p) => p.email).slice(0, Math.min(remaining, MAX_NOTIFY_PER_EVENT));
-
-  let sent = 0;
-  for (const p of targets) {
-    const claimed = await tryClaimNotification(supabase, {
-      userId: p.user_id,
-      email: p.email,
-      eventType: 'weekly_ticket_ready',
-      referenceId: ticketId,
-    });
-    if (!claimed) continue;
-    try {
-      const tpl = weeklyTicketReadyEmail(tierLabel);
-      await sendBrevoEmail({ to: p.email, ...tpl, tags: ['weekly_ticket_ready'] });
-      sent++;
-    } catch (err) {
-      console.error(`Failed to send ${tierLabel} ready email to ${p.email}:`, err.message);
-    }
-  }
-  console.log(`${tierLabel} ready notification: sent ${sent} email(s).`);
 }
