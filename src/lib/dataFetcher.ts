@@ -18,17 +18,9 @@ import { supabase } from './supabaseClient';
 export type MatchStatus = 'pending' | 'green' | 'red';
 
 
-export type TicketTier =
-  | 'mega'
-  | 'bronze'
-  | 'silver'
-  | 'gold'
-  | 'platinum'
-  | 'diamond'
-  | 'weekly_lite'
-  | 'weekly_titan'
-  | 'weekender'
-  | 'saints_lock';
+// The only ticket tiers that exist. Must stay in sync with TIER_CONFIG in
+// scripts/generate-tickets.mjs.
+export type TicketTier = 'mega' | 'duo' | 'saints_lock';
 
 export interface Match {
   id: string;
@@ -84,16 +76,16 @@ export interface TierConfig {
 // derived from this constant.
 export const TIER_CONFIG: TierConfig[] = [
   { tier: 'mega', label: 'Mega Day Ticket', matchCount: 3, oddsRange: '1.5-3', alwaysFree: true },
-  { tier: 'bronze', label: 'Bronze', matchCount: 5, oddsRange: '3-7', alwaysFree: false },
-  { tier: 'silver', label: 'Silver', matchCount: 7, oddsRange: '7-12', alwaysFree: false },
-  { tier: 'gold', label: 'Gold', matchCount: 9, oddsRange: '20-30', alwaysFree: false },
-  { tier: 'platinum', label: 'Platinum', matchCount: 11, oddsRange: '70-300', alwaysFree: false },
-  { tier: 'diamond', label: 'Diamond', matchCount: 13, oddsRange: '300-2500', alwaysFree: false },
-  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 15, oddsRange: '2500-10000', alwaysFree: false },
-  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 17, oddsRange: '10000+', alwaysFree: false },
-  { tier: 'weekender', label: 'Weekender', matchCount: 25, oddsRange: '12000+', alwaysFree: false },
+  { tier: 'duo', label: 'Duo', matchCount: 2, oddsRange: '2-4', alwaysFree: false },
   { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2.4', alwaysFree: false },
 ];
+
+/**
+ * Tiers the app reads. Every ticket query is filtered by this list so any
+ * leftover rows from eliminated tiers can never surface in the feed,
+ * archive or performance history.
+ */
+export const DISPLAYED_TIERS: TicketTier[] = TIER_CONFIG.map((c) => c.tier);
 
 /**
  * Availability hours (UTC) — when each day's release slot actually
@@ -166,7 +158,8 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
         `id, tier, slip_label, match_count, odds_range, total_odds, is_free, release_slot, available_at,
          ticket_matches ( sort_order, fixtures ( id, league, country, home_team, away_team, kickoff, market, odds, confidence, result_status, final_home_score, final_away_score ) )`
       )
-      .eq('ticket_date', day);
+      .eq('ticket_date', day)
+      .in('tier', DISPLAYED_TIERS);
 
     if (result.error) {
       // eslint-disable-next-line no-console
@@ -636,7 +629,8 @@ async function fetchRealHistoryRange(days: number): Promise<Map<string, DayPerfo
       .from('tickets')
       .select('id, ticket_date, tier, ticket_matches ( fixtures ( result_status ) )')
       .gte('ticket_date', dateKey(start))
-      .lte('ticket_date', dateKey(today));
+      .lte('ticket_date', dateKey(today))
+      .in('tier', DISPLAYED_TIERS);
 
     if (result.error) return map;
     data = result.data;
