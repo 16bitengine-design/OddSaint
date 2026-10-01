@@ -2106,13 +2106,13 @@ function getDailyRefreshInfo(): { timeLabel: string; hasRefreshedToday: boolean 
 }
 
 function Hero({
-  bronzeCount,
-  goldCount,
+  megaCount,
+  duoCount,
   winRatePct,
   onViewHistory,
 }: {
-  bronzeCount: number;
-  goldCount: number;
+  megaCount: number;
+  duoCount: number;
   winRatePct: number | null;
   onViewHistory: () => void;
 }) {
@@ -2225,8 +2225,8 @@ function Hero({
         }}
       >
         {[
-          { label: 'Bronze slips today', value: String(bronzeCount) },
-          { label: 'Gold slips today', value: String(goldCount) },
+          { label: 'Mega slips today', value: String(megaCount) },
+          { label: 'Duo slips today', value: String(duoCount) },
           {
             label: '14-day win rate',
             value: winRatePct !== null ? `${winRatePct}%` : '—',
@@ -2742,7 +2742,7 @@ function PricingModal({
         <p style={{ fontSize: 11.5, color: COLORS.textMuted, margin: '0 0 16px' }}>
           {product === 'saints_lock'
             ? "One ultra-high-confidence pick a day. No free trial applies — pay easily with mobile money."
-            : 'Unlock every tier, every day — pay easily with mobile money.'}
+            : 'Unlock every ticket, every day — pay easily with mobile money.'}
         </p>
 
         {!userId && (
@@ -3167,18 +3167,18 @@ export default function Page() {
     );
   }
 
-  // Interleave a single in-feed ad slot right after the Bronze slips end
-  // and before Gold begins.
+  // Interleave a single in-feed ad slot right after the Mega Day slips end
+  // and before the next ticket begins.
   const feedItems: Array<{ kind: 'ticket'; ticket: Ticket } | { kind: 'ad' }> = [];
-  const lastBronzeIndex = tickets.map((t) => t.tier).lastIndexOf('bronze');
+  const lastMegaIndex = tickets.map((t) => t.tier).lastIndexOf('mega');
   tickets.forEach((t, idx) => {
     feedItems.push({ kind: 'ticket', ticket: t });
-    if (idx === lastBronzeIndex && lastBronzeIndex !== -1) feedItems.push({ kind: 'ad' });
+    if (idx === lastMegaIndex && lastMegaIndex !== -1) feedItems.push({ kind: 'ad' });
   });
 
   const historySummary = summarizeHistory(history);
-  const bronzeCountToday = tickets.filter((t) => t.tier === 'bronze').length;
-  const goldCountToday = tickets.filter((t) => t.tier === 'gold').length;
+  const megaCountToday = tickets.filter((t) => t.tier === 'mega').length;
+  const duoCountToday = tickets.filter((t) => t.tier === 'duo').length;
   const saintsLockTickets = tickets.filter((t) => t.tier === 'saints_lock');
 
   return (
@@ -3332,8 +3332,8 @@ export default function Page() {
 
       <div style={{ maxWidth: 560, margin: '0 auto', padding: '16px' }}>
         <Hero
-          bronzeCount={bronzeCountToday}
-          goldCount={goldCountToday}
+          megaCount={megaCountToday}
+          duoCount={duoCountToday}
           winRatePct={historySummary.winRatePct}
           onViewHistory={() => setShowHistory((s) => !s)}
         />
@@ -3356,12 +3356,12 @@ export default function Page() {
           }}
         >
           {isAdmin
-            ? 'Admin account — every ticket, every tier, including Saint\'s Lock, is unlocked for you automatically.'
+            ? 'Admin account — every ticket, including Saint\'s Lock, is unlocked for you automatically.'
             : userEmail
-            ? "You're signed in — every ticket, every tier, including Saint's Lock, is free for you."
+            ? "You're signed in — every ticket, including Saint's Lock, is free for you."
             : trialActive
             ? `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Every ticket is unlocked, no account needed. Sign up anytime to keep full access for free.`
-            : 'Your free trial has ended. The Mega Day Ticket stays free forever — sign up free to unlock everything else, including Saint\'s Lock.'}
+            : 'Your free trial has ended. The Mega Day Ticket stays free forever — sign up free to unlock the rest, including Saint\'s Lock.'}
         </div>
 
         {!isAdmin && (
