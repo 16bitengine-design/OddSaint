@@ -80,13 +80,9 @@ function loadLeagueAllowlist() {
 
 const LEAGUE_ALLOWLIST = loadLeagueAllowlist();
 
-// Caps how many /odds requests we make per pool (daily, weekly, weekender
-// — so a full run uses at most ~3x this many, plus a couple of /fixtures
-// calls). Raised from the old Free-plan-era value of 25 now that the
-// account is on Pro (300 req/min, 7,500 req/day): worst case is 3 pools x
-// 2 runs/day x this value = 6 x 200 = 1,200 odds lookups/day, leaving
-// >6,000/day of headroom for grading (every 3h) and manual runs. Revisit
-// if the Actions logs show the daily cap getting tight.
+// Caps how many /odds requests a run makes for the daily pool (Pro plan:
+// 300 req/min, 7,500 req/day). Worst case is 2 runs/day x this value = 400
+// odds lookups/day, leaving ample headroom for grading and manual runs.
 const MAX_ODDS_LOOKUPS_PER_RUN = 200;
 
 // Named priority leagues break ties when ASSEMBLING tickets from the priced
@@ -126,14 +122,6 @@ const PRIORITY_LEAGUE_NAMES = new Set([
 // contribute more than a token pick per round.
 const PER_LEAGUE_LOOKUPS_PER_ROUND = 3;
 
-// How many extra days ahead to pull fixtures for the two "Weekly" tiers.
-// API-Football's FREE plan only allows querying a narrow window around
-// today (typically yesterday through tomorrow) — requesting further out
-// returns a "Free plans do not have access to this date" error. Set to 1
-// to stay within that window; if you upgrade your API plan later, this can
-// go back up to pull a genuine week's worth of fixtures.
-const WEEKLY_LOOKAHEAD_DAYS = 1;
-
 // A curated set of marquee clubs across the covered leagues. Fixtures where
 // BOTH sides are in this set (e.g. Real Madrid vs Barcelona, a Manchester
 // or Milan derby) are skipped entirely — these are inherently the hardest
@@ -154,24 +142,10 @@ function isBigClash(homeTeam, awayTeam) {
 
 const TIER_CONFIG = [
   { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
-  { tier: 'bronze', label: 'Bronze', matchCount: 3, oddsRange: '2-3', alwaysFree: false },
-  { tier: 'silver', label: 'Silver', matchCount: 5, oddsRange: '3-5', alwaysFree: false },
-  { tier: 'gold', label: 'Gold', matchCount: 7, oddsRange: '5-10', alwaysFree: false },
-  // Platinum/Diamond/Weekly Lite/Weekly Titan match counts are each ONE
-  // FEWER than the "standard" tier size (10/15/20/30) — a deliberate
-  // reduction to raise real-world win probability by cutting one
-  // compounding leg of bookmaker margin per ticket. Must stay in sync with
+  // Exactly two legs, cumulative odds between 2 and 4 (inclusive). Held to
+  // a strict band — see STRICT_RANGE_TIERS below. Must stay in sync with
   // TIER_CONFIG in src/lib/dataFetcher.ts.
-  { tier: 'platinum', label: 'Platinum', matchCount: 9, oddsRange: '25-300', alwaysFree: false },
-  { tier: 'diamond', label: 'Diamond', matchCount: 14, oddsRange: '300+', alwaysFree: false },
-  { tier: 'weekly_lite', label: 'Weekly Lite', matchCount: 19, oddsRange: 'Mixed', alwaysFree: false },
-  { tier: 'weekly_titan', label: 'Weekly Titan', matchCount: 29, oddsRange: 'Mixed', alwaysFree: false },
-  // Spans BOTH Saturday and Sunday. Built from its own dedicated pool (see
-  // upcomingWeekendDates() and its use in main()) rather than the daily or
-  // weekly pools. 35 legs needs a deep fixture pool — that's the main
-  // reason MAX_ODDS_LOOKUPS_PER_RUN was raised after moving to the
-  // API-Football Pro plan.
-  { tier: 'weekender', label: 'Weekender', matchCount: 35, oddsRange: 'Mixed', alwaysFree: false },
+  { tier: 'duo', label: 'Duo', matchCount: 2, oddsRange: '2-4', alwaysFree: false },
   // Single-match category. Only ever one match per slip — the safest
   // Home Win / Away Win / Over 2.5 pick available in the 1.5-2.0 odds
   // band. Produced in EVERY release slot (see buildSaintsLockTickets).
@@ -184,40 +158,16 @@ const TIER_CONFIG = [
 // above. These are ACTUALLY ENFORCED during slip assembly (see
 // pickFixturesForSlip) — previously oddsRange was just a display string
 // with nothing checking whether a ticket's real combined odds landed
-// inside it. Weekly Lite/Titan/Weekender are intentionally left unset
+// inside it. Tiers without an entry here are intentionally left unset
 // ("Mixed" by design, no fixed target).
 const TIER_ODDS_TARGET = {
   mega: [1.5, 3],
-  bronze: [2, 3],
-  silver: [3, 5],
-  gold: [5, 10],
-  platinum: [25, 300],
-  diamond: [300, Infinity],
+  duo: [2, 4],
   saints_lock: [1.5, 2],
 };
 
 function dateStr(d) {
   return d.toISOString().slice(0, 10);
-}
-
-/**
- * Returns [saturdayStr, sundayStr] for the NEXT upcoming Saturday+Sunday
- * from `now` (today itself if today already is Sat/Sun) — same lookahead
- * pattern as WEEKLY_LOOKAHEAD_DAYS. Runs on ANY day of the week, relying
- * on the Pro plan's wider date-range window to fetch a few days ahead
- * (unlike the old Free-plan-only-weekend-runs restriction). The exact
- * Pro-plan date-range limit hasn't been directly re-verified — if a date
- * turns out to still be out of range, fetchPricedFixtures below catches
- * that per-date and skips it rather than crashing the whole script.
- */
-function upcomingWeekendDates(now) {
-  const dow = now.getUTCDay(); // 0 = Sunday, 6 = Saturday
-  const daysUntilSaturday = (6 - dow + 7) % 7;
-  const sat = new Date(now);
-  sat.setUTCDate(sat.getUTCDate() + daysUntilSaturday);
-  const sun = new Date(sat);
-  sun.setUTCDate(sun.getUTCDate() + 1);
-  return [dateStr(sat), dateStr(sun)];
 }
 
 // --- Staggered release: figure out which slot (if any) this run should fill ---
@@ -369,8 +319,7 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
     } catch (err) {
       // Safety net for date-range limits we haven't fully re-verified
       // since moving from Free to Pro — skip just this date instead of
-      // failing the whole run (matters most for the Weekender pool, which
-      // now reaches a few days ahead via upcomingWeekendDates()).
+      // failing the whole run (date-range limits can differ by API plan).
       console.warn(`Could not fetch fixtures for ${d}, skipping that date:`, err.message);
       continue;
     }
@@ -431,7 +380,7 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
           if (queue.length > 0) anyQueueHasFixtures = true;
 
           const fixtureId = f.fixture.id;
-          if (seen.has(fixtureId)) continue; // already priced (e.g. weekly pool overlapping today's date)
+          if (seen.has(fixtureId)) continue; // already priced
 
           oddsLookupsUsed++;
           let oddsResponse;
@@ -586,7 +535,11 @@ function pickSaintsLockMarket(oddsResponse) {
 // Tiers with fewer than 7 matches favor safer, more heavily-favored picks:
 // their fixture pool is restricted to legs priced at 1.77 or below rather
 // than the full odds range used for Gold and up.
-const SMALL_TICKET_TIERS = new Set(['mega', 'bronze', 'silver']); // matchCount < 7
+const SMALL_TICKET_TIERS = new Set(['mega', 'duo']); // matchCount < 7
+// Tiers whose odds band is a hard requirement: zero tolerance slack, and
+// the slip must use exactly the configured number of legs or it is skipped.
+const STRICT_RANGE_TIERS = new Set(['duo']);
+const DEFAULT_RANGE_TOLERANCE = 0.3;
 const SMALL_TICKET_MAX_ODDS = 1.77;
 
 /**
@@ -621,7 +574,7 @@ function computeTotalOdds(picks) {
  * the ticket within its odds range, returns `picks` unchanged — this is a
  * best-effort guarantee, not a mandate to force a bad combination.
  */
-function ensureFullWinLeg(picks, pool, usageCount, targetRange) {
+function ensureFullWinLeg(picks, pool, usageCount, targetRange, tolerance = DEFAULT_RANGE_TOLERANCE) {
   if (picks.length === 0) return picks;
   if (picks.some((p) => FULL_WIN_MARKETS.has(p.market))) return picks; // already has one
 
@@ -640,7 +593,7 @@ function ensureFullWinLeg(picks, pool, usageCount, targetRange) {
   const candidate = candidates[0];
 
   if (!targetRange) {
-    // No odds band to protect (Weekly Lite/Titan/Weekender) — swap out
+    // No odds band to protect — swap out
     // the current highest-odds leg for the full-win candidate.
     const highestIdx = picks.reduce((hi, p, i) => (p.odds > picks[hi].odds ? i : hi), 0);
     const next = [...picks];
@@ -649,7 +602,7 @@ function ensureFullWinLeg(picks, pool, usageCount, targetRange) {
   }
 
   const [minTotal, maxTotal] = targetRange;
-  const TOLERANCE = 0.3; // same slack pickFixturesForSlip itself allows
+  const TOLERANCE = tolerance;
   const order = [...picks.keys()].sort((a, b) => picks[b].odds - picks[a].odds); // highest-odds leg first
   for (const idx of order) {
     const next = [...picks];
@@ -673,7 +626,7 @@ function ensureFullWinLeg(picks, pool, usageCount, targetRange) {
  * as few legs as will actually get the job done, only adding more when
  * the safest legs alone can't reach the target.
  */
-function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
+function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange, tolerance = DEFAULT_RANGE_TOLERANCE) {
   const eligible = pool.filter((f) => (usageCount.get(f.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY);
   if (eligible.length === 0) return [];
 
@@ -685,10 +638,10 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
   });
 
   if (!targetRange) {
-    // No target range to hit (Weekly Lite/Titan/Weekender, "Mixed") —
+    // No target range to hit —
     // just take the safest available up to the max, as before.
     if (ranked.length < maxMatchCount) return [];
-    return ensureFullWinLeg(ranked.slice(0, maxMatchCount), pool, usageCount, null);
+    return ensureFullWinLeg(ranked.slice(0, maxMatchCount), pool, usageCount, null, tolerance);
   }
 
   const [minTotal, maxTotal] = targetRange;
@@ -747,11 +700,11 @@ function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
   }
 
   const finalTotal = computeTotalOdds(picks);
-  const TOLERANCE = 0.3; // 30% slack either side of the target band
+  const TOLERANCE = tolerance;
   const withinTolerance = finalTotal >= minTotal * (1 - TOLERANCE) && finalTotal <= maxTotal * (1 + TOLERANCE);
   if (!withinTolerance || picks.length === 0) return []; // pool doesn't have enough spread to hit this tier's range today
 
-  return ensureFullWinLeg(picks, pool, usageCount, targetRange);
+  return ensureFullWinLeg(picks, pool, usageCount, targetRange, tolerance);
 }
 
 /**
@@ -813,7 +766,7 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
   return { tickets, ticketMatches, fixturesUsed: [pick] };
 }
 
-function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, now) {
+function buildTickets(dailyPool, slipState, now) {
   const today = dateStr(now);
   const availableAtIso = new Date(now.getTime() + AVAILABILITY_DELAY_MS).toISOString();
   const tickets = [];
@@ -843,14 +796,18 @@ function buildTickets(dailyPool, weeklyPool, weekenderPool, slipState, now) {
       return;
     }
 
-    const isWeekly = config.tier === 'weekly_lite' || config.tier === 'weekly_titan';
-    const isWeekender = config.tier === 'weekender';
-    const basePool = isWeekender ? weekenderPool : isWeekly ? weeklyPool : dailyPool;
-    const pool = poolForTier(basePool, config.tier);
+    const pool = poolForTier(dailyPool, config.tier);
     const targetRange = TIER_ODDS_TARGET[config.tier] ?? null;
+    const strict = STRICT_RANGE_TIERS.has(config.tier);
 
-    const picks = pickFixturesForSlip(pool, config.matchCount, usageCount, targetRange);
-    if (picks.length === 0) {
+    const picks = pickFixturesForSlip(
+      pool,
+      config.matchCount,
+      usageCount,
+      targetRange,
+      strict ? 0 : DEFAULT_RANGE_TOLERANCE
+    );
+    if (picks.length === 0 || (strict && picks.length !== config.matchCount)) {
       console.log(`${config.label}: couldn't assemble a valid combination this run — skipping this slip.`);
       return; // couldn't assemble a valid combination today — skip this slip rather than force it
     }
@@ -896,12 +853,6 @@ async function main() {
   const today = new Date();
   const todayStr = dateStr(today);
   const dailyDates = [todayStr];
-  const weeklyDates = [todayStr];
-  for (let i = 1; i <= WEEKLY_LOOKAHEAD_DAYS; i++) {
-    const d = new Date(today);
-    d.setDate(d.getDate() + i);
-    weeklyDates.push(dateStr(d));
-  }
 
   const supabase = getSupabaseAdmin();
 
@@ -919,15 +870,6 @@ async function main() {
   console.log('Fetching daily fixture pool...');
   const dailyPool = await fetchPricedFixtures(dailyDates, MAX_ODDS_LOOKUPS_PER_RUN, today);
   console.log(`Priced ${dailyPool.length} fixtures for today.`);
-
-  console.log('Fetching weekly fixture pool (for Weekly Lite / Weekly Titan)...');
-  const weeklyPool = await fetchPricedFixtures(weeklyDates, MAX_ODDS_LOOKUPS_PER_RUN, today);
-  console.log(`Priced ${weeklyPool.length} fixtures for the week ahead.`);
-
-  console.log('Fetching Weekender pool (upcoming Sat+Sun)...');
-  const weekendDates = upcomingWeekendDates(today);
-  const weekenderPool = await fetchPricedFixtures(weekendDates, MAX_ODDS_LOOKUPS_PER_RUN, today);
-  console.log(`Priced ${weekenderPool.length} fixtures for the weekend (${weekendDates.join(', ')}).`);
 
   // Freeze fixtures already used by today's earlier Saint's Lock slip(s).
   // Their fixture rows carry the Saint's Lock market; re-pricing one in
@@ -947,8 +889,6 @@ async function main() {
 
   const { tickets, ticketMatches, fixturesUsed } = buildTickets(
     dropFrozen(dailyPool),
-    dropFrozen(weeklyPool),
-    dropFrozen(weekenderPool),
     slipState,
     today
   );
