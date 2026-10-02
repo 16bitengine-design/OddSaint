@@ -23,7 +23,6 @@ import { dirname, join } from 'node:path';
 import { getFixturesForDate, getFixturesByIds } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { getOwnModelForFixture } from './lib/teamModel.mjs';
-import { topScorelines } from './lib/scorelines.mjs';
 import { isAmateurOrYouthLeague } from './lib/leagueQuality.mjs';
 import { isWomensCompetition } from './lib/womensLeagueFilter.mjs';
 
@@ -35,6 +34,9 @@ const MIN_HOURS_SINCE_KICKOFF = 2.5; // same grading delay as grade-tickets.mjs
 const MAX_GRADE_PER_RUN = 60;
 const SCORES_PER_FIXTURE = 3;
 const FINISHED_STATUSES = new Set(['FT', 'AET', 'PEN']);
+// API-Football's /fixtures?ids= accepts at most 20 IDs per request — a larger
+// list is rejected, which would leave every pending prediction ungraded.
+const FIXTURE_IDS_PER_REQUEST = 20;
 
 function loadAllowlist() {
   try {
@@ -64,7 +66,16 @@ async function gradePending(supabase) {
   }
 
   const byId = new Map(pending.map((p) => [p.fixture_id, p]));
-  const results = await getFixturesByIds(pending.map((p) => p.fixture_id));
+  const ids = pending.map((p) => p.fixture_id);
+  const results = [];
+  for (let i = 0; i < ids.length; i += FIXTURE_IDS_PER_REQUEST) {
+    try {
+      results.push(...(await getFixturesByIds(ids.slice(i, i + FIXTURE_IDS_PER_REQUEST))));
+    } catch (err) {
+      // One failed batch must not stop the others from being graded.
+      console.warn(`Grading batch starting at ${i} failed:`, err.message);
+    }
+  }
 
   let graded = 0;
   for (const r of results) {
@@ -156,7 +167,12 @@ async function generateForToday(supabase, now) {
       home_team: f.teams?.home?.name ?? 'Home',
       away_team: f.teams?.away?.name ?? 'Away',
       kickoff: f.fixture.date,
-      top_scores: topScorelines(model.homeXG, model.awayXG, SCORES_PER_FIXTURE),
+      // Ranked straight from the model's own goal grid (already {home, away, probability}).
+      top_scores: (model.topScorelines ?? []).slice(0, SCORES_PER_FIXTURE).map((s) => ({
+        home: s.home,
+        away: s.away,
+        probability: Math.round(s.probability * 10000) / 10000,
+      })),
       home_xg: model.homeXG,
       away_xg: model.awayXG,
       home_sample: model.sampleInfo?.homeTeamMatches ?? null,
