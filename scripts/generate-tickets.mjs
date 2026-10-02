@@ -29,6 +29,7 @@ import { getFixturesForDate, getOddsForFixture } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { collectViableOutcomes, FULL_WIN_MARKETS } from './lib/markets.mjs';
 import { isAmateurOrYouthLeague } from './lib/leagueQuality.mjs';
+import { isSouthAmericanLeague } from './lib/regionFilter.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -66,7 +67,12 @@ function loadLeagueAllowlist() {
     const leagues = JSON.parse(raw);
     if (Array.isArray(leagues) && leagues.length > 0) {
       console.log(`Loaded ${leagues.length} resolved league(s) from leagues.json.`);
-      return new Set(leagues.map((l) => l.id));
+      // South American leagues are excluded from every ticket by product decision.
+      return new Set(
+        leagues
+          .filter((l) => l.region !== 'South America' && !isSouthAmericanLeague(l.country, l.name))
+          .map((l) => l.id)
+      );
     }
   } catch {
     // leagues.json doesn't exist yet (or is invalid) — fall back below.
@@ -331,6 +337,9 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
         // resolve-leagues.mjs, which applies the same filter) is stale or
         // predates this filter — see scripts/lib/leagueQuality.mjs.
         !isAmateurOrYouthLeague(f.league?.name) &&
+        // Product rule: no South American fixtures on any ticket (defense-in-
+        // depth on top of the allowlist filter — see scripts/lib/regionFilter.mjs).
+        !isSouthAmericanLeague(f.league?.country, f.league?.name) &&
         !isBigClash(f.teams?.home?.name, f.teams?.away?.name) &&
         !isExcluded(f.teams?.home?.name, f.teams?.away?.name) &&
         hasMinimumLeadTime(f.fixture?.date, now)
