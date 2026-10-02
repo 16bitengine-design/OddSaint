@@ -157,7 +157,7 @@ const TIER_CONFIG = [
   // band. Produced in EVERY release slot (see buildSaintsLockTickets).
   // Sign-up required, no free trial ever applies — see the separate
   // checkout flow in plans.ts.
-  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2', alwaysFree: false },
+  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5+', alwaysFree: false },
 ];
 
 // Numeric cumulative-odds targets matching each tier's oddsRange label
@@ -169,7 +169,7 @@ const TIER_CONFIG = [
 const TIER_ODDS_TARGET = {
   mega: [1.5, 3],
   duo: [2, 4],
-  saints_lock: [1.5, 2],
+  saints_lock: [1.5, Infinity], // floor only — any qualifying pick priced 1.5 or above
 };
 
 function dateStr(d) {
@@ -317,6 +317,8 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
   const seen = new Map(); // fixtureId -> priced fixture
   let oddsLookupsUsed = 0;
   const leagueBreakdown = new Map(); // league name -> count actually priced (for the run summary log)
+  // Funnel counters — answer "why so few priced fixtures?" straight from the log.
+  const funnel = { fetched: 0, inAllowlist: 0, startedOrTooSoon: 0, eligible: 0, oddsLookups: 0, noUsableMarket: 0, priced: 0, lockCandidates: 0 };
 
   for (const d of dates) {
     let fixtures;
@@ -344,6 +346,11 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
         !isExcluded(f.teams?.home?.name, f.teams?.away?.name) &&
         hasMinimumLeadTime(f.fixture?.date, now)
     );
+
+    funnel.fetched += fixtures.length;
+    funnel.inAllowlist += fixtures.filter((f) => LEAGUE_ALLOWLIST.has(f.league?.id)).length;
+    funnel.startedOrTooSoon += fixtures.filter((f) => !hasMinimumLeadTime(f.fixture?.date, now)).length;
+    funnel.eligible += eligible.length;
 
     if (eligible.length === 0) continue;
 
@@ -392,6 +399,7 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
           if (seen.has(fixtureId)) continue; // already priced
 
           oddsLookupsUsed++;
+          funnel.oddsLookups++;
           let oddsResponse;
           try {
             oddsResponse = await getOddsForFixture(fixtureId);
@@ -403,7 +411,12 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
 
           const picked = pickMarketFromOdds(oddsResponse);
           const lockPick = pickSaintsLockMarket(oddsResponse);
-          if (!picked && !lockPick) continue; // no usable market for this fixture — skip it
+          if (!picked && !lockPick) {
+            funnel.noUsableMarket++;
+            continue; // no usable market for this fixture — skip it
+          }
+          funnel.priced++;
+          if (lockPick) funnel.lockCandidates++;
           const base = picked ?? lockPick;
 
           seen.set(fixtureId, {
@@ -425,6 +438,14 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
       }
     }
   }
+
+  // eslint-disable-next-line no-console
+  console.log(
+    `Funnel: ${funnel.fetched} fixtures fetched → ${funnel.inAllowlist} in allowed leagues ` +
+      `(${funnel.startedOrTooSoon} of all fetched already started or kick off within ${MIN_HOURS_TO_KICKOFF}h) → ` +
+      `${funnel.eligible} eligible → ${funnel.oddsLookups} odds lookups → ${funnel.noUsableMarket} with no usable market ` +
+      `→ ${funnel.priced} priced (${funnel.lockCandidates} Saint's Lock candidates).`
+  );
 
   if (leagueBreakdown.size > 0) {
     // eslint-disable-next-line no-console
@@ -738,13 +759,21 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
 
   const candidates = dailyPool
     .filter((p) => p.lockPick && (usageCount.get(p.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY)
-    .sort((a, b) => b.lockPick.confidence - a.lockPick.confidence);
+    // Best = the most-favored qualifying pick: lowest price at or above the
+    // 1.5 floor (highest implied probability). Compare raw odds, not the
+    // rounded integer confidence, so near-ties aren't broken arbitrarily;
+    // priority leagues win an exact tie.
+    .sort(
+      (a, b) =>
+        a.lockPick.odds - b.lockPick.odds ||
+        (PRIORITY_LEAGUE_NAMES.has(b.league) ? 1 : 0) - (PRIORITY_LEAGUE_NAMES.has(a.league) ? 1 : 0)
+    );
 
   if (candidates.length === 0) {
     // eslint-disable-next-line no-console
     console.warn(
       `Saint's Lock slot ${slot}: NO fixture today has a Home Win / Away Win / Over 2.5 market ` +
-        `priced ${TIER_ODDS_TARGET.saints_lock[0]}-${TIER_ODDS_TARGET.saints_lock[1]} — nothing produced for this slot.`
+        `priced ${TIER_ODDS_TARGET.saints_lock[0]} or above — nothing produced for this slot.`
     );
     return { tickets: [], ticketMatches: [], fixturesUsed: [] };
   }
