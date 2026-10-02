@@ -42,6 +42,13 @@ import {
   type FeedbackRow,
 } from '@/lib/feedback';
 import { adminGrantAccess, type GrantableProduct } from '@/lib/adminGrant';
+import { CorrectScoresSection } from './CorrectScores';
+import {
+  fetchCorrectScores,
+  fetchCorrectScoreStats,
+  type CorrectScorePrediction,
+  type CorrectScoreStats,
+} from '@/lib/dataFetcher';
 
 // ---------------------------------------------------------------------------
 // Color tokens — Odd Saint brand
@@ -3053,6 +3060,9 @@ export default function Page() {
   const [pricingProduct, setPricingProduct] = useState<'subscription' | 'saints_lock'>('subscription');
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [history, setHistory] = useState<DayPerformance[]>([]);
+  const [correctScores, setCorrectScores] = useState<CorrectScorePrediction[]>([]);
+  const [correctScoreStats, setCorrectScoreStats] = useState<CorrectScoreStats | null>(null);
+  const [correctScoresLoading, setCorrectScoresLoading] = useState(true);
   const [showHistory, setShowHistory] = useState(false);
   const [loading, setLoading] = useState(true);
   const [ticketsLoading, setTicketsLoading] = useState(true);
@@ -3115,6 +3125,16 @@ export default function Page() {
         // eslint-disable-next-line no-console
         console.error('[Odd Saint] Failed to load performance history:', err);
       });
+    Promise.all([fetchCorrectScores(), fetchCorrectScoreStats(30)])
+      .then(([list, stats]) => {
+        setCorrectScores(list);
+        setCorrectScoreStats(stats);
+      })
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('[Odd Saint] Failed to load correct scores:', err);
+      })
+      .finally(() => setCorrectScoresLoading(false));
     getTrialPolicy()
       .then(setTrialPolicy)
       .catch((err) => {
@@ -3434,6 +3454,15 @@ export default function Page() {
             No tickets available right now — check back after the next release.
           </div>
         )}
+
+        {/* Correct-score predictions — same access rule as a standard ticket. */}
+        <CorrectScoresSection
+          predictions={correctScores}
+          stats={correctScoreStats}
+          unlocked={isAdmin || !!userEmail || trialActive}
+          loading={correctScoresLoading}
+          onSignUp={() => setShowLoginModal(true)}
+        />
 
         <Footer />
       </div>
