@@ -967,3 +967,131 @@ export interface ScorePredictionDayAccuracy {
   /** Correct ÷ (correct + incorrect) as a whole-number percent, or null if nothing decided yet. */
   hitRatePct: number | null;
 }
+
+// ---------------------------------------------------------------------------
+// Correct-score predictions
+// ---------------------------------------------------------------------------
+// Reads the `correct_score_predictions` table (supabase migration
+// 006_correct_scores.sql), written and graded by
+// scripts/generate-correct-scores.mjs. `top_scores` is the model's three
+// most likely exact scorelines, most likely first; a prediction is a 'hit'
+// when the FIRST one was exact, and `top3_hit` is true when ANY of the three
+// was. Public-read via RLS; the unlock gating is a UI decision.
+
+export interface ScoreLine {
+  home: number;
+  away: number;
+  probability: number; // model's own probability for this exact scoreline, 0-1
+}
+
+export interface CorrectScorePrediction {
+  fixtureId: string;
+  homeTeam: string;
+  awayTeam: string;
+  league: string;
+  country: string;
+  kickoff: string; // ISO date string
+  topScores: ScoreLine[];
+  homeXg: number;
+  awayXg: number;
+  status: 'pending' | 'hit' | 'miss';
+  top3Hit: boolean | null;
+  finalHomeScore?: number; // 90-minute score, set once graded
+  finalAwayScore?: number;
+}
+
+export interface CorrectScoreStats {
+  windowDays: number;
+  graded: number;
+  topHits: number;
+  top3Hits: number;
+  topHitRatePct: number | null;
+  top3HitRatePct: number | null;
+}
+
+/**
+ * Today's predictions in the VISITOR'S local calendar day (kickoff between
+ * local midnight and the next), ordered by kickoff. Filtering on kickoff
+ * rather than the stored prediction_date avoids a UTC-vs-local date
+ * mismatch hiding predictions around midnight.
+ */
+export async function fetchCorrectScores(): Promise<CorrectScorePrediction[]> {
+  try {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(start);
+    end.setDate(end.getDate() + 1);
+
+    const { data, error } = await supabase
+      .from('correct_score_predictions')
+      .select(
+        'fixture_id, league, country, home_team, away_team, kickoff, top_scores, home_xg, away_xg, result_status, top3_hit, final_home_score, final_away_score'
+      )
+      .gte('kickoff', start.toISOString())
+      .lt('kickoff', end.toISOString())
+      .order('kickoff', { ascending: true });
+    if (error || !data) return [];
+
+    return data.map((row: any) => ({
+      fixtureId: String(row.fixture_id),
+      homeTeam: row.home_team,
+      awayTeam: row.away_team,
+      league: row.league,
+      country: row.country,
+      kickoff: row.kickoff,
+      topScores: (Array.isArray(row.top_scores) ? row.top_scores : []).map((s: any) => ({
+        home: Number(s.home),
+        away: Number(s.away),
+        probability: Number(s.probability),
+      })),
+      homeXg: Number(row.home_xg),
+      awayXg: Number(row.away_xg),
+      status: row.result_status as 'pending' | 'hit' | 'miss',
+      top3Hit: row.top3_hit ?? null,
+      finalHomeScore: row.final_home_score ?? undefined,
+      finalAwayScore: row.final_away_score ?? undefined,
+    }));
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[Odd Saint] fetchCorrectScores failed:', err);
+    return [];
+  }
+}
+
+/** Real hit rates over the last `days` days of graded predictions — never mock data. */
+export async function fetchCorrectScoreStats(days: number = 30): Promise<CorrectScoreStats> {
+  const empty: CorrectScoreStats = {
+    windowDays: days,
+    graded: 0,
+    topHits: 0,
+    top3Hits: 0,
+    topHitRatePct: null,
+    top3HitRatePct: null,
+  };
+  try {
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const { data, error } = await supabase
+      .from('correct_score_predictions')
+      .select('result_status, top3_hit')
+      .neq('result_status', 'pending')
+      .gte('kickoff', since)
+      .limit(5000);
+    if (error || !data || data.length === 0) return empty;
+
+    const graded = data.length;
+    const topHits = data.filter((r: any) => r.result_status === 'hit').length;
+    const top3Hits = data.filter((r: any) => r.top3_hit === true).length;
+    return {
+      windowDays: days,
+      graded,
+      topHits,
+      top3Hits,
+      topHitRatePct: Math.round((topHits / graded) * 1000) / 10,
+      top3HitRatePct: Math.round((top3Hits / graded) * 1000) / 10,
+    };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[Odd Saint] fetchCorrectScoreStats failed:', err);
+    return empty;
+  }
+}
