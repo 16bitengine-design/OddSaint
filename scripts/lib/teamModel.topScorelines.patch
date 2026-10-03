@@ -1,0 +1,26 @@
+--- a/scripts/lib/teamModel.mjs
++++ b/scripts/lib/teamModel.mjs
+@@ probabilitiesFromExpectedGoals — add this NEW function right after it @@
++/**
++ * Most likely exact scorelines from the same Poisson goal grid, best first.
++ * Returns [{ home, away, probability }] (probability is 0-1).
++ */
++function topScorelinesFromExpectedGoals(homeXG, awayXG, n = 3) {
++  const all = [];
++  for (let h = 0; h <= MAX_GOALS_MODELED; h++) {
++    for (let a = 0; a <= MAX_GOALS_MODELED; a++) {
++      all.push({ home: h, away: a, probability: poissonPMF(h, homeXG) * poissonPMF(a, awayXG) });
++    }
++  }
++  return all.sort((x, y) => y.probability - x.probability).slice(0, n);
++}
++
+@@ getOwnModelForFixture — in the final return object, add topScorelines @@
+   const probabilities = probabilitiesFromExpectedGoals(homeXG, awayXG);
++  const topScorelines = topScorelinesFromExpectedGoals(homeXG, awayXG, 3);
+ 
+   return {
+     available: true,
+     probabilities,
++    topScorelines,
+     homeXG: Math.round(homeXG * 100) / 100,
