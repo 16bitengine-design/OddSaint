@@ -1,35 +1,51 @@
 // ---------------------------------------------------------------------------
-// Odd Saint — daily ticket generation
-// Pulls real fixtures + bookmaker odds from API-Football, turns them into
-// tickets for every tier, and writes them to Supabase. Runs TWICE a day via
-// .github/workflows/generate-tickets.yml (03:00 and 10:00 UTC — 06:00 and
-// 13:00 East Africa Time) so each tier's daily tickets release in two
-// staggered batches rather than all at once — see
-// fetchTodaysSlipState/nextSlotFor below for how a given run decides
-// whether it's producing today's 1st or 2nd slip for a tier, or skipping
-// that tier entirely because it already has both.
+// Odd Saint — ticket generation (Mega Day, Duo, Saint's Lock ONLY)
 //
-// HONEST SCOPE NOTE (read this before treating the output as a finished
-// prediction engine): the "AI Confidence Index" here is a simple, transparent
-// heuristic derived from bookmaker consensus odds (implied probability),
-// not a trained model. That's a legitimate, defensible basis for a
-// confidence figure — real odds reflect real market consensus — but it's
-// intentionally simple. Tune the SELECTION STRATEGY section below as your
-// picks strategy matures.
+// Runs twice a day via .github/workflows/generate-tickets.yml (03:00 and
+// 10:00 UTC). Each tier can release up to 2 tickets per day, at least
+// MIN_HOURS_BETWEEN_SLOTS apart, each becoming visible AVAILABILITY_DELAY_MS
+// after generation.
 //
-// SAINT'S LOCK FIX (2026-09-29): Saint's Lock used to require
-// confidence >= 85 AND odds 1.5-2.0, which can never both hold
-// (confidence = round(100/odds) is only 50-67% at those odds), and its
-// candidates were also filtered by MIN_CONFIDENCE 68 upstream, so its pool
-// was always empty. It now has its own candidate pick per fixture
-// (pickSaintsLockMarket) and always takes the best available one in EVERY
-// release slot. Regular tiers are unaffected.
+// WHAT CHANGED vs the previous version (accuracy work):
+//   1. CONFIDENCE IS NOW A REAL PROBABILITY. Previously confidence was
+//      100/odds from ONE bookmaker, which still contains that bookmaker's
+//      margin (a "75%" pick was really ~70%). Now every bookmaker's prices
+//      are devigged separately (proportional method) and the fair
+//      probabilities are averaged across bookmakers. Displayed odds are the
+//      MEDIAN QUOTED odds (what a user could actually get), not fair odds.
+//   2. THIN / DISAGREEING MARKETS ARE SKIPPED: fewer than MIN_BOOKMAKERS
+//      pricing an outcome, or bookmakers disagreeing by more than
+//      MAX_BOOKMAKER_SPREAD, means the fixture/outcome is not used.
+//   3. THE POISSON MODEL CAN VETO A PICK. If scripts/lib/teamModel.mjs has an
+//      opinion and it is more than MODEL_MAX_DISAGREEMENT below the market's
+//      fair probability, the outcome is dropped. No model opinion (thin
+//      history) never blocks a pick — it just isn't a second opinion.
+//   4. TICKETS ARE CHOSEN BY BEST JOINT PROBABILITY, not "greedy safest
+//      first": every valid leg combination inside the tier's odds band is
+//      scored by the product of its legs' fair probabilities.
+//   5. A FIXTURE APPEARS IN AT MOST ONE TICKET PER DAY (across all tiers and
+//      both slots), so a single upset can't sink several tickets at once.
+//      This also guarantees a fixture's stored market is never overwritten
+//      by a later run.
+//   6. NO SOUTH AMERICAN LEAGUES, NO WOMEN'S COMPETITIONS, no youth/reserve/
+//      lower-division leagues (shared filters), min 2h to kickoff.
+//
+// HONEST SCOPE NOTE: this is still bookmaker-consensus selection plus a
+// Poisson veto — NOT a trained model. Inside Saint's Lock's 1.48-2.00 odds
+// band the true win chance of ANY pick is roughly 50-67%; no filter can make
+// it "almost certain". Never describe it as such.
+//
+// confidence stored in `fixtures.confidence` is now round(fairProb * 100),
+// which runs lower than the old 100/odds figure. scripts/analyze-performance
+// .mjs bands and self-tune.mjs thresholds (built for the old scale) will need
+// re-baselining once new graded results accumulate.
 // ---------------------------------------------------------------------------
 import { getFixturesForDate, getOddsForFixture } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
-import { collectViableOutcomes, FULL_WIN_MARKETS } from './lib/markets.mjs';
+import { MARKET_CATALOG } from './lib/markets.mjs';
 import { isAmateurOrYouthLeague } from './lib/leagueQuality.mjs';
-import { isSouthAmericanLeague } from './lib/regionFilter.mjs';
+import { isWomensCompetition } from './lib/womensLeagueFilter.mjs';
+import { getOwnModelForFixture } from './lib/teamModel.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -39,100 +55,97 @@ const LEAGUES_JSON_PATH = join(__dirname, 'lib', 'leagues.json');
 
 // --- Config -----------------------------------------------------------------
 
-// Small built-in default — used until scripts/resolve-leagues.mjs has been
-// run at least once (via the manually-triggered "Resolve League IDs"
-// workflow) to generate the full, verified league list at
-// scripts/lib/leagues.json. One /fixtures?date= call already returns every
-// league for that date regardless of allowlist size — filtering here
-// doesn't cost extra API requests either way.
-const DEFAULT_LEAGUE_ALLOWLIST = new Set([
-  39,  // Premier League
-  140, // La Liga
-  135, // Serie A
-  78,  // Bundesliga
-  61,  // Ligue 1
-  2,   // UEFA Champions League
-  3,   // UEFA Europa League
-  88,  // Eredivisie
-  // Belgium, Denmark, Norway, Scotland, Austria, Switzerland, Turkey are
-  // intentionally NOT hardcoded here — their real numeric league IDs
-  // aren't something to guess. Run the "Resolve League IDs" workflow
-  // (scripts/resolve-leagues.mjs already targets all seven regional
-  // leagues) to bring them in via leagues.json with verified IDs instead.
-]);
+const TIER_CONFIG = {
+  mega: { tier: 'mega', label: 'Mega Day Ticket', maxLegs: 4, oddsRange: '1.5-3', alwaysFree: true },
+  duo: { tier: 'duo', label: 'Duo', maxLegs: 2, oddsRange: '2-4', alwaysFree: false },
+  saints_lock: { tier: 'saints_lock', label: "Saint's Lock", maxLegs: 1, oddsRange: '1.48-2', alwaysFree: false },
+};
+const TIERS = Object.keys(TIER_CONFIG);
+
+// --- Odds bands (cumulative ticket odds, built from QUOTED median odds) -----
+const MEGA_ODDS_RANGE = [1.5, 3];
+const DUO_ODDS_RANGE = [2, 4];
+// Product rule: Saint's Lock odds stay between 1.48 and 2.0.
+const SAINTS_LOCK_MIN_ODDS = 1.48;
+const SAINTS_LOCK_MAX_ODDS = 2.0;
+
+// --- Probability floors (devigged consensus fair probability, 0-1) ----------
+// Within Saint's Lock's odds band the fair probability can only be about
+// 0.48-0.66, so a floor above ~0.66 would make it impossible to ever publish.
+// 0.60 keeps it to the shorter end of the band (roughly odds <= ~1.57).
+const GLOBAL_MIN_FAIR_PROB = 0.45; // anything below this is never a candidate
+const SAINTS_LOCK_MIN_FAIR_PROB = 0.6;
+const MEGA_MIN_LEG_FAIR_PROB = 0.72;
+const DUO_MIN_LEG_FAIR_PROB = 0.55;
+
+// Product rule says "minimum 1 Saint's Lock a day". If nothing clears
+// SAINTS_LOCK_MIN_FAIR_PROB on the first slot, true would relax to the best
+// fixture inside the odds band. Default false: skipping a day beats shipping
+// a pick we don't believe in. Flip to true to restore the old guarantee.
+const ALLOW_SAINTS_LOCK_FALLBACK = false;
+
+// Mega: fewer legs = less compounded margin and fewer ways to lose. 3 keeps
+// it recognisably a "Mega"; set to 2 for the highest hit rate.
+const MEGA_MIN_LEGS = 3;
+const MEGA_MAX_LEGS = 4;
+
+// --- Market-quality gates ----------------------------------------------------
+const MIN_BOOKMAKERS = 3; // bookmakers that must price an outcome
+const MAX_BOOKMAKER_SPREAD = 0.08; // max-min fair probability across bookmakers
+const MODEL_MAX_DISAGREEMENT = 0.12; // model may sit at most this far below the market
+const COMBO_POOL_SIZE_MEGA = 16;
+const COMBO_POOL_SIZE_DUO = 30;
+
+// --- Pipeline limits ---------------------------------------------------------
+const MAX_ODDS_LOOKUPS_PER_RUN = 200;
+const PER_LEAGUE_LOOKUPS_PER_ROUND = 3;
+const MAX_TICKETS_PER_CATEGORY = 2;
+const MIN_HOURS_BETWEEN_SLOTS = 6;
+const AVAILABILITY_DELAY_MS = 60 * 60 * 1000; // 1 hour; matches RELEASE_SLOT_HOURS_UTC in dataFetcher.ts
+const MIN_HOURS_TO_KICKOFF = 2;
+const MODEL_CHECK_CONCURRENCY = 10;
+
+// --- Leagues -----------------------------------------------------------------
+
+const DEFAULT_LEAGUE_ALLOWLIST = new Set([39, 140, 135, 78, 61, 2, 3, 88]);
 
 function loadLeagueAllowlist() {
   try {
-    const raw = readFileSync(LEAGUES_JSON_PATH, 'utf8');
-    const leagues = JSON.parse(raw);
+    const leagues = JSON.parse(readFileSync(LEAGUES_JSON_PATH, 'utf8'));
     if (Array.isArray(leagues) && leagues.length > 0) {
       console.log(`Loaded ${leagues.length} resolved league(s) from leagues.json.`);
-      // South American leagues are excluded from every ticket by product decision.
-      return new Set(
-        leagues
-          .filter((l) => l.region !== 'South America' && !isSouthAmericanLeague(l.country, l.name))
-          .map((l) => l.id)
-      );
+      return new Set(leagues.map((l) => l.id));
     }
   } catch {
-    // leagues.json doesn't exist yet (or is invalid) — fall back below.
+    // fall through to default
   }
-  console.log(
-    'leagues.json not found — using the small built-in default league set. ' +
-      'Run the "Resolve League IDs" workflow for full regional coverage.'
-  );
+  console.log('leagues.json not found — using the small built-in default league set.');
   return DEFAULT_LEAGUE_ALLOWLIST;
 }
 
 const LEAGUE_ALLOWLIST = loadLeagueAllowlist();
 
-// Caps how many /odds requests a run makes for the daily pool (Pro plan:
-// 300 req/min, 7,500 req/day). Worst case is 2 runs/day x this value = 400
-// odds lookups/day, leaving ample headroom for grading and manual runs.
-const MAX_ODDS_LOOKUPS_PER_RUN = 200;
-
-// Named priority leagues break ties when ASSEMBLING tickets from the priced
-// pool (see the final sort at the end of fetchPricedFixtures, and
-// poolForTier/pickFixturesForSlip below) — and get first look in each
-// round of the odds-lookup rotation (see PER_LEAGUE_LOOKUPS_PER_ROUND).
-// They are NOT an exclusive gate on which leagues get priced: on a day
-// where these leagues are thin or mostly unpredictable (no clear
-// favorites, lots of picks failing MIN_CONFIDENCE), the rotation below
-// still gives every other allowlisted league with fixtures today a fair
-// shot at the odds-lookup budget instead of it being exhausted here first.
-// Belgium, Denmark, and Norway are prioritized here per product direction,
-// replacing Portugal's former default-set slot. League *names* are used
-// (rather than numeric IDs) since these are confirmed values from
-// API-Football's published league list, unlike guessed ID numbers.
 const PRIORITY_LEAGUE_NAMES = new Set([
   'Premier League', 'La Liga', 'Serie A', 'Bundesliga', 'Ligue 1',
   'UEFA Champions League', 'UEFA Europa League', 'Eredivisie',
-  'Scottish Premiership',    // UK regional tier-one
-  'Austrian Bundesliga',      // Central Europe
-  'Swiss Super League',       // Western Europe
-  'Turkish Super Lig',        // Eastern Europe / Asia-Minor bridge
-  'Jupiler Pro League',       // Belgium (regional priority)
-  'Superligaen',              // Denmark (regional priority)
-  'Eliteserien',              // Norway (regional priority)
+  'Scottish Premiership', 'Austrian Bundesliga', 'Swiss Super League',
+  'Turkish Super Lig', 'Jupiler Pro League', 'Superligaen', 'Eliteserien',
 ]);
 
-// How many odds lookups a single league can consume in one rotation pass
-// before yielding to the next league in line. This is the actual fix for
-// "glued to particular leagues": without a per-round cap, a priority
-// league with a full fixture list would consume the entire
-// MAX_ODDS_LOOKUPS_PER_RUN budget before any other league — including
-// other priority leagues further down the list — ever got a single odds
-// lookup, even on a day where that first league's matches were all
-// unpredictable coin-flips that would fail MIN_CONFIDENCE anyway. Kept
-// small (not 1) so a league with genuinely strong, easy fixtures can still
-// contribute more than a token pick per round.
-const PER_LEAGUE_LOOKUPS_PER_ROUND = 3;
+// Product rule: no ticket may include a fixture from any South American league.
+const SOUTH_AMERICAN_COUNTRIES = new Set([
+  'Brazil', 'Argentina', 'Uruguay', 'Chile', 'Colombia', 'Peru', 'Ecuador',
+  'Paraguay', 'Bolivia', 'Venezuela', 'Guyana', 'Suriname',
+]);
+const SOUTH_AMERICAN_COMPETITION_PATTERN = /libertadores|sudamericana|sul-?americana|conmebol/i;
 
-// A curated set of marquee clubs across the covered leagues. Fixtures where
-// BOTH sides are in this set (e.g. Real Madrid vs Barcelona, a Manchester
-// or Milan derby) are skipped entirely — these are inherently the hardest
-// matches to call with real confidence, so the platform avoids building
-// picks around them rather than pretending otherwise.
+function isSouthAmericanFixture(f) {
+  return (
+    SOUTH_AMERICAN_COUNTRIES.has(f.league?.country) ||
+    SOUTH_AMERICAN_COMPETITION_PATTERN.test(f.league?.name ?? '')
+  );
+}
+
 const BIG_CLUBS = new Set([
   'Manchester City', 'Manchester United', 'Liverpool', 'Arsenal', 'Chelsea', 'Tottenham',
   'Real Madrid', 'Barcelona', 'Atletico Madrid',
@@ -146,121 +159,6 @@ function isBigClash(homeTeam, awayTeam) {
   return BIG_CLUBS.has(homeTeam) && BIG_CLUBS.has(awayTeam);
 }
 
-const TIER_CONFIG = [
-  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
-  // Exactly two legs, cumulative odds between 2 and 4 (inclusive). Held to
-  // a strict band — see STRICT_RANGE_TIERS below. Must stay in sync with
-  // TIER_CONFIG in src/lib/dataFetcher.ts.
-  { tier: 'duo', label: 'Duo', matchCount: 2, oddsRange: '2-4', alwaysFree: false },
-  // Single-match category. Only ever one match per slip — the safest
-  // Home Win / Away Win / Over 2.5 pick available in the 1.5-2.0 odds
-  // band. Produced in EVERY release slot (see buildSaintsLockTickets).
-  // Sign-up required, no free trial ever applies — see the separate
-  // checkout flow in plans.ts.
-  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5+', alwaysFree: false },
-];
-
-// Numeric cumulative-odds targets matching each tier's oddsRange label
-// above. These are ACTUALLY ENFORCED during slip assembly (see
-// pickFixturesForSlip) — previously oddsRange was just a display string
-// with nothing checking whether a ticket's real combined odds landed
-// inside it. Tiers without an entry here are intentionally left unset
-// ("Mixed" by design, no fixed target).
-const TIER_ODDS_TARGET = {
-  mega: [1.5, 3],
-  duo: [2, 4],
-  saints_lock: [1.5, Infinity], // floor only — any qualifying pick priced 1.5 or above
-};
-
-function dateStr(d) {
-  return d.toISOString().slice(0, 10);
-}
-
-// --- Staggered release: figure out which slot (if any) this run should fill ---
-
-// Every category caps at 2 tickets/day (down from 3) — see product
-// direction: max 2/category/day, released at staggered times rather than
-// all at once, so users never see multiple slips for the same tier appear
-// simultaneously (avoids an "illusion of choice" where every option shows
-// up at the same moment with no real signal about which is fresher).
-const MAX_TICKETS_PER_CATEGORY = 2;
-
-// Minimum real-world gap enforced between a tier's slot-0 and slot-1
-// ticket on the same day. Exists so a manual re-run, a delayed cron, or
-// GitHub Actions scheduling jitter can never produce both of a tier's
-// daily slips back-to-back — the two staggered releases stay meaningfully
-// spread out regardless of exactly when this workflow happens to fire.
-// Matches the two 03:00/10:00 UTC cron triggers (7h apart) with headroom.
-const MIN_HOURS_BETWEEN_SLOTS = 6;
-
-// Tickets become ACCESSIBLE this long after the moment they're generated
-// — not the instant the row is written. Gives a clean, predictable "ready
-// at" cutoff instead of a batch appearing mid-write, and matches
-// RELEASE_SLOT_HOURS_UTC in src/lib/dataFetcher.ts (generation at
-// 03:00/10:00 UTC + this delay = 04:00/11:00 UTC availability). Enforced
-// on the read side by fetchRealTicketsForDate in dataFetcher.ts, which
-// filters out any row whose available_at is still in the future — this
-// file's only job is stamping the correct future timestamp when writing.
-const AVAILABILITY_DELAY_MS = 60 * 60 * 1000; // 1 hour
-
-/**
- * Reads how many slips already exist today per tier, and when the most
- * recent one for each tier was released — this is what makes slot
- * placement idempotent and safe to call from either of the day's two
- * scheduled runs (or a manual re-run) without ever overproducing.
- */
-async function fetchTodaysSlipState(supabase, today) {
-  const { data, error } = await supabase
-    .from('tickets')
-    .select('tier, release_slot, available_at')
-    .eq('ticket_date', today);
-  if (error) throw error;
-
-  const byTier = new Map(); // tier -> { count, lastAvailableAt }
-  (data ?? []).forEach((row) => {
-    const existing = byTier.get(row.tier) ?? { count: 0, lastAvailableAt: null };
-    existing.count += 1;
-    if (!existing.lastAvailableAt || row.available_at > existing.lastAvailableAt) {
-      existing.lastAvailableAt = row.available_at;
-    }
-    byTier.set(row.tier, existing);
-  });
-  return byTier;
-}
-
-/**
- * Decides whether THIS run should produce the tier's next slip, and if so
- * which slot index (0 or 1) it fills. Returns null when the tier already
- * has its daily cap, or when the minimum gap since its last slip hasn't
- * elapsed yet — in either case the tier is simply skipped this run, and
- * whatever it already has stays on display untouched (nothing here ever
- * deletes or overwrites a previous slip).
- */
-function nextSlotFor(maxSlipsToday, slipState) {
-  const state = slipState ?? { count: 0, lastAvailableAt: null };
-  if (state.count >= maxSlipsToday) return null; // already at today's cap for this tier
-  if (state.count === 0) return 0; // first slip of the day — always fine
-  // available_at is stamped as GENERATION time + AVAILABILITY_DELAY_MS
-  // (see buildTickets/buildSaintsLockTickets), so recover the actual
-  // generation time before measuring the gap — otherwise every comparison
-  // would be skewed by that same fixed delay, which at this schedule's 7h
-  // gap would put the measured value right at the MIN_HOURS_BETWEEN_SLOTS
-  // boundary instead of safely above it.
-  const lastGeneratedAtMs = new Date(state.lastAvailableAt).getTime() - AVAILABILITY_DELAY_MS;
-  const hoursSinceLast = (Date.now() - lastGeneratedAtMs) / 3_600_000;
-  if (hoursSinceLast < MIN_HOURS_BETWEEN_SLOTS) return null; // too soon — this run isn't the 2nd slot's time yet
-  return state.count; // e.g. 1 for the 2nd slip of the day
-}
-
-// --- Fetch + price fixtures ---------------------------------------------------
-
-// Empty by default — add exact team names here (matching API-Football's
-// naming) if there are specific clubs or competitions you want the
-// pipeline to avoid picking entirely, for any reason (integrity concerns,
-// unreliable data, or otherwise). This is a business decision left to you
-// rather than a list Claude fills in, since flagging real clubs by name
-// for something as serious as match-fixing needs to be based on your own
-// verified, current judgment — not baked into the code as an assumption.
 const EXCLUDED_TEAMS = new Set([
   // 'Example FC',
 ]);
@@ -269,107 +167,199 @@ function isExcluded(homeTeam, awayTeam) {
   return EXCLUDED_TEAMS.has(homeTeam) || EXCLUDED_TEAMS.has(awayTeam);
 }
 
-// Product rule: a fixture must be at least this many hours from kickoff,
-// measured from the moment THIS run started (not wall-clock time when the
-// fixture happens to be evaluated mid-loop), to be eligible for a ticket.
-// Protects against picks generated too close to kickoff, where there's
-// less time for team news, a lineup change, or a postponement to surface
-// before someone acts on the pick.
-const MIN_HOURS_TO_KICKOFF = 2;
-
 function hasMinimumLeadTime(kickoffISO, now) {
   if (!kickoffISO) return false;
-  const kickoffMs = new Date(kickoffISO).getTime();
-  return kickoffMs - now.getTime() >= MIN_HOURS_TO_KICKOFF * 60 * 60 * 1000;
+  return new Date(kickoffISO).getTime() - now.getTime() >= MIN_HOURS_TO_KICKOFF * 60 * 60 * 1000;
+}
+
+// --- Small helpers -------------------------------------------------------------
+
+function dateStr(d) {
+  return d.toISOString().slice(0, 10);
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+function mean(values) {
+  return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+function median(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function product(values) {
+  return values.reduce((a, b) => a * b, 1);
+}
+
+function* combinations(items, k, start = 0, prefix = []) {
+  if (prefix.length === k) {
+    yield prefix;
+    return;
+  }
+  for (let i = start; i < items.length; i++) {
+    yield* combinations(items, k, i + 1, [...prefix, items[i]]);
+  }
+}
+
+// --- Consensus, vig-corrected pricing -----------------------------------------
+
+const OUTCOME_BANDS = new Map(); // marketLabel -> { oddsMin, oddsMax }
+MARKET_CATALOG.forEach((bet) =>
+  bet.outcomes.forEach((o) => OUTCOME_BANDS.set(o.marketLabel, { oddsMin: o.oddsMin, oddsMax: o.oddsMax }))
+);
+
+function parseOdd(entry) {
+  const n = parseFloat(entry?.odd);
+  return Number.isFinite(n) && n > 1 ? n : null;
 }
 
 /**
- * Fetches and prices fixtures for the given dates, spending up to
- * `maxOddsLookups` /odds requests total. `now` anchors both the kickoff
- * lead-time filter above and is passed through unchanged for the whole
- * call — every fixture in one run is judged against the same moment,
- * rather than drifting as the run progresses.
- *
- * FLEXIBLE LEAGUE ROTATION (this is the fix for "glued to particular
- * leagues"): fixtures are grouped by league, then priced in a round-robin
- * rotation — named priority leagues go first each round, but only
- * PER_LEAGUE_LOOKUPS_PER_ROUND lookups at a time, before the rotation
- * moves on to the next league (priority or not) that still has fixtures
- * queued. The rotation repeats until either the budget runs out or every
- * league's queue is empty.
- *
- * The old behavior sorted ALL priority-league fixtures ahead of ALL other
- * fixtures, so a single busy priority league could consume the entire
- * day's odds-lookup budget before any other league was even attempted —
- * including on days where that league's matches were mostly unpredictable
- * coin-flips that would go on to fail MIN_CONFIDENCE anyway. The rotation
- * below means every allowlisted league with fixtures today gets looked at,
- * not just the named priority set — "priority" now only breaks ties once
- * fixtures are being assembled into tickets (see the final sort below).
- *
- * SAINT'S LOCK: each priced fixture may carry TWO independent picks —
- * `market/odds/confidence` (the regular pick, must clear MIN_CONFIDENCE)
- * and `lockPick` (the Saint's Lock candidate, see pickSaintsLockMarket).
- * A fixture that has ONLY a lockPick is flagged `lockOnly` and is kept out
- * of every regular tier by poolForTier.
+ * Devigs ONE bookmaker's prices. Returns Map<marketLabel, { fairProb, odds }>
+ * for every catalog outcome whose full market group that bookmaker priced
+ * (an incomplete group can't be devigged, so it's skipped, never guessed).
  */
-async function fetchPricedFixtures(dates, maxOddsLookups, now) {
+function bookmakerFairProbs(bets) {
+  const out = new Map();
+  const getBet = (name) => bets?.find((b) => b.name === name);
+  const val = (bet, apiValue) => parseOdd(bet?.values?.find((v) => v.value === apiValue));
+  const add = (label, fairProb, odds) => {
+    if (OUTCOME_BANDS.has(label)) out.set(label, { fairProb, odds });
+  };
+
+  const mw = getBet('Match Winner');
+  if (mw) {
+    const h = val(mw, 'Home');
+    const d = val(mw, 'Draw');
+    const a = val(mw, 'Away');
+    if (h && d && a) {
+      const sum = 1 / h + 1 / d + 1 / a;
+      add('Home Win', 1 / h / sum, h);
+      add('Away Win', 1 / a / sum, a);
+    }
+  }
+
+  const ou = getBet('Goals Over/Under');
+  if (ou) {
+    for (const line of ['1.5', '2.5', '3.5']) {
+      const over = val(ou, `Over ${line}`);
+      const under = val(ou, `Under ${line}`);
+      if (!over || !under) continue;
+      const sum = 1 / over + 1 / under;
+      add(`Over ${line} Goals`, 1 / over / sum, over);
+      add(`Under ${line} Goals`, 1 / under / sum, under);
+    }
+  }
+
+  const btts = getBet('Both Teams Score');
+  if (btts) {
+    const yes = val(btts, 'Yes');
+    const no = val(btts, 'No');
+    if (yes && no) {
+      const sum = 1 / yes + 1 / no;
+      add('BTTS - Yes', 1 / yes / sum, yes);
+      add('BTTS - No', 1 / no / sum, no);
+    }
+  }
+
+  const dc = getBet('Double Chance');
+  if (dc) {
+    const x1 = val(dc, 'Home/Draw');
+    const x2 = val(dc, 'Draw/Away');
+    const x12 = val(dc, 'Home/Away');
+    if (x1 && x2 && x12) {
+      // The three double-chance outcomes cover every result twice, so their
+      // fair probabilities sum to 2, not 1.
+      const sum = 1 / x1 + 1 / x2 + 1 / x12;
+      add('Double Chance 1X', ((1 / x1) / sum) * 2, x1);
+      add('Double Chance X2', ((1 / x2) / sum) * 2, x2);
+      add('Double Chance 12', ((1 / x12) / sum) * 2, x12);
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Averages every bookmaker's devigged fair probability per outcome. Drops
+ * outcomes priced by too few bookmakers, where bookmakers disagree too much,
+ * or whose median quoted odds fall outside the catalog's own odds band.
+ */
+function consensusOutcomes(bookmakers) {
+  const acc = new Map(); // label -> { probs: [], odds: [] }
+  for (const bm of bookmakers ?? []) {
+    for (const [label, { fairProb, odds }] of bookmakerFairProbs(bm.bets)) {
+      const entry = acc.get(label) ?? { probs: [], odds: [] };
+      entry.probs.push(fairProb);
+      entry.odds.push(odds);
+      acc.set(label, entry);
+    }
+  }
+
+  const results = [];
+  for (const [label, { probs, odds }] of acc) {
+    if (probs.length < MIN_BOOKMAKERS) continue;
+    if (Math.max(...probs) - Math.min(...probs) > MAX_BOOKMAKER_SPREAD) continue;
+
+    const band = OUTCOME_BANDS.get(label);
+    const quoted = median(odds);
+    if (quoted < band.oddsMin || quoted > band.oddsMax) continue;
+
+    results.push({
+      market: label,
+      odds: round2(quoted),
+      fairProb: mean(probs),
+      bookmakerCount: probs.length,
+      modelProbability: null,
+      modelAvailable: false,
+    });
+  }
+  return results;
+}
+
+// --- Fetch + price fixtures ----------------------------------------------------
+
+async function fetchPricedFixtures(dates, maxOddsLookups, now, usedFixtureIds) {
   const seen = new Map(); // fixtureId -> priced fixture
   let oddsLookupsUsed = 0;
-  const leagueBreakdown = new Map(); // league name -> count actually priced (for the run summary log)
-  // Funnel counters — answer "why so few priced fixtures?" straight from the log.
-  const funnel = { fetched: 0, inAllowlist: 0, startedOrTooSoon: 0, eligible: 0, oddsLookups: 0, noUsableMarket: 0, priced: 0, lockCandidates: 0 };
+  const stats = { lookups: 0, noOdds: 0, noViableOutcome: 0, priced: 0 };
+  const leagueBreakdown = new Map();
 
   for (const d of dates) {
     let fixtures;
     try {
       fixtures = await getFixturesForDate(d);
     } catch (err) {
-      // Safety net for date-range limits we haven't fully re-verified
-      // since moving from Free to Pro — skip just this date instead of
-      // failing the whole run (date-range limits can differ by API plan).
       console.warn(`Could not fetch fixtures for ${d}, skipping that date:`, err.message);
       continue;
     }
+
     const eligible = fixtures.filter(
       (f) =>
+        f.fixture?.status?.short === 'NS' && // not started
+        !usedFixtureIds.has(f.fixture?.id) &&
         LEAGUE_ALLOWLIST.has(f.league?.id) &&
-        // Defense-in-depth: excludes youth/reserve/third-division-or-lower
-        // competitions by name pattern even if leagues.json (built by
-        // resolve-leagues.mjs, which applies the same filter) is stale or
-        // predates this filter — see scripts/lib/leagueQuality.mjs.
         !isAmateurOrYouthLeague(f.league?.name) &&
-        // Product rule: no South American fixtures on any ticket (defense-in-
-        // depth on top of the allowlist filter — see scripts/lib/regionFilter.mjs).
-        !isSouthAmericanLeague(f.league?.country, f.league?.name) &&
+        !isWomensCompetition(f.league?.name) &&
+        !isSouthAmericanFixture(f) &&
         !isBigClash(f.teams?.home?.name, f.teams?.away?.name) &&
         !isExcluded(f.teams?.home?.name, f.teams?.away?.name) &&
         hasMinimumLeadTime(f.fixture?.date, now)
     );
-
-    funnel.fetched += fixtures.length;
-    funnel.inAllowlist += fixtures.filter((f) => LEAGUE_ALLOWLIST.has(f.league?.id)).length;
-    funnel.startedOrTooSoon += fixtures.filter((f) => !hasMinimumLeadTime(f.fixture?.date, now)).length;
-    funnel.eligible += eligible.length;
-
     if (eligible.length === 0) continue;
 
-    // Group today's eligible fixtures by league so the rotation below can
-    // give each league with fixtures today a fair, repeated turn instead
-    // of exhausting the budget on whichever league sorts first.
-    const byLeague = new Map(); // league name -> fixture queue (FIFO)
+    const byLeague = new Map();
     eligible.forEach((f) => {
       const name = f.league?.name ?? 'Unknown League';
       if (!byLeague.has(name)) byLeague.set(name, []);
       byLeague.get(name).push(f);
     });
 
-    // Rotation order: named priority leagues first (so they still get
-    // first look each round), then every other league that actually has
-    // fixtures today, in the order first encountered in the API response.
-    // This is a per-round ordering, not an allowlist — a non-priority
-    // league with fixtures today is never excluded from pricing, only
-    // queued behind the priority set within a given round.
+    // Round-robin odds lookups so one busy league can't eat the whole budget.
     const leagueOrder = [
       ...PRIORITY_LEAGUE_NAMES,
       ...Array.from(byLeague.keys()).filter((name) => !PRIORITY_LEAGUE_NAMES.has(name)),
@@ -381,586 +371,407 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
 
       for (const leagueName of leagueOrder) {
         if (oddsLookupsUsed >= maxOddsLookups) break;
-
         const queue = byLeague.get(leagueName);
         if (!queue || queue.length === 0) continue;
 
         let takenThisRound = 0;
-        while (
-          takenThisRound < PER_LEAGUE_LOOKUPS_PER_ROUND &&
-          queue.length > 0 &&
-          oddsLookupsUsed < maxOddsLookups
-        ) {
+        while (takenThisRound < PER_LEAGUE_LOOKUPS_PER_ROUND && queue.length > 0 && oddsLookupsUsed < maxOddsLookups) {
           const f = queue.shift();
           takenThisRound++;
           if (queue.length > 0) anyQueueHasFixtures = true;
 
           const fixtureId = f.fixture.id;
-          if (seen.has(fixtureId)) continue; // already priced
+          if (seen.has(fixtureId)) continue;
 
           oddsLookupsUsed++;
-          funnel.oddsLookups++;
+          stats.lookups++;
           let oddsResponse;
           try {
             oddsResponse = await getOddsForFixture(fixtureId);
           } catch (err) {
-            // eslint-disable-next-line no-console
             console.warn(`Odds lookup failed for fixture ${fixtureId}:`, err.message);
             continue;
           }
 
-          const picked = pickMarketFromOdds(oddsResponse);
-          const lockPick = pickSaintsLockMarket(oddsResponse);
-          if (!picked && !lockPick) {
-            funnel.noUsableMarket++;
-            continue; // no usable market for this fixture — skip it
+          const bookmakers = oddsResponse?.[0]?.bookmakers;
+          if (!bookmakers || bookmakers.length === 0) {
+            stats.noOdds++;
+            continue;
           }
-          funnel.priced++;
-          if (lockPick) funnel.lockCandidates++;
-          const base = picked ?? lockPick;
+
+          const outcomes = consensusOutcomes(bookmakers).filter((o) => o.fairProb >= GLOBAL_MIN_FAIR_PROB);
+          if (outcomes.length === 0) {
+            stats.noViableOutcome++;
+            continue;
+          }
 
           seen.set(fixtureId, {
             fixtureId,
-            ticketDate: dateStr(new Date()),
+            ticketDate: dateStr(now),
             league: f.league?.name ?? 'Unknown League',
             country: f.league?.country ?? 'Unknown',
             homeTeam: f.teams?.home?.name ?? 'Home',
             awayTeam: f.teams?.away?.name ?? 'Away',
+            homeTeamId: f.teams?.home?.id ?? null,
+            awayTeamId: f.teams?.away?.id ?? null,
             kickoff: f.fixture?.date,
-            market: base.market,
-            odds: base.odds,
-            confidence: base.confidence,
-            lockPick, // Saint's Lock candidate (or null)
-            lockOnly: !picked, // true = must NOT be used by any regular tier
+            outcomes,
           });
+          stats.priced++;
           leagueBreakdown.set(leagueName, (leagueBreakdown.get(leagueName) ?? 0) + 1);
         }
       }
     }
   }
 
-  // eslint-disable-next-line no-console
   console.log(
-    `Funnel: ${funnel.fetched} fixtures fetched → ${funnel.inAllowlist} in allowed leagues ` +
-      `(${funnel.startedOrTooSoon} of all fetched already started or kick off within ${MIN_HOURS_TO_KICKOFF}h) → ` +
-      `${funnel.eligible} eligible → ${funnel.oddsLookups} odds lookups → ${funnel.noUsableMarket} with no usable market ` +
-      `→ ${funnel.priced} priced (${funnel.lockCandidates} Saint's Lock candidates).`
+    `Odds lookups: ${stats.lookups} | no odds: ${stats.noOdds} | no outcome cleared the market-quality gates: ` +
+      `${stats.noViableOutcome} | priced: ${stats.priced}`
   );
-
   if (leagueBreakdown.size > 0) {
-    // eslint-disable-next-line no-console
     console.log(
-      'Priced fixtures by league this run: ' +
-        Array.from(leagueBreakdown.entries())
-          .map(([name, count]) => `${name}: ${count}`)
-          .join(', ')
+      'Priced fixtures by league: ' +
+        Array.from(leagueBreakdown.entries()).map(([n, c]) => `${n}: ${c}`).join(', ')
     );
   }
 
-  // Priority leagues still get first billing once fixtures are being
-  // assembled into tickets (equal-confidence tie-break) — but every
-  // allowlisted league with fixtures today was actually attempted above,
-  // so a non-priority league's picks are never excluded from this pool.
-  return Array.from(seen.values()).sort((a, b) => {
-    const aPriority = PRIORITY_LEAGUE_NAMES.has(a.league) ? 1 : 0;
-    const bPriority = PRIORITY_LEAGUE_NAMES.has(b.league) ? 1 : 0;
-    if (aPriority !== bPriority) return bPriority - aPriority;
-    return b.confidence - a.confidence;
-  });
+  return Array.from(seen.values());
 }
 
-// A fixture is skipped entirely if nothing viable clears this confidence
-// floor — better to generate one fewer match, or even skip a slip, than to
-// force in a pick the market itself doesn't consider a clear favorite.
-const MIN_CONFIDENCE = 68;
-
-// Result-based markets to steer away from when priced this short — an
-// extremely tight price on any of these can still be upset (a draw, a cup
-// shock, a keeper's bad day). Double Chance is the only one of these that
-// actually reaches odds this low (as tight as 1.1) — Home Win / Away Win
-// can NEVER trigger this guard, since their own odds band in
-// MARKET_CATALOG (markets.mjs) starts at 1.3: an outright win pick is
-// never substituted away for being "too safe." This guard exists purely
-// to catch an overly tight Double Chance price, not to steer away from
-// full wins — see FULL_WIN_MARKETS / ensureFullWinLeg below for the
-// separate "always incorporate a full win where necessary" logic.
-const RESULT_BASED_MARKETS = new Set([
-  'Home Win', 'Away Win', 'Double Chance 1X', 'Double Chance X2', 'Double Chance 12',
-]);
-const WIN_MARKET_MIN_ODDS = 1.3;
+// --- Poisson model veto -----------------------------------------------------------
 
 /**
- * SELECTION STRATEGY (odds → market pick):
- * Checks every market in the shared catalog (Match Winner, Goals
- * Over/Under, Both Teams Score, Double Chance) against this fixture's
- * bookmaker odds, and takes the SAFEST viable outcome — i.e. whichever
- * has the lowest odds / highest implied confidence — rather than picking
- * randomly among them. If that safest outcome is a result-based market
- * (see RESULT_BASED_MARKETS) priced below WIN_MARKET_MIN_ODDS, an Over
- * Goals market is substituted instead when one's available. Skips the
- * fixture entirely if nothing clears MIN_CONFIDENCE, rather than forcing a
- * low-quality pick just to fill a ticket.
+ * Drops any outcome the first-party Poisson model rates clearly lower than
+ * the bookmaker consensus. Fixtures without enough team history keep all
+ * their outcomes (modelAvailable = false) — absence of a model opinion is
+ * never treated as disagreement.
  */
-function pickMarketFromOdds(oddsResponse) {
-  const bookmaker = oddsResponse?.[0]?.bookmakers?.[0];
-  if (!bookmaker) return null;
+async function applyModelVeto(supabase, pool) {
+  let vetoed = 0;
+  let withModel = 0;
 
-  const viable = collectViableOutcomes(bookmaker.bets);
-  if (viable.length === 0) return null;
+  for (let i = 0; i < pool.length; i += MODEL_CHECK_CONCURRENCY) {
+    const chunk = pool.slice(i, i + MODEL_CHECK_CONCURRENCY);
+    await Promise.all(
+      chunk.map(async (fx) => {
+        let model;
+        try {
+          model = await getOwnModelForFixture(supabase, {
+            league: fx.league,
+            homeTeamId: fx.homeTeamId,
+            awayTeamId: fx.awayTeamId,
+            homeTeamName: fx.homeTeam,
+            awayTeamName: fx.awayTeam,
+          });
+        } catch (err) {
+          model = { available: false };
+        }
 
-  const sorted = [...viable].sort((a, b) => a.odds - b.odds);
-  let chosen = sorted[0]; // lowest odds = safest, by default
+        if (model?.available) withModel++;
 
-  const isResultMarket = RESULT_BASED_MARKETS.has(chosen.market);
-  if (isResultMarket && chosen.odds < WIN_MARKET_MIN_ODDS) {
-    const goalsAlt = sorted.find((o) => o.market === 'Over 1.5 Goals' || o.market === 'Over 2.5 Goals');
-    if (goalsAlt) {
-      chosen = goalsAlt;
-    } else {
-      // No Goals-market alternative for this fixture — fall back to the
-      // next-safest non-result-based option if one exists (e.g. BTTS),
-      // rather than the too-short result-based price.
-      const nonResult = sorted.find((o) => !RESULT_BASED_MARKETS.has(o.market));
-      if (nonResult) chosen = nonResult;
-      // If truly nothing else is viable, the short price is accepted
-      // rather than dropping the fixture entirely.
-    }
-  }
-
-  const confidence = impliedConfidence(chosen.odds);
-  if (confidence < MIN_CONFIDENCE) return null; // too uncertain even at its safest — skip this fixture
-
-  return { market: chosen.market, odds: chosen.odds, confidence };
-}
-
-function impliedConfidence(odds) {
-  const raw = Math.round((1 / odds) * 100);
-  return Math.min(95, Math.max(55, raw)); // clipped to a sane display range
-}
-
-// Saint's Lock candidate markets — straight Home Win / Away Win / Over 2.5
-// Goals only, priced inside the tier's 1.5-2.0 odds band. Deliberately
-// SEPARATE from pickMarketFromOdds: at 1.5-2.0 odds the implied confidence
-// is only ~50-67%, so these picks can never clear MIN_CONFIDENCE (68) and
-// would otherwise never enter the pool at all — which is exactly why
-// Saint's Lock used to come out empty every run. Lowest odds in band =
-// the market's own most-favored option.
-const SAINTS_LOCK_MARKETS = new Set(['Home Win', 'Away Win', 'Over 2.5 Goals']);
-
-function pickSaintsLockMarket(oddsResponse) {
-  const bookmaker = oddsResponse?.[0]?.bookmakers?.[0];
-  if (!bookmaker) return null;
-
-  const [minOdds, maxOdds] = TIER_ODDS_TARGET.saints_lock;
-  const best = collectViableOutcomes(bookmaker.bets)
-    .filter((o) => SAINTS_LOCK_MARKETS.has(o.market) && o.odds >= minOdds && o.odds <= maxOdds)
-    .sort((a, b) => a.odds - b.odds)[0];
-  if (!best) return null;
-
-  return { market: best.market, odds: best.odds, confidence: impliedConfidence(best.odds) };
-}
-
-// --- Assemble tickets from the priced-fixture pool ---------------------------
-
-// Tiers with fewer than 7 matches favor safer, more heavily-favored picks:
-// their fixture pool is restricted to legs priced at 1.77 or below rather
-// than the full odds range used for Gold and up.
-const SMALL_TICKET_TIERS = new Set(['mega', 'duo']); // matchCount < 7
-// Tiers whose odds band is a hard requirement: zero tolerance slack, and
-// the slip must use exactly the configured number of legs or it is skipped.
-const STRICT_RANGE_TIERS = new Set(['duo']);
-const DEFAULT_RANGE_TOLERANCE = 0.3;
-const SMALL_TICKET_MAX_ODDS = 1.77;
-
-/**
- * Narrows the pool for a regular tier. Always drops lock-only fixtures
- * (they exist purely as Saint's Lock candidates and never cleared
- * MIN_CONFIDENCE), then narrows to safer, lower-odds picks for tiers
- * under 7 matches.
- */
-function poolForTier(pool, tier) {
-  const regular = pool.filter((p) => !p.lockOnly);
-  if (!SMALL_TICKET_TIERS.has(tier)) return regular;
-  return regular.filter((p) => p.odds <= SMALL_TICKET_MAX_ODDS);
-}
-
-// No single match can appear in more than this many of the day's tickets,
-// across every tier combined. Without this cap, a small fixture pool can
-// end up reused in nearly every ticket — meaning one unexpected result
-// takes down the whole day's slate at once instead of just a few tickets.
-const MAX_FIXTURE_APPEARANCES_PER_DAY = 3;
-
-function computeTotalOdds(picks) {
-  return Math.round(picks.reduce((acc, p) => acc * p.odds, 1) * 100) / 100;
-}
-
-/**
- * "Always incorporate a full win where necessary": if `picks` doesn't
- * already contain an outright Home/Away Win leg, try swapping one in from
- * the pool. Tries every leg position (safest-to-disrupt first — i.e. the
- * current highest-odds leg) and keeps the first swap that lands the total
- * back within the same tolerance band pickFixturesForSlip itself allows.
- * If no full-win fixture is available in today's pool, or no swap keeps
- * the ticket within its odds range, returns `picks` unchanged — this is a
- * best-effort guarantee, not a mandate to force a bad combination.
- */
-function ensureFullWinLeg(picks, pool, usageCount, targetRange, tolerance = DEFAULT_RANGE_TOLERANCE) {
-  if (picks.length === 0) return picks;
-  if (picks.some((p) => FULL_WIN_MARKETS.has(p.market))) return picks; // already has one
-
-  const alreadyIn = new Set(picks.map((p) => p.fixtureId));
-  const candidates = pool
-    .filter(
-      (f) =>
-        FULL_WIN_MARKETS.has(f.market) &&
-        !alreadyIn.has(f.fixtureId) &&
-        (usageCount.get(f.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY
-    )
-    .sort((a, b) => a.odds - b.odds); // safest full-win pick first
-
-  if (candidates.length === 0) return picks; // nothing full-win available today
-
-  const candidate = candidates[0];
-
-  if (!targetRange) {
-    // No odds band to protect — swap out
-    // the current highest-odds leg for the full-win candidate.
-    const highestIdx = picks.reduce((hi, p, i) => (p.odds > picks[hi].odds ? i : hi), 0);
-    const next = [...picks];
-    next[highestIdx] = candidate;
-    return next;
-  }
-
-  const [minTotal, maxTotal] = targetRange;
-  const TOLERANCE = tolerance;
-  const order = [...picks.keys()].sort((a, b) => picks[b].odds - picks[a].odds); // highest-odds leg first
-  for (const idx of order) {
-    const next = [...picks];
-    next[idx] = candidate;
-    const total = computeTotalOdds(next);
-    const within = total >= minTotal * (1 - TOLERANCE) && total <= maxTotal * (1 + TOLERANCE);
-    if (within) return next;
-  }
-
-  return picks; // no swap kept the total within range — leave the ticket as assembled
-}
-
-/**
- * Picks fixtures for one slip using the FEWEST legs needed to reach the
- * tier's minimum target odds — starting from the safest available fixtures
- * and adding one at a time, stopping the moment the cumulative total lands
- * in range. `maxMatchCount` is a CEILING now, not a fixed requirement:
- * fewer legs at the same target odds means less compounded bookmaker
- * margin (every leg carries the house edge, and it multiplies) and fewer
- * independent things that can go wrong — so this deliberately favors using
- * as few legs as will actually get the job done, only adding more when
- * the safest legs alone can't reach the target.
- */
-function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange, tolerance = DEFAULT_RANGE_TOLERANCE) {
-  const eligible = pool.filter((f) => (usageCount.get(f.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY);
-  if (eligible.length === 0) return [];
-
-  const ranked = [...eligible].sort((a, b) => {
-    const usedA = usageCount.get(a.fixtureId) ?? 0;
-    const usedB = usageCount.get(b.fixtureId) ?? 0;
-    if (usedA !== usedB) return usedA - usedB; // least-used first
-    return a.odds - b.odds; // then safest first
-  });
-
-  if (!targetRange) {
-    // No target range to hit —
-    // just take the safest available up to the max, as before.
-    if (ranked.length < maxMatchCount) return [];
-    return ensureFullWinLeg(ranked.slice(0, maxMatchCount), pool, usageCount, null, tolerance);
-  }
-
-  const [minTotal, maxTotal] = targetRange;
-
-  // Greedily add the safest legs one at a time, stopping as soon as the
-  // cumulative total reaches the target range.
-  let picks = [];
-  let unused = [...ranked];
-
-  for (const fixture of ranked) {
-    if (picks.length >= maxMatchCount) break;
-    picks.push(fixture);
-    unused = unused.filter((f) => f !== fixture);
-
-    const total = computeTotalOdds(picks);
-    if (total >= minTotal && total <= maxTotal) {
-      return picks; // hit the target with this many legs — stop here
-    }
-    if (total > maxTotal) {
-      // Overshot on the safest-first path (can happen with a wide odds
-      // spread) — back this addition out and fall through to the swap
-      // logic below instead of just continuing to pile on legs.
-      picks.pop();
-      unused.unshift(fixture);
-      break;
-    }
-  }
-
-  // Safest legs alone (within the max leg cap) didn't reach minTotal —
-  // add more legs if there's still room, then fall back to swapping
-  // weaker-for-stronger legs to close the gap.
-  const MAX_SWAP_ATTEMPTS = 8;
-  for (let attempt = 0; attempt < MAX_SWAP_ATTEMPTS; attempt++) {
-    const total = computeTotalOdds(picks);
-    if (total >= minTotal && total <= maxTotal) break;
-
-    if (total < minTotal) {
-      if (picks.length < maxMatchCount && unused.length > 0) {
-        const next = [...unused].sort((a, b) => a.odds - b.odds)[0];
-        picks.push(next);
-        unused = unused.filter((f) => f !== next);
-        continue;
-      }
-      const lowestIdx = picks.reduce((li, p, i) => (p.odds < picks[li].odds ? i : li), 0);
-      const candidate = unused.find((f) => f.odds > picks[lowestIdx].odds);
-      if (!candidate) break; // nothing left that would raise the total further
-      picks[lowestIdx] = candidate;
-      unused = unused.filter((f) => f !== candidate);
-    } else {
-      const highestIdx = picks.reduce((hi, p, i) => (p.odds > picks[hi].odds ? i : hi), 0);
-      const candidate = [...unused].sort((a, b) => a.odds - b.odds).find((f) => f.odds < picks[highestIdx].odds);
-      if (!candidate) break;
-      picks[highestIdx] = candidate;
-      unused = unused.filter((f) => f !== candidate);
-    }
-  }
-
-  const finalTotal = computeTotalOdds(picks);
-  const TOLERANCE = tolerance;
-  const withinTolerance = finalTotal >= minTotal * (1 - TOLERANCE) && finalTotal <= maxTotal * (1 + TOLERANCE);
-  if (!withinTolerance || picks.length === 0) return []; // pool doesn't have enough spread to hit this tier's range today
-
-  return ensureFullWinLeg(picks, pool, usageCount, targetRange, tolerance);
-}
-
-/**
- * Saint's Lock — GUARANTEED once per release slot whenever ANY fixture in
- * today's pool has a qualifying Saint's Lock market (Home Win / Away Win /
- * Over 2.5 at 1.5-2.0 odds, see pickSaintsLockMarket).
- *
- * The old 85% confidence floor is gone: at 1.5-2.0 odds the implied
- * confidence is only ~50-67%, so that floor could never be met and the
- * tier came out empty every run. Selection is now simply "the most
- * favored qualifying pick available" (lowest odds in band = highest
- * implied confidence), in BOTH daily slots.
- *
- * The chosen fixture row is written with the Saint's Lock market (so
- * grading settles the right market), and its usageCount is maxed out so no
- * other tier in this run can reuse the same fixture with a different
- * market. main() also freezes fixtures already used by today's earlier
- * Saint's Lock slip so a later run can't re-price and overwrite them.
- */
-function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now) {
-  const config = TIER_CONFIG.find((c) => c.tier === 'saints_lock');
-
-  const candidates = dailyPool
-    .filter((p) => p.lockPick && (usageCount.get(p.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY)
-    // Best = the most-favored qualifying pick: lowest price at or above the
-    // 1.5 floor (highest implied probability). Compare raw odds, not the
-    // rounded integer confidence, so near-ties aren't broken arbitrarily;
-    // priority leagues win an exact tie.
-    .sort(
-      (a, b) =>
-        a.lockPick.odds - b.lockPick.odds ||
-        (PRIORITY_LEAGUE_NAMES.has(b.league) ? 1 : 0) - (PRIORITY_LEAGUE_NAMES.has(a.league) ? 1 : 0)
+        fx.outcomes = fx.outcomes.flatMap((o) => {
+          const mp = model?.available ? model.probabilities?.[o.market] : undefined;
+          if (typeof mp !== 'number' || !Number.isFinite(mp)) return [o];
+          if (mp < o.fairProb - MODEL_MAX_DISAGREEMENT) {
+            vetoed++;
+            return [];
+          }
+          return [{ ...o, modelProbability: mp, modelAvailable: true }];
+        });
+      })
     );
+  }
 
-  if (candidates.length === 0) {
-    // eslint-disable-next-line no-console
+  console.log(`Model check: opinion available for ${withModel}/${pool.length} fixture(s); vetoed ${vetoed} outcome(s).`);
+  return pool.filter((fx) => fx.outcomes.length > 0);
+}
+
+// --- Selection ----------------------------------------------------------------------
+
+function bestOutcomeFor(fx, predicate) {
+  const ok = fx.outcomes.filter(predicate);
+  if (ok.length === 0) return null;
+  return ok.sort((a, b) => b.fairProb - a.fairProb)[0];
+}
+
+function bestCombo(candidates, sizes, [minTotal, maxTotal], requireDistinctFixtures) {
+  let best = null;
+  for (const k of sizes) {
+    if (candidates.length < k) continue;
+    for (const combo of combinations(candidates, k)) {
+      if (requireDistinctFixtures && new Set(combo.map((c) => c.fx.fixtureId)).size !== k) continue;
+      const total = product(combo.map((c) => c.o.odds));
+      if (total < minTotal || total > maxTotal) continue;
+      const prob = product(combo.map((c) => c.o.fairProb));
+      if (!best || prob > best.prob) best = { combo, total: round2(total), prob };
+    }
+  }
+  return best;
+}
+
+/** Saint's Lock: single highest-fair-probability outcome with quoted odds in [1.48, 2.0]. */
+function pickSaintsLock(pool, usedFixtureIds, slot) {
+  const inBand = [];
+  for (const fx of pool) {
+    if (usedFixtureIds.has(fx.fixtureId)) continue;
+    for (const o of fx.outcomes) {
+      if (o.odds >= SAINTS_LOCK_MIN_ODDS && o.odds <= SAINTS_LOCK_MAX_ODDS) inBand.push({ fx, o });
+    }
+  }
+  inBand.sort((a, b) => b.o.fairProb - a.o.fairProb);
+
+  const strict = inBand.find((c) => c.o.fairProb >= SAINTS_LOCK_MIN_FAIR_PROB);
+  if (strict) return strict;
+
+  if (ALLOW_SAINTS_LOCK_FALLBACK && slot === 0 && inBand.length > 0) {
     console.warn(
-      `Saint's Lock slot ${slot}: NO fixture today has a Home Win / Away Win / Over 2.5 market ` +
-        `priced ${TIER_ODDS_TARGET.saints_lock[0]} or above — nothing produced for this slot.`
+      `Saint's Lock: nothing cleared ${SAINTS_LOCK_MIN_FAIR_PROB * 100}% fair probability — using best in-band ` +
+        `(${Math.round(inBand[0].o.fairProb * 100)}%) per ALLOW_SAINTS_LOCK_FALLBACK.`
     );
-    return { tickets: [], ticketMatches: [], fixturesUsed: [] };
+    return inBand[0];
   }
-
-  const base = candidates[0];
-  const pick = { ...base, ...base.lockPick }; // fixture row gets the Saint's Lock market/odds/confidence
-  usageCount.set(pick.fixtureId, MAX_FIXTURE_APPEARANCES_PER_DAY); // keep it out of every other tier
-
-  const ticketId = `${today}-saints_lock-${slot}`;
-  const availableAtIso = new Date(now.getTime() + AVAILABILITY_DELAY_MS).toISOString();
-
-  const tickets = [
-    {
-      id: ticketId,
-      ticket_date: today,
-      tier: 'saints_lock',
-      slip_label: null, // marketed as one pick at a time, not "1 of 2"
-      match_count: 1,
-      odds_range: config.oddsRange,
-      total_odds: pick.odds,
-      is_free: false,
-      release_slot: slot,
-      available_at: availableAtIso,
-    },
-  ];
-  const ticketMatches = [{ ticket_id: ticketId, fixture_id: pick.fixtureId, sort_order: 0 }];
-
-  return { tickets, ticketMatches, fixturesUsed: [pick] };
+  return null;
 }
 
-function buildTickets(dailyPool, slipState, now) {
-  const today = dateStr(now);
-  const availableAtIso = new Date(now.getTime() + AVAILABILITY_DELAY_MS).toISOString();
-  const tickets = [];
-  const ticketMatches = [];
-  const fixturesUsed = new Map();
-  const usageCount = new Map(); // shared across every tier/slip for the day
-
-  // Saint's Lock is built FIRST with its own dedicated selection (see
-  // buildSaintsLockTickets) so it always gets first claim on a fixture
-  // before any regular tier can use it.
-  const saintsLockSlot = nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get('saints_lock'));
-  if (saintsLockSlot !== null) {
-    const saintsLock = buildSaintsLockTickets(dailyPool, usageCount, today, saintsLockSlot, now);
-    tickets.push(...saintsLock.tickets);
-    ticketMatches.push(...saintsLock.ticketMatches);
-    saintsLock.fixturesUsed.forEach((f) => fixturesUsed.set(f.fixtureId, f));
-  } else {
-    console.log("Saint's Lock: already at today's cap, or too soon since the last slip — skipping this run.");
+/** Mega: best joint-probability set of MEGA_MIN_LEGS..MEGA_MAX_LEGS legs, one outcome per fixture, total odds in range. */
+function pickMega(pool, usedFixtureIds) {
+  const candidates = [];
+  for (const fx of pool) {
+    if (usedFixtureIds.has(fx.fixtureId)) continue;
+    const o = bestOutcomeFor(fx, (x) => x.fairProb >= MEGA_MIN_LEG_FAIR_PROB);
+    if (o) candidates.push({ fx, o });
   }
+  candidates.sort((a, b) => b.o.fairProb - a.o.fairProb);
+  const top = candidates.slice(0, COMBO_POOL_SIZE_MEGA);
 
-  TIER_CONFIG.forEach((config) => {
-    if (config.tier === 'saints_lock') return; // handled above
+  const sizes = [];
+  for (let k = MEGA_MIN_LEGS; k <= MEGA_MAX_LEGS; k++) sizes.push(k);
+  return bestCombo(top, sizes, MEGA_ODDS_RANGE, true);
+}
 
-    const slot = nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get(config.tier));
-    if (slot === null) {
-      console.log(`${config.label}: already at today's cap, or too soon since the last slip — skipping this run.`);
-      return;
+/** Duo: best joint-probability pair from two different fixtures, total odds in range. */
+function pickDuo(pool, usedFixtureIds) {
+  const candidates = [];
+  for (const fx of pool) {
+    if (usedFixtureIds.has(fx.fixtureId)) continue;
+    fx.outcomes
+      .filter((o) => o.fairProb >= DUO_MIN_LEG_FAIR_PROB)
+      .sort((a, b) => b.fairProb - a.fairProb)
+      .slice(0, 2)
+      .forEach((o) => candidates.push({ fx, o }));
+  }
+  candidates.sort((a, b) => b.o.fairProb - a.o.fairProb);
+  const top = candidates.slice(0, COMBO_POOL_SIZE_DUO);
+  return bestCombo(top, [2], DUO_ODDS_RANGE, true);
+}
+
+// --- Staggered release state ----------------------------------------------------------
+
+async function fetchTodaysState(supabase, today) {
+  const { data: ticketRows, error: ticketErr } = await supabase
+    .from('tickets')
+    .select('id, tier, available_at, ticket_matches ( fixture_id )')
+    .eq('ticket_date', today);
+  if (ticketErr) throw ticketErr;
+
+  const { data: fixtureRows, error: fixtureErr } = await supabase.from('fixtures').select('id').eq('ticket_date', today);
+  if (fixtureErr) throw fixtureErr;
+
+  const byTier = new Map(); // tier -> { count, lastAvailableAt }
+  const usedFixtureIds = new Set((fixtureRows ?? []).map((r) => r.id));
+
+  (ticketRows ?? []).forEach((row) => {
+    const existing = byTier.get(row.tier) ?? { count: 0, lastAvailableAt: null };
+    existing.count += 1;
+    if (!existing.lastAvailableAt || row.available_at > existing.lastAvailableAt) {
+      existing.lastAvailableAt = row.available_at;
     }
+    byTier.set(row.tier, existing);
+    (row.ticket_matches ?? []).forEach((tm) => usedFixtureIds.add(tm.fixture_id));
+  });
 
-    const pool = poolForTier(dailyPool, config.tier);
-    const targetRange = TIER_ODDS_TARGET[config.tier] ?? null;
-    const strict = STRICT_RANGE_TIERS.has(config.tier);
+  return { byTier, usedFixtureIds };
+}
 
-    const picks = pickFixturesForSlip(
-      pool,
-      config.matchCount,
-      usageCount,
-      targetRange,
-      strict ? 0 : DEFAULT_RANGE_TOLERANCE
-    );
-    if (picks.length === 0 || (strict && picks.length !== config.matchCount)) {
-      console.log(`${config.label}: couldn't assemble a valid combination this run — skipping this slip.`);
-      return; // couldn't assemble a valid combination today — skip this slip rather than force it
-    }
+function nextSlotFor(slipState) {
+  const state = slipState ?? { count: 0, lastAvailableAt: null };
+  if (state.count >= MAX_TICKETS_PER_CATEGORY) return null;
+  if (state.count === 0) return 0;
+  // available_at = generation time + AVAILABILITY_DELAY_MS — recover the real generation time first.
+  const lastGeneratedAtMs = new Date(state.lastAvailableAt).getTime() - AVAILABILITY_DELAY_MS;
+  const hoursSinceLast = (Date.now() - lastGeneratedAtMs) / 3_600_000;
+  if (hoursSinceLast < MIN_HOURS_BETWEEN_SLOTS) return null;
+  return state.count;
+}
 
-    picks.forEach((p) => {
-      fixturesUsed.set(p.fixtureId, p);
-      usageCount.set(p.fixtureId, (usageCount.get(p.fixtureId) ?? 0) + 1);
-    });
+// --- Ticket assembly ---------------------------------------------------------------------
 
-    const totalOdds = Math.round(picks.reduce((acc, p) => acc * p.odds, 1) * 100) / 100;
-    const ticketId = `${today}-${config.tier}-${slot}`;
-    // Both of a tier's daily slips are real, equally-curated tickets
-    // released at different times — not simultaneous alternatives — so
-    // "Slip 1 of 2" phrasing (which implies picking between options
-    // available right now) is deliberately dropped in favor of a plain
-    // release-time label shown by the frontend instead.
-    const slipLabel = null;
+function buildTicketRecords({ tier, slot, today, availableAtIso, legs, totalOdds }) {
+  const config = TIER_CONFIG[tier];
+  const ticketId = `${today}-${tier}-${slot}`;
 
-    tickets.push({
+  return {
+    ticket: {
       id: ticketId,
       ticket_date: today,
-      tier: config.tier,
-      slip_label: slipLabel,
-      match_count: picks.length, // actual legs used — may be fewer than config.matchCount's ceiling
+      tier,
+      slip_label: null,
+      match_count: legs.length,
       odds_range: config.oddsRange,
       total_odds: totalOdds,
       is_free: config.alwaysFree,
       release_slot: slot,
       available_at: availableAtIso,
-    });
-
-    picks.forEach((p, idx) => {
-      ticketMatches.push({ ticket_id: ticketId, fixture_id: p.fixtureId, sort_order: idx });
-    });
-  });
-
-  return { tickets, ticketMatches, fixturesUsed: Array.from(fixturesUsed.values()) };
+    },
+    links: legs.map((leg, idx) => ({ ticket_id: ticketId, fixture_id: leg.fx.fixtureId, sort_order: idx })),
+    fixtureRows: legs.map(({ fx, o }) => {
+      const base = {
+        id: fx.fixtureId,
+        ticket_date: fx.ticketDate,
+        league: fx.league,
+        country: fx.country,
+        home_team: fx.homeTeam,
+        away_team: fx.awayTeam,
+        kickoff: fx.kickoff,
+        market: o.market,
+        odds: o.odds,
+        confidence: Math.min(100, Math.max(0, Math.round(o.fairProb * 100))),
+      };
+      return {
+        base,
+        extended: {
+          ...base,
+          model_probability: o.modelProbability,
+          model_available: o.modelAvailable,
+          bookmaker_count: o.bookmakerCount,
+        },
+      };
+    }),
+  };
 }
 
-// --- Main ---------------------------------------------------------------------
+function isMissingColumnError(error) {
+  return error?.code === 'PGRST204' || error?.code === '42703' || /column/i.test(error?.message ?? '');
+}
+
+async function upsertFixtures(supabase, rows) {
+  const { error } = await supabase.from('fixtures').upsert(rows.map((r) => r.extended), { onConflict: 'id' });
+  if (!error) return;
+
+  if (isMissingColumnError(error)) {
+    console.warn(
+      'fixtures upsert failed on an optional column (model_probability / model_available / bookmaker_count) — ' +
+        `retrying with base columns only. Apply the self-improvement/consensus migrations to keep that data. (${error.message})`
+    );
+    const { error: retryErr } = await supabase.from('fixtures').upsert(rows.map((r) => r.base), { onConflict: 'id' });
+    if (retryErr) throw retryErr;
+    return;
+  }
+  throw error;
+}
+
+// --- Main ------------------------------------------------------------------------------------
 
 async function main() {
-  const today = new Date();
-  const todayStr = dateStr(today);
-  const dailyDates = [todayStr];
-
+  const now = new Date();
+  const today = dateStr(now);
+  const availableAtIso = new Date(now.getTime() + AVAILABILITY_DELAY_MS).toISOString();
   const supabase = getSupabaseAdmin();
 
-  console.log('Checking today\'s existing slips (staggered-release state)...');
-  const slipState = await fetchTodaysSlipState(supabase, todayStr);
+  console.log("Checking today's existing tickets (staggered-release state)...");
+  const { byTier, usedFixtureIds } = await fetchTodaysState(supabase, today);
 
-  const anySlotAvailable = [...TIER_CONFIG.map((c) => c.tier)].some(
-    (tier) => nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get(tier)) !== null
-  );
-  if (!anySlotAvailable) {
-    console.log('Every category is already at today\'s cap, or within the min-gap window — nothing to do this run.');
+  const slots = Object.fromEntries(TIERS.map((tier) => [tier, nextSlotFor(byTier.get(tier))]));
+  TIERS.forEach((tier) => {
+    if (slots[tier] === null) {
+      console.log(`${TIER_CONFIG[tier].label}: already at today's cap, or too soon since the last slip — skipping this run.`);
+    }
+  });
+  if (TIERS.every((tier) => slots[tier] === null)) {
+    console.log("Every tier is already at today's cap or within the min-gap window — nothing to do this run.");
     return;
   }
 
-  console.log('Fetching daily fixture pool...');
-  const dailyPool = await fetchPricedFixtures(dailyDates, MAX_ODDS_LOOKUPS_PER_RUN, today);
-  console.log(`Priced ${dailyPool.length} fixtures for today.`);
+  console.log('Fetching and pricing today\'s fixtures...');
+  let pool = await fetchPricedFixtures([today], MAX_ODDS_LOOKUPS_PER_RUN, now, usedFixtureIds);
+  console.log(`${pool.length} fixture(s) cleared the consensus-pricing gates.`);
 
-  // Freeze fixtures already used by today's earlier Saint's Lock slip(s).
-  // Their fixture rows carry the Saint's Lock market; re-pricing one in
-  // this run (possibly with a different regular market) and upserting it
-  // would overwrite that market and corrupt grading. Also stops slot 1
-  // from re-picking slot 0's fixture.
-  const { data: lockRows, error: lockErr } = await supabase
-    .from('ticket_matches')
-    .select('fixture_id, tickets!inner(tier, ticket_date)')
-    .eq('tickets.tier', 'saints_lock')
-    .eq('tickets.ticket_date', todayStr);
-  if (lockErr) {
-    console.warn("Could not read today's existing Saint's Lock fixtures:", lockErr.message);
+  pool = await applyModelVeto(supabase, pool);
+  console.log(`${pool.length} fixture(s) remain after the model check.`);
+
+  const claimed = new Set(usedFixtureIds); // grows as tickets claim fixtures this run
+  const allTickets = [];
+  const allLinks = [];
+  const allFixtureRows = [];
+
+  const claim = (records, legs) => {
+    legs.forEach((l) => claimed.add(l.fx.fixtureId));
+    allTickets.push(records.ticket);
+    allLinks.push(...records.links);
+    allFixtureRows.push(...records.fixtureRows);
+  };
+
+  // Order matters: Saint's Lock gets first claim on fixtures, then Mega, then Duo.
+  if (slots.saints_lock !== null) {
+    const pick = pickSaintsLock(pool, claimed, slots.saints_lock);
+    if (pick) {
+      const legs = [pick];
+      claim(
+        buildTicketRecords({ tier: 'saints_lock', slot: slots.saints_lock, today, availableAtIso, legs, totalOdds: pick.o.odds }),
+        legs
+      );
+      console.log(
+        `Saint's Lock: ${pick.fx.homeTeam} vs ${pick.fx.awayTeam} — ${pick.o.market} @ ${pick.o.odds} ` +
+          `(fair ${Math.round(pick.o.fairProb * 100)}%, ${pick.o.bookmakerCount} bookmakers).`
+      );
+    } else {
+      console.log("Saint's Lock: nothing cleared the bar this run — skipping rather than forcing a pick.");
+    }
   }
-  const frozen = new Set((lockRows ?? []).map((r) => r.fixture_id));
-  const dropFrozen = (pool) => pool.filter((f) => !frozen.has(f.fixtureId));
 
-  const { tickets, ticketMatches, fixturesUsed } = buildTickets(
-    dropFrozen(dailyPool),
-    slipState,
-    today
-  );
+  if (slots.mega !== null) {
+    const result = pickMega(pool, claimed);
+    if (result) {
+      claim(
+        buildTicketRecords({ tier: 'mega', slot: slots.mega, today, availableAtIso, legs: result.combo, totalOdds: result.total }),
+        result.combo
+      );
+      console.log(`Mega Day: ${result.combo.length} legs, total ${result.total}x, joint fair probability ${Math.round(result.prob * 100)}%.`);
+    } else {
+      console.log("Mega Day: couldn't assemble a valid combination this run — skipping.");
+    }
+  }
 
-  if (tickets.length === 0) {
-    console.warn('No tickets could be assembled this run — not enough priced fixtures, or every eligible category was skipped. Nothing written.');
+  if (slots.duo !== null) {
+    const result = pickDuo(pool, claimed);
+    if (result) {
+      claim(
+        buildTicketRecords({ tier: 'duo', slot: slots.duo, today, availableAtIso, legs: result.combo, totalOdds: result.total }),
+        result.combo
+      );
+      console.log(`Duo: 2 legs, total ${result.total}x, joint fair probability ${Math.round(result.prob * 100)}%.`);
+    } else {
+      console.log("Duo: couldn't assemble a valid pair this run — skipping.");
+    }
+  }
+
+  if (allTickets.length === 0) {
+    console.warn('No tickets could be assembled this run. Nothing written.');
     return;
   }
 
-  const fixtureRows = fixturesUsed.map((f) => ({
-    id: f.fixtureId,
-    ticket_date: f.ticketDate,
-    league: f.league,
-    country: f.country,
-    home_team: f.homeTeam,
-    away_team: f.awayTeam,
-    kickoff: f.kickoff,
-    market: f.market,
-    odds: f.odds,
-    confidence: f.confidence,
-  }));
+  await upsertFixtures(supabase, allFixtureRows);
 
-  const { error: fixturesErr } = await supabase.from('fixtures').upsert(fixtureRows, { onConflict: 'id' });
-  if (fixturesErr) throw fixturesErr;
-
-  const { error: ticketsErr } = await supabase.from('tickets').upsert(tickets, { onConflict: 'id' });
+  const { error: ticketsErr } = await supabase.from('tickets').upsert(allTickets, { onConflict: 'id' });
   if (ticketsErr) throw ticketsErr;
 
-  const { error: linksErr } = await supabase
-    .from('ticket_matches')
-    .upsert(ticketMatches, { onConflict: 'ticket_id,fixture_id' });
+  const { error: linksErr } = await supabase.from('ticket_matches').upsert(allLinks, { onConflict: 'ticket_id,fixture_id' });
   if (linksErr) throw linksErr;
 
-  console.log(`Wrote ${tickets.length} new ticket(s), ${fixtureRows.length} fixture(s). Previous slips today are untouched and remain visible.`);
+  console.log(
+    `Wrote ${allTickets.length} new ticket(s) and ${allFixtureRows.length} fixture(s). ` +
+      'Earlier slips today are untouched and remain visible.'
+  );
 }
 
 main().catch((err) => {
