@@ -84,7 +84,7 @@ export interface TierConfig {
 // scripts/generate-tickets.mjs — matchCount here is the leg CEILING (the
 // pipeline uses as few legs as it can within the odds band).
 export const TIER_CONFIG: TierConfig[] = [
-  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
+  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.97-3', alwaysFree: true },
   { tier: 'duo', label: 'Duo', matchCount: 2, oddsRange: '2-4', alwaysFree: false },
   { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.48-2', alwaysFree: false },
 ];
