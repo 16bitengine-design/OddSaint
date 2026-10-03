@@ -1,0 +1,44 @@
+--- a/scripts/lib/teamModel.mjs   (what generate-score-predictions.mjs needs)
+@@ constants @@
+-const MIN_SAMPLE_MATCHES = 5;
++export const DEFAULT_MIN_SAMPLE_MATCHES = 5;
++// (replace remaining uses of MIN_SAMPLE_MATCHES with a minSampleMatches
++//  parameter threaded through, defaulting to DEFAULT_MIN_SAMPLE_MATCHES)
+
+@@ getTeamVenueProfile @@
+-async function getTeamVenueProfile(supabase, teamId, venue) {
++async function getTeamVenueProfile(supabase, teamId, venue, minSampleMatches = DEFAULT_MIN_SAMPLE_MATCHES) {
+ ...
+-  if (error || !data || data.length < MIN_SAMPLE_MATCHES) return null;
++  if (error || !data || data.length < minSampleMatches) return null;
+
+@@ getLeagueBaseline — same swap for its sample check @@
+
+@@ getOwnModelForFixture @@
+-export async function getOwnModelForFixture(supabase, { league, homeTeamId, awayTeamId, homeTeamName, awayTeamName }) {
++export async function getOwnModelForFixture(supabase, { league, homeTeamId, awayTeamId, homeTeamName, awayTeamName, minSampleMatches = DEFAULT_MIN_SAMPLE_MATCHES }) {
+ ...
+-    getTeamVenueProfile(supabase, homeTeamId, 'home'),
+-    getTeamVenueProfile(supabase, awayTeamId, 'away'),
+-    getLeagueBaseline(supabase, league),
++    getTeamVenueProfile(supabase, homeTeamId, 'home', minSampleMatches),
++    getTeamVenueProfile(supabase, awayTeamId, 'away', minSampleMatches),
++    getLeagueBaseline(supabase, league, minSampleMatches),
+
+@@ add helper (shared with the correct-scores patch) @@
++function topScorelinesFromExpectedGoals(homeXG, awayXG, n = 3) {
++  const all = [];
++  for (let h = 0; h <= MAX_GOALS_MODELED; h++)
++    for (let a = 0; a <= MAX_GOALS_MODELED; a++)
++      all.push({ home: h, away: a, probability: poissonPMF(h, homeXG) * poissonPMF(a, awayXG) });
++  return all.sort((x, y) => y.probability - x.probability).slice(0, n);
++}
+
+@@ final return of getOwnModelForFixture @@
++  const topScorelines = topScorelinesFromExpectedGoals(homeXG, awayXG, 3);
+   return {
+     available: true,
+     probabilities,
++    topScorelines,                 // used by generate-correct-scores.mjs
++    topScoreline: topScorelines[0],// used by generate-score-predictions.mjs
+     homeXG: ...,
