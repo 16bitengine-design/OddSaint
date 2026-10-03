@@ -1,16 +1,14 @@
 name: Odd Saint — Correct Score Predictions
 
-# Runs 4x a day. Each run grades any finished predictions first, then adds
-# predictions for today's fixtures that don't have one yet (existing
-# predictions are never rewritten — see scripts/generate-correct-scores.mjs).
-#
-# Offset to :30 so it never fires at the same minute as generate-tickets
-# (03:00/10:00) or grade-tickets (:15 every 3h) — each workflow is its own
-# process with its own API-Football rate limiter, so this avoids them
-# hitting the API at the same real-world moment.
+# Every 3 hours at :45 — grades finished predictions, then generates
+# predictions for today's fixtures that don't have one yet (each run only
+# adds NEW fixtures; existing predictions are never rewritten). Offset to
+# :45 so it never lands on grade-tickets.yml's :15 or the generate-tickets
+# 03:00/10:00 UTC slots — all of them share the same API-Football quota.
+# Costs ~2 API-Football requests per run. Can also be run manually.
 on:
   schedule:
-    - cron: '30 3,9,15,21 * * *'
+    - cron: '45 */3 * * *'
   workflow_dispatch: {}
 
 jobs:
@@ -28,7 +26,7 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Generate and grade correct-score predictions
+      - name: Grade and generate correct-score predictions
         env:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
