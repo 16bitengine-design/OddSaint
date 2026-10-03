@@ -42,13 +42,6 @@ import {
   type FeedbackRow,
 } from '@/lib/feedback';
 import { adminGrantAccess, type GrantableProduct } from '@/lib/adminGrant';
-import { CorrectScoresSection } from './CorrectScores';
-import {
-  fetchCorrectScores,
-  fetchCorrectScoreStats,
-  type CorrectScorePrediction,
-  type CorrectScoreStats,
-} from '@/lib/dataFetcher';
 
 // ---------------------------------------------------------------------------
 // Color tokens — Odd Saint brand
@@ -114,6 +107,7 @@ function Logo({ light = false }: { light?: boolean }) {
       </span>
     </div>
   );
+
 }
 
 function IndemnificationNotice({ compact = false }: { compact?: boolean }) {
@@ -200,8 +194,7 @@ function AdSlot({ variant }: { variant: 'infeed' | 'anchor' }) {
  * device is set to — Intl.DateTimeFormat uses the browser's local timezone
  * automatically when no `timeZone` option is passed, so this needs no
  * manual geo-IP lookup or timezone detection at all. "Today"/"Tomorrow" are
- * relative to the visitor's own local calendar day, not server time —
- * important for Weekly Lite/Titan tickets whose matches span several days.
+ * relative to the visitor's own local calendar day, not server time.
  */
 function formatKickoff(iso: string): string {
   const date = new Date(iso);
@@ -1034,7 +1027,7 @@ function TicketCard({
               )}
             </div>
             <div style={{ fontSize: 11.5, color: COLORS.textMuted, marginTop: 3 }}>
-              {ticket.matchCount} matches · odds {ticket.oddsRange} · total{' '}
+              {ticket.matchCount} match{ticket.matchCount === 1 ? '' : 'es'} · odds {ticket.oddsRange} · total{' '}
               <span style={{ color: COLORS.emerald, fontWeight: 700 }}>{ticket.totalOdds}x</span>
             </div>
           </div>
@@ -2093,8 +2086,7 @@ function LoginModal({ onSent, onClose }: { onSent: (email: string) => void; onCl
  * first batch of the day drops, regardless of where they are. Reads the
  * hour from RELEASE_SLOT_HOURS_UTC[0] (rather than a separately hardcoded
  * value) so this can never drift from the schedule dataFetcher.ts and the
- * actual cron triggers use — the exact bug the tier-count-sync note in
- * CLAUDE.md previously flagged for a different constant.
+ * actual cron triggers use.
  */
 function getDailyRefreshInfo(): { timeLabel: string; hasRefreshedToday: boolean } {
   const now = new Date();
@@ -2394,6 +2386,7 @@ function PerformanceHistory({ history }: { history: DayPerformance[] }) {
       </div>
       <div style={{ fontSize: 10, color: COLORS.textMuted, marginTop: 10, lineHeight: 1.5 }}>
         Win rate = won ÷ (won + failed) among that day's tickets. Ticket count shown after the dot.
+        "All" includes every ticket generated in the window, including tiers we've since retired.
       </div>
     </div>
   );
@@ -2748,8 +2741,8 @@ function PricingModal({
         </h2>
         <p style={{ fontSize: 11.5, color: COLORS.textMuted, margin: '0 0 16px' }}>
           {product === 'saints_lock'
-            ? "One ultra-high-confidence pick a day. No free trial applies — pay easily with mobile money."
-            : 'Unlock every ticket, every day — pay easily with mobile money.'}
+            ? "One high-confidence pick a day. No free trial applies — pay easily with mobile money."
+            : 'Unlock every tier, every day — pay easily with mobile money.'}
         </p>
 
         {!userId && (
@@ -3060,9 +3053,6 @@ export default function Page() {
   const [pricingProduct, setPricingProduct] = useState<'subscription' | 'saints_lock'>('subscription');
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [history, setHistory] = useState<DayPerformance[]>([]);
-  const [correctScores, setCorrectScores] = useState<CorrectScorePrediction[]>([]);
-  const [correctScoreStats, setCorrectScoreStats] = useState<CorrectScoreStats | null>(null);
-  const [correctScoresLoading, setCorrectScoresLoading] = useState(true);
   const [showHistory, setShowHistory] = useState(false);
   const [loading, setLoading] = useState(true);
   const [ticketsLoading, setTicketsLoading] = useState(true);
@@ -3125,16 +3115,6 @@ export default function Page() {
         // eslint-disable-next-line no-console
         console.error('[Odd Saint] Failed to load performance history:', err);
       });
-    Promise.all([fetchCorrectScores(), fetchCorrectScoreStats(30)])
-      .then(([list, stats]) => {
-        setCorrectScores(list);
-        setCorrectScoreStats(stats);
-      })
-      .catch((err) => {
-        // eslint-disable-next-line no-console
-        console.error('[Odd Saint] Failed to load correct scores:', err);
-      })
-      .finally(() => setCorrectScoresLoading(false));
     getTrialPolicy()
       .then(setTrialPolicy)
       .catch((err) => {
@@ -3188,7 +3168,7 @@ export default function Page() {
   }
 
   // Interleave a single in-feed ad slot right after the Mega Day slips end
-  // and before the next ticket begins.
+  // and before Duo / Saint's Lock begin.
   const feedItems: Array<{ kind: 'ticket'; ticket: Ticket } | { kind: 'ad' }> = [];
   const lastMegaIndex = tickets.map((t) => t.tier).lastIndexOf('mega');
   tickets.forEach((t, idx) => {
@@ -3218,26 +3198,6 @@ export default function Page() {
       >
         <Logo light />
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          {/* Link to the standalone Correct scores page (src/app/correct-scores/page.tsx) */}
-          <a
-            href="/correct-scores"
-            aria-label="Correct scores"
-            style={{
-              background: 'rgba(255,255,255,0.12)',
-              border: '1px solid rgba(255,255,255,0.4)',
-              borderRadius: 7,
-              padding: '6px 10px',
-              color: '#ffffff',
-              fontFamily: FONT_BODY,
-              fontSize: 11.5,
-              fontWeight: 700,
-              textDecoration: 'none',
-              lineHeight: 1,
-              display: 'inline-block',
-            }}
-          >
-            🎯 Scores
-          </a>
           <button
             onClick={() => setShowTeamSearch(true)}
             aria-label="Search a team"
@@ -3376,12 +3336,12 @@ export default function Page() {
           }}
         >
           {isAdmin
-            ? 'Admin account — every ticket, including Saint\'s Lock, is unlocked for you automatically.'
+            ? 'Admin account — every ticket, every tier, including Saint\'s Lock, is unlocked for you automatically.'
             : userEmail
-            ? "You're signed in — every ticket, including Saint's Lock, is free for you."
+            ? "You're signed in — every ticket, every tier, including Saint's Lock, is free for you."
             : trialActive
             ? `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Every ticket is unlocked, no account needed. Sign up anytime to keep full access for free.`
-            : 'Your free trial has ended. The Mega Day Ticket stays free forever — sign up free to unlock the rest, including Saint\'s Lock.'}
+            : 'Your free trial has ended. The Mega Day Ticket stays free forever — sign up free to unlock everything else, including Saint\'s Lock.'}
         </div>
 
         {!isAdmin && (
@@ -3454,15 +3414,6 @@ export default function Page() {
             No tickets available right now — check back after the next release.
           </div>
         )}
-
-        {/* Correct-score predictions — same access rule as a standard ticket. */}
-        <CorrectScoresSection
-          predictions={correctScores}
-          stats={correctScoreStats}
-          unlocked={isAdmin || !!userEmail || trialActive}
-          loading={correctScoresLoading}
-          onSignUp={() => setShowLoginModal(true)}
-        />
 
         <Footer />
       </div>
