@@ -12,15 +12,32 @@
 // fabricates placeholder tickets. fetchTickets(date) is for browsing one
 // SPECIFIC date (the ticket archive) and never looks at any other day —
 // an empty result there means honestly "nothing was generated that day."
+//
+// ACTIVE TIERS: only Mega Day, Duo and Saint's Lock are generated and shown
+// in the live feed. The older tiers (bronze … weekender) were eliminated —
+// their historical rows stay in the database and remain visible in the
+// ticket ARCHIVE (labelled as legacy) so past results are never erased,
+// but they never appear in the live feed.
 // ---------------------------------------------------------------------------
 import { supabase } from './supabaseClient';
 
 export type MatchStatus = 'pending' | 'green' | 'red';
 
+/** Tiers the pipeline currently generates. MUST match TIER_CONFIG in scripts/generate-tickets.mjs. */
+export type ActiveTicketTier = 'mega' | 'duo' | 'saints_lock';
 
-// The only ticket tiers that exist. Must stay in sync with TIER_CONFIG in
-// scripts/generate-tickets.mjs.
-export type TicketTier = 'mega' | 'duo' | 'saints_lock';
+/** Eliminated tiers — no longer generated, kept only so historical rows still type-check and display in the archive. */
+export type LegacyTicketTier =
+  | 'bronze'
+  | 'silver'
+  | 'gold'
+  | 'platinum'
+  | 'diamond'
+  | 'weekly_lite'
+  | 'weekly_titan'
+  | 'weekender';
+
+export type TicketTier = ActiveTicketTier | LegacyTicketTier;
 
 export interface Match {
   id: string;
@@ -33,7 +50,7 @@ export interface Match {
   odds: number;
   kickoff: string; // ISO date string
   status: MatchStatus;
-  confidence: number; // AI Data Confidence Index, 0-100 (not a guarantee)
+  confidence: number; // devigged bookmaker-consensus probability, 0-100 (not a guarantee)
   finalHomeScore?: number; // set once the match has concluded
   finalAwayScore?: number;
 }
@@ -63,29 +80,29 @@ export interface TierConfig {
   alwaysFree: boolean;
 }
 
-// Tier definitions per the product spec.
-//
-// UPDATED (batch/range revision): each tier's real min-max match-count
-// range and odds-target band now live in scripts/generate-tickets.mjs's
-// TIER_CONFIG/TIER_ODDS_TARGET — this frontend copy MUST stay in sync
-// with that file (the two representations drifted out of sync once
-// before; see git history). `matchCount` here is the display ceiling —
-// a given real ticket's actual leg count (`match_count` on the DB row,
-// surfaced as Ticket.matchCount) can be anywhere from the tier's real
-// minimum up to this ceiling and is read from Supabase per-ticket, not
-// derived from this constant.
+// Active tier definitions. MUST stay in sync with TIER_CONFIG in
+// scripts/generate-tickets.mjs — matchCount here is the leg CEILING (the
+// pipeline uses as few legs as it can within the odds band).
 export const TIER_CONFIG: TierConfig[] = [
-  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 3, oddsRange: '1.5-3', alwaysFree: true },
+  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.5-3', alwaysFree: true },
   { tier: 'duo', label: 'Duo', matchCount: 2, oddsRange: '2-4', alwaysFree: false },
-  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5+', alwaysFree: false },
+  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.48-2', alwaysFree: false },
 ];
 
-/**
- * Tiers the app reads. Every ticket query is filtered by this list so any
- * leftover rows from eliminated tiers can never surface in the feed,
- * archive or performance history.
- */
-export const DISPLAYED_TIERS: TicketTier[] = TIER_CONFIG.map((c) => c.tier);
+const ACTIVE_TIERS = new Set<string>(TIER_CONFIG.map((c) => c.tier));
+
+// Labels for eliminated tiers, used only when the archive shows an old day.
+const LEGACY_TIER_LABELS: Record<LegacyTicketTier, string> = {
+  bronze: 'Bronze (legacy)',
+  silver: 'Silver (legacy)',
+  gold: 'Gold (legacy)',
+  platinum: 'Platinum (legacy)',
+  diamond: 'Diamond (legacy)',
+  weekly_lite: 'Weekly Lite (legacy)',
+  weekly_titan: 'Weekly Titan (legacy)',
+  weekender: 'Weekender (legacy)',
+};
+const LEGACY_TIER_ORDER = Object.keys(LEGACY_TIER_LABELS);
 
 /**
  * Availability hours (UTC) — when each day's release slot actually
@@ -146,8 +163,11 @@ export function getTicketStatus(ticket: Ticket): MatchStatus {
  * from "haven't checked yet" and decide what to do next (e.g.
  * fetchLatestTickets below falls back to an earlier day; fetchTickets
  * does not).
+ *
+ * `activeTiersOnly` hides eliminated tiers — true for the live feed, false
+ * for the archive (which keeps showing legacy rows, labelled as such).
  */
-async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
+async function fetchRealTicketsForDate(date: Date, activeTiersOnly: boolean): Promise<Ticket[] | null> {
   const day = dateKey(date);
 
   let data;
@@ -158,8 +178,7 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
         `id, tier, slip_label, match_count, odds_range, total_odds, is_free, release_slot, available_at,
          ticket_matches ( sort_order, fixtures ( id, league, country, home_team, away_team, kickoff, market, odds, confidence, result_status, final_home_score, final_away_score ) )`
       )
-      .eq('ticket_date', day)
-      .in('tier', DISPLAYED_TIERS);
+      .eq('ticket_date', day);
 
     if (result.error) {
       // eslint-disable-next-line no-console
@@ -182,46 +201,37 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
   // rather than showing a batch the instant it's written.
   const nowMs = Date.now();
   const accessible = data.filter((row: any) => {
+    if (activeTiersOnly && !ACTIVE_TIERS.has(row.tier)) return false; // eliminated tier — not shown live
     if (!row.available_at) return true; // defensive: no timestamp means don't block it
     return new Date(row.available_at).getTime() <= nowMs;
   });
   if (accessible.length === 0) return null;
 
-  const tierOrder = TIER_CONFIG.map((c) => c.tier);
-  const tierLabel = (tier: TicketTier) => TIER_CONFIG.find((c) => c.tier === tier)?.label ?? tier;
+  const tierOrder: string[] = [...TIER_CONFIG.map((c) => c.tier), ...LEGACY_TIER_ORDER];
+  const tierLabel = (tier: string) =>
+    TIER_CONFIG.find((c) => c.tier === tier)?.label ?? LEGACY_TIER_LABELS[tier as LegacyTicketTier] ?? tier;
 
   const tickets: Ticket[] = accessible.map((row: any) => {
     const links = [...(row.ticket_matches ?? [])].sort(
       (a: any, b: any) => a.sort_order - b.sort_order
     );
-    // Defensive: Supabase/PostgREST can return a to-one relationship join
-    // (ticket_matches -> fixtures) shaped as either a single object or a
-    // one-element array, depending on how the foreign key is detected —
-    // see the same Array.isArray guard already used in
-    // recomputeTicketTotals below for this identical join shape. Links
-    // with no resolvable fixture are dropped rather than producing a
-    // match with undefined fields.
-    const matches: Match[] = links
-      .map((link: any) => {
-        const f = Array.isArray(link.fixtures) ? link.fixtures[0] : link.fixtures;
-        if (!f) return null;
-        const match: Match = {
-          id: String(f.id),
-          league: f.league,
-          country: f.country,
-          homeTeam: f.home_team,
-          awayTeam: f.away_team,
-          market: f.market,
-          odds: f.odds,
-          kickoff: f.kickoff,
-          status: f.result_status as MatchStatus,
-          confidence: f.confidence,
-          finalHomeScore: f.final_home_score ?? undefined,
-          finalAwayScore: f.final_away_score ?? undefined,
-        };
-        return match;
-      })
-      .filter((m): m is Match => m !== null);
+    const matches: Match[] = links.map((link: any) => {
+      const f = link.fixtures;
+      return {
+        id: String(f.id),
+        league: f.league,
+        country: f.country,
+        homeTeam: f.home_team,
+        awayTeam: f.away_team,
+        market: f.market,
+        odds: f.odds,
+        kickoff: f.kickoff,
+        status: f.result_status as MatchStatus,
+        confidence: f.confidence,
+        finalHomeScore: f.final_home_score ?? undefined,
+        finalAwayScore: f.final_away_score ?? undefined,
+      };
+    });
 
     return {
       id: row.id,
@@ -256,11 +266,13 @@ async function fetchRealTicketsForDate(date: Date): Promise<Ticket[] | null> {
  * Fetch tickets for one SPECIFIC calendar day — used by the ticket
  * archive, where browsing a past date should show exactly what was
  * generated that day, honestly, including an empty result if nothing
- * was. Never looks at any other day and never fabricates data.
+ * was. Never looks at any other day and never fabricates data. Legacy
+ * (eliminated) tiers ARE included here, labelled "(legacy)", so past
+ * results are never erased from the record.
  */
 export async function fetchTickets(date: Date = new Date()): Promise<Ticket[]> {
   try {
-    const real = await fetchRealTicketsForDate(date);
+    const real = await fetchRealTicketsForDate(date, false);
     return real ?? [];
   } catch (err) {
     // eslint-disable-next-line no-console
@@ -278,10 +290,12 @@ const LATEST_TICKETS_LOOKBACK_DAYS = 30;
 /**
  * The live homepage's ticket feed: today's accessible tickets if any
  * exist yet, otherwise the most recent earlier day's accessible tickets —
- * "the results of the last generation." Never falls back to fabricated
- * data; if nothing is found within the lookback window (e.g. a brand-new
- * deployment before the pipeline has ever run), returns an empty array
- * and the UI shows an honest "nothing yet" state.
+ * "the results of the last generation." Only ACTIVE tiers (Mega, Duo,
+ * Saint's Lock) ever appear here. Never falls back to fabricated data; if
+ * nothing is found within the lookback window (e.g. a brand-new
+ * deployment, or right after the tier change before the new pipeline has
+ * run), returns an empty array and the UI shows an honest "nothing yet"
+ * state.
  */
 export async function fetchLatestTickets(): Promise<Ticket[]> {
   const today = new Date();
@@ -289,7 +303,7 @@ export async function fetchLatestTickets(): Promise<Ticket[]> {
     const d = new Date(today);
     d.setDate(d.getDate() - i);
     try {
-      const real = await fetchRealTicketsForDate(d);
+      const real = await fetchRealTicketsForDate(d, true);
       if (real) return real;
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -301,7 +315,7 @@ export async function fetchLatestTickets(): Promise<Ticket[]> {
 }
 
 /**
- * Fetch every slip for one tier on a given day (e.g. all of today's Gold slips).
+ * Fetch every slip for one tier on a given day (e.g. all of today's Duo slips).
  */
 export async function fetchTicketsByTier(tier: TicketTier, date: Date = new Date()): Promise<Ticket[]> {
   const all = await fetchTickets(date);
@@ -540,7 +554,7 @@ export function isWithinFreeTrial(startISO: string | null, totalDays: number): b
 // ---------------------------------------------------------------------------
 // Anonymous trial tracking
 // ---------------------------------------------------------------------------
-// Visitors get the full 30-day free trial WITHOUT creating an account. The
+// Visitors get the full free trial WITHOUT creating an account. The
 // trial clock starts the first time a browser hits the app and is stored in
 // localStorage on that device. Signing in later (magic link) is optional —
 // it's only needed once the trial ends, to unlock ads/payment/subscription
@@ -571,6 +585,11 @@ export function getAnonymousTrialStart(): string {
 // "no data" (ticketsGenerated: 0, winRatePct: null) rather than a
 // fabricated placeholder — see PerformanceHistory in src/app/page.tsx,
 // which already renders a "—" for a day with no stats.
+//
+// HONESTY NOTE: `overall` deliberately counts EVERY ticket in the window,
+// including eliminated (legacy) tiers, so the headline win rate is never
+// flattered by dropping tiers that performed poorly. `byTier` only breaks
+// out the active tiers, since those are the only filter tabs shown.
 
 export interface TierStats {
   ticketsGenerated: number;
@@ -629,8 +648,7 @@ async function fetchRealHistoryRange(days: number): Promise<Map<string, DayPerfo
       .from('tickets')
       .select('id, ticket_date, tier, ticket_matches ( fixtures ( result_status ) )')
       .gte('ticket_date', dateKey(start))
-      .lte('ticket_date', dateKey(today))
-      .in('tier', DISPLAYED_TIERS);
+      .lte('ticket_date', dateKey(today));
 
     if (result.error) return map;
     data = result.data;
@@ -649,16 +667,8 @@ async function fetchRealHistoryRange(days: number): Promise<Map<string, DayPerfo
     byDate.get(key)!.push(row);
   });
 
-  // Same defensive guard as fetchRealTicketsForDate above and
-  // recomputeTicketTotals below — the ticket_matches -> fixtures join can
-  // come back as a one-element array rather than a plain object.
   const statusesOfRow = (row: any): MatchStatus[] =>
-    (row.ticket_matches ?? [])
-      .map((tm: any) => {
-        const f = Array.isArray(tm.fixtures) ? tm.fixtures[0] : tm.fixtures;
-        return f?.result_status;
-      })
-      .filter(Boolean);
+    (row.ticket_matches ?? []).map((tm: any) => tm.fixtures?.result_status).filter(Boolean);
 
   byDate.forEach((rows, day) => {
     const byTier: Partial<Record<TicketTier, TierStats>> = {};
@@ -918,180 +928,5 @@ export async function getArchiveAccess(userId: string | null): Promise<ArchiveAc
     // eslint-disable-next-line no-console
     console.warn('[Odd Saint] Archive access check failed, defaulting to no access:', err);
     return { level: 'none' };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Score predictions — RESTORED TYPE-ONLY STUBS (build-fix, incomplete)
-// ---------------------------------------------------------------------------
-// src/app/ScorePredictions.tsx imports these two types but every actual
-// data-fetching function that used to populate them (e.g. whatever pulled
-// from a `score_predictions` table / `score_prediction_daily_accuracy`
-// view — see the comments in ScorePredictions.tsx referencing
-// scripts/generate-score-predictions.mjs, scripts/analyze-score-
-// predictions.mjs, and supabase/migrations/006_score_prediction_tuning.sql)
-// was NOT present in the source content this file was rewritten from, and
-// is NOT reconstructed here — inventing a table/column shape would risk
-// silently querying the wrong thing rather than surfacing a clear error.
-//
-// These two shapes are restored ONLY because every field on them is
-// directly, unambiguously readable from ScorePredictions.tsx's own usage
-// (prediction.homeTeam, prediction.status, day.hitRatePct, etc.) — this
-// is reading the real consumer contract, not guessing. This restores the
-// TypeScript build (ScorePredictions.tsx is type-checked by Next.js even
-// though nothing currently imports/renders the component from page.tsx),
-// but the feature itself is NOT wired back up:
-//   - No function here actually returns ScorePrediction[] or
-//     ScorePredictionDayAccuracy[] from Supabase.
-//   - page.tsx does not import or render ScorePredictionsSection /
-//     ScorePredictionAccuracyHistory at all right now.
-// Provide the original fetcher implementation (or the real table/view
-// schema) to restore this properly instead of leaving it dead code.
-export interface ScorePrediction {
-  fixtureId: string;
-  homeTeam: string;
-  awayTeam: string;
-  league: string;
-  country: string;
-  kickoff: string; // ISO date string
-  status: 'pending' | 'correct' | 'incorrect';
-  predictedHomeScore: number;
-  predictedAwayScore: number;
-}
-
-export interface ScorePredictionDayAccuracy {
-  date: string; // 'YYYY-MM-DD'
-  correct: number;
-  incorrect: number;
-  stillPending: number;
-  /** Correct ÷ (correct + incorrect) as a whole-number percent, or null if nothing decided yet. */
-  hitRatePct: number | null;
-}
-
-// ---------------------------------------------------------------------------
-// Correct-score predictions
-// ---------------------------------------------------------------------------
-// Reads the `correct_score_predictions` table (supabase migration
-// 006_correct_scores.sql), written and graded by
-// scripts/generate-correct-scores.mjs. `top_scores` is the model's three
-// most likely exact scorelines, most likely first; a prediction is a 'hit'
-// when the FIRST one was exact, and `top3_hit` is true when ANY of the three
-// was. Public-read via RLS; the unlock gating is a UI decision.
-
-export interface ScoreLine {
-  home: number;
-  away: number;
-  probability: number; // model's own probability for this exact scoreline, 0-1
-}
-
-export interface CorrectScorePrediction {
-  fixtureId: string;
-  homeTeam: string;
-  awayTeam: string;
-  league: string;
-  country: string;
-  kickoff: string; // ISO date string
-  topScores: ScoreLine[];
-  homeXg: number;
-  awayXg: number;
-  status: 'pending' | 'hit' | 'miss';
-  top3Hit: boolean | null;
-  finalHomeScore?: number; // 90-minute score, set once graded
-  finalAwayScore?: number;
-}
-
-export interface CorrectScoreStats {
-  windowDays: number;
-  graded: number;
-  topHits: number;
-  top3Hits: number;
-  topHitRatePct: number | null;
-  top3HitRatePct: number | null;
-}
-
-/**
- * Today's predictions in the VISITOR'S local calendar day (kickoff between
- * local midnight and the next), ordered by kickoff. Filtering on kickoff
- * rather than the stored prediction_date avoids a UTC-vs-local date
- * mismatch hiding predictions around midnight.
- */
-export async function fetchCorrectScores(): Promise<CorrectScorePrediction[]> {
-  try {
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(start);
-    end.setDate(end.getDate() + 1);
-
-    const { data, error } = await supabase
-      .from('correct_score_predictions')
-      .select(
-        'fixture_id, league, country, home_team, away_team, kickoff, top_scores, home_xg, away_xg, result_status, top3_hit, final_home_score, final_away_score'
-      )
-      .gte('kickoff', start.toISOString())
-      .lt('kickoff', end.toISOString())
-      .order('kickoff', { ascending: true });
-    if (error || !data) return [];
-
-    return data.map((row: any) => ({
-      fixtureId: String(row.fixture_id),
-      homeTeam: row.home_team,
-      awayTeam: row.away_team,
-      league: row.league,
-      country: row.country,
-      kickoff: row.kickoff,
-      topScores: (Array.isArray(row.top_scores) ? row.top_scores : []).map((s: any) => ({
-        home: Number(s.home),
-        away: Number(s.away),
-        probability: Number(s.probability),
-      })),
-      homeXg: Number(row.home_xg),
-      awayXg: Number(row.away_xg),
-      status: row.result_status as 'pending' | 'hit' | 'miss',
-      top3Hit: row.top3_hit ?? null,
-      finalHomeScore: row.final_home_score ?? undefined,
-      finalAwayScore: row.final_away_score ?? undefined,
-    }));
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn('[Odd Saint] fetchCorrectScores failed:', err);
-    return [];
-  }
-}
-
-/** Real hit rates over the last `days` days of graded predictions — never mock data. */
-export async function fetchCorrectScoreStats(days: number = 30): Promise<CorrectScoreStats> {
-  const empty: CorrectScoreStats = {
-    windowDays: days,
-    graded: 0,
-    topHits: 0,
-    top3Hits: 0,
-    topHitRatePct: null,
-    top3HitRatePct: null,
-  };
-  try {
-    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-    const { data, error } = await supabase
-      .from('correct_score_predictions')
-      .select('result_status, top3_hit')
-      .neq('result_status', 'pending')
-      .gte('kickoff', since)
-      .limit(5000);
-    if (error || !data || data.length === 0) return empty;
-
-    const graded = data.length;
-    const topHits = data.filter((r: any) => r.result_status === 'hit').length;
-    const top3Hits = data.filter((r: any) => r.top3_hit === true).length;
-    return {
-      windowDays: days,
-      graded,
-      topHits,
-      top3Hits,
-      topHitRatePct: Math.round((topHits / graded) * 1000) / 10,
-      top3HitRatePct: Math.round((top3Hits / graded) * 1000) / 10,
-    };
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn('[Odd Saint] fetchCorrectScoreStats failed:', err);
-    return empty;
   }
 }
