@@ -1064,3 +1064,83 @@ export interface ScorePredictionDayAccuracy {
   /** correct / (correct + incorrect) as 0-100, null if nothing decided. */
   hitRatePct: number | null;
 }
+
+/**
+ * Today's exact-score predictions (table `score_predictions`, written by
+ * scripts/generate-score-predictions.mjs, graded with the ticket grader).
+ * `ticket_date` is a UTC date in the script, so the key here is UTC too.
+ * Returns [] on any failure — never fabricates predictions.
+ */
+export async function fetchScorePredictions(date: Date = new Date()): Promise<ScorePrediction[]> {
+  try {
+    const { data, error } = await supabase
+      .from('score_predictions')
+      .select('id, league, country, home_team, away_team, kickoff, predicted_home_score, predicted_away_score, result_status')
+      .eq('ticket_date', date.toISOString().slice(0, 10))
+      .order('kickoff', { ascending: true });
+    if (error || !data) {
+      if (error) {
+        // eslint-disable-next-line no-console
+        console.warn('[Odd Saint] fetchScorePredictions failed:', error.message);
+      }
+      return [];
+    }
+    return data.map((row: any) => ({
+      fixtureId: row.id,
+      league: row.league,
+      country: row.country,
+      homeTeam: row.home_team,
+      awayTeam: row.away_team,
+      kickoff: row.kickoff,
+      predictedHomeScore: row.predicted_home_score,
+      predictedAwayScore: row.predicted_away_score,
+      status: row.result_status as ScorePredictionStatus,
+    }));
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[Odd Saint] fetchScorePredictions threw:', err);
+    return [];
+  }
+}
+
+/**
+ * Daily exact-score accuracy for the last `days` UTC days, most recent first.
+ * Days with no rollup row come back as zeros / null rate ("—" in the UI),
+ * never a made-up number. Reads `score_prediction_daily_accuracy`.
+ */
+export async function fetchScorePredictionAccuracyHistory(days: number = 14): Promise<ScorePredictionDayAccuracy[]> {
+  const keys: string[] = [];
+  const today = new Date();
+  for (let i = 0; i < days; i++) {
+    const d = new Date(today);
+    d.setUTCDate(d.getUTCDate() - i);
+    keys.push(d.toISOString().slice(0, 10));
+  }
+
+  const byDate = new Map<string, ScorePredictionDayAccuracy>();
+  try {
+    const { data, error } = await supabase
+      .from('score_prediction_daily_accuracy')
+      .select('ticket_date, correct, incorrect, still_pending, hit_rate_pct')
+      .gte('ticket_date', keys[keys.length - 1])
+      .lte('ticket_date', keys[0]);
+    if (!error && data) {
+      data.forEach((row: any) => {
+        byDate.set(row.ticket_date, {
+          date: row.ticket_date,
+          correct: row.correct ?? 0,
+          incorrect: row.incorrect ?? 0,
+          stillPending: row.still_pending ?? 0,
+          hitRatePct: row.hit_rate_pct === null || row.hit_rate_pct === undefined ? null : Number(row.hit_rate_pct),
+        });
+      });
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[Odd Saint] fetchScorePredictionAccuracyHistory threw:', err);
+  }
+
+  return keys.map(
+    (k) => byDate.get(k) ?? { date: k, correct: 0, incorrect: 0, stillPending: 0, hitRatePct: null }
+  );
+}
