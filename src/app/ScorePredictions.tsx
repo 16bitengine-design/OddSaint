@@ -160,7 +160,7 @@ export function ScorePredictionsSection({
             Today's Exact Score Predictions
           </div>
           <div style={{ fontSize: 11.5, color: COLORS.textMuted, marginTop: 3 }}>
-            {predictions.length} match{predictions.length === 1 ? '' : 'es'} — model's single most likely final score
+            {predictions.length} match{predictions.length === 1 ? '' : 'es'} — predicted final scores
           </div>
         </div>
         <span style={{ color: COLORS.textMuted, fontSize: 12 }}>{open ? '▲' : '▼'}</span>
@@ -215,8 +215,7 @@ export function ScorePredictionsSection({
       )}
 
       <div style={{ fontSize: 10, color: COLORS.textMuted, marginTop: 12, lineHeight: 1.5 }}>
-        Model's own most-likely scoreline per match — a statistical opinion, not a guarantee. Exact-score
-        predictions are inherently low-probability; treat these as analysis, not a promise.
+        Predictions are analysis, not a guarantee of any result.
       </div>
     </div>
   );
@@ -248,7 +247,7 @@ export function ScorePredictionAccuracyHistory({ history }: { history: ScorePred
       }}
     >
       <div style={{ fontFamily: FONT_DISPLAY, fontSize: 14, fontWeight: 700, color: COLORS.textPrimary, marginBottom: 10 }}>
-        Exact-score accuracy — last {history.length} days
+        Exact score results — last {history.length} days
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -283,9 +282,8 @@ export function ScorePredictionAccuracyHistory({ history }: { history: ScorePred
       </div>
 
       <div style={{ fontSize: 10, color: COLORS.textMuted, marginTop: 10, lineHeight: 1.5 }}>
-        Exact-score hit rate = correct scorelines ÷ decided predictions (sample size shown after the dot). A
-        single-scoreline pick is inherently low-probability — sitting well under 50% is expected, not a sign
-        of error. Days with nothing decided yet show as pending or "—", never a fabricated rate.
+        Hit rate = correct predictions ÷ decided predictions. The number after the dot is how many were decided.
+        Exact scores are hard to call — results vary day to day.
       </div>
     </div>
   );
