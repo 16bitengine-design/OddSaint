@@ -1034,3 +1034,33 @@ export async function fetchCorrectScoreStats(windowDays: number = 30): Promise<C
     return null;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Exact-score predictions (single most-likely scoreline per fixture)
+// ---------------------------------------------------------------------------
+// Types used by src/app/ScorePredictions.tsx. Shapes are taken from how that
+// component reads them. The fetch functions for these are NOT here yet —
+// they depend on the score-prediction table/script schema.
+
+export type ScorePredictionStatus = 'pending' | 'correct' | 'incorrect';
+
+export interface ScorePrediction {
+  fixtureId: number;
+  league: string;
+  country: string;
+  homeTeam: string;
+  awayTeam: string;
+  kickoff: string; // ISO
+  predictedHomeScore: number;
+  predictedAwayScore: number;
+  status: ScorePredictionStatus;
+}
+
+export interface ScorePredictionDayAccuracy {
+  date: string; // 'YYYY-MM-DD'
+  correct: number;
+  incorrect: number;
+  stillPending: number;
+  /** correct / (correct + incorrect) as 0-100, null if nothing decided. */
+  hitRatePct: number | null;
+}
