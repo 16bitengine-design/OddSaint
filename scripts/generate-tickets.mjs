@@ -3,7 +3,7 @@
 //
 // Pulls real fixtures + bookmaker odds from API-Football, builds the three
 // remaining tiers, and writes them to Supabase. Runs twice a day via
-// .github/workflows/generate-tickets.yml (03:00 and 10:00 UTC) so each tier
+// .github/workflows/generate-tickets.yml (03:00 and 09:00 UTC) so each tier
 // releases in up to two staggered slots — see nextSlotFor.
 //
 // PRODUCT RULES ENFORCED HERE
@@ -118,11 +118,11 @@ const TIER_ODDS_TARGET = {
 const MIN_CUMULATIVE_ODDS = { mega: 1.97, duo: 1.97 };
 const UPPER_TOLERANCE = 0.3;
 
-// Per-tier confidence floor for the tier's base market (confidence = 100/odds,
-// clipped to 55-95, so 68 means odds of about 1.48 or shorter). NOTE: Duo needs
-// a 2-leg product of at least 2, so a 68 floor leaves a very narrow window —
-// lower DUO's value here if Duo is skipped too often.
-const TIER_MIN_CONFIDENCE = { mega: 68, duo: 68 };
+// Per-tier confidence floor (confidence = 100/odds, clipped to 55-95, so 68
+// means odds of about 1.48 or shorter). Duo needs two legs whose product is
+// at least 2 (average leg >= ~1.41), which a 68 floor makes almost impossible —
+// so Duo has its own, lower floor (58 = legs up to about 1.72).
+const TIER_MIN_CONFIDENCE = { mega: 68, duo: 58 };
 
 // Saint's Lock
 const SAINTS_LOCK_ODDS_MIN = 1.48;
@@ -141,8 +141,19 @@ const SMALL_TICKET_MAX_ODDS = 1.77;
 const MAX_FIXTURE_APPEARANCES_PER_DAY = 3;
 
 const MAX_TICKETS_PER_CATEGORY = 2;
-const MIN_HOURS_BETWEEN_SLOTS = 6;
-const AVAILABILITY_DELAY_MS = 60 * 60 * 1000; // matches RELEASE_SLOT_HOURS_UTC in dataFetcher.ts
+const MIN_HOURS_BETWEEN_SLOTS = 5; // runs are 6h apart (03:00 and 09:00 UTC); 5 leaves room for GitHub start-up jitter
+// Batches become visible at FIXED clock times, not "generation + 1h": slot 0 at
+// 04:00 UTC (07:00 EAT), slot 1 at 10:00 UTC (13:00 EAT). Generation runs at
+// 03:00 / 09:00 UTC; if a run starts late (GitHub jitter) and has already
+// passed its release time, the batch is available immediately instead of later.
+// MUST match RELEASE_SLOT_HOURS_UTC in src/lib/dataFetcher.ts.
+const RELEASE_SLOT_HOURS_UTC = [4, 10];
+
+function releaseTimeFor(slot, now) {
+  const hour = RELEASE_SLOT_HOURS_UTC[Math.min(slot, RELEASE_SLOT_HOURS_UTC.length - 1)];
+  const scheduled = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hour, 0, 0);
+  return new Date(Math.max(scheduled, now.getTime())).toISOString();
+}
 const MIN_HOURS_TO_KICKOFF = 2;
 
 function dateStr(d) {
@@ -154,16 +165,16 @@ function dateStr(d) {
 async function fetchTodaysSlipState(supabase, today) {
   const { data, error } = await supabase
     .from('tickets')
-    .select('tier, release_slot, available_at')
+    .select('tier, release_slot, available_at, created_at')
     .eq('ticket_date', today);
   if (error) throw error;
 
   const byTier = new Map();
   (data ?? []).forEach((row) => {
-    const existing = byTier.get(row.tier) ?? { count: 0, lastAvailableAt: null };
+    const existing = byTier.get(row.tier) ?? { count: 0, lastCreatedAt: null };
     existing.count += 1;
-    if (!existing.lastAvailableAt || row.available_at > existing.lastAvailableAt) {
-      existing.lastAvailableAt = row.available_at;
+    if (!existing.lastCreatedAt || row.created_at > existing.lastCreatedAt) {
+      existing.lastCreatedAt = row.created_at;
     }
     byTier.set(row.tier, existing);
   });
@@ -171,12 +182,11 @@ async function fetchTodaysSlipState(supabase, today) {
 }
 
 function nextSlotFor(maxSlipsToday, slipState) {
-  const state = slipState ?? { count: 0, lastAvailableAt: null };
+  const state = slipState ?? { count: 0, lastCreatedAt: null };
   if (state.count >= maxSlipsToday) return null;
   if (state.count === 0) return 0;
-  // available_at = generation time + AVAILABILITY_DELAY_MS — recover generation time.
-  const lastGeneratedAtMs = new Date(state.lastAvailableAt).getTime() - AVAILABILITY_DELAY_MS;
-  const hoursSinceLast = (Date.now() - lastGeneratedAtMs) / 3_600_000;
+  // created_at is the real generation time (available_at is a fixed release time now).
+  const hoursSinceLast = (Date.now() - new Date(state.lastCreatedAt).getTime()) / 3_600_000;
   if (hoursSinceLast < MIN_HOURS_BETWEEN_SLOTS) return null;
   return state.count;
 }
@@ -375,6 +385,7 @@ async function pickMarketFromOdds(oddsResponse, f) {
     market: chosen.market,
     odds: chosen.odds,
     confidence: impliedConfidence(chosen.odds),
+    allowedOutcomes: allowed.map((o) => ({ market: o.market, odds: o.odds })),
     saintsLockAlternatives,
     opponentPenalty: win?.opponentPenalty ?? 0,
   };
@@ -463,6 +474,7 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
             market: picked.market,
             odds: picked.odds,
             confidence: picked.confidence,
+            allowedOutcomes: picked.allowedOutcomes,
             saintsLockAlternatives: picked.saintsLockAlternatives,
             opponentPenalty: picked.opponentPenalty,
             baseUsable: true,
@@ -615,6 +627,7 @@ function pickDuo(pool, usageCount, targetRange) {
     for (let j = i + 1; j < eligible.length; j++) {
       const a = eligible[i];
       const b = eligible[j];
+      if (a.fixtureId === b.fixtureId) continue; // two different matches
       const total = a.odds * b.odds;
       if (total < minTotal || total > maxTotal) continue;
       const score = [
@@ -656,7 +669,7 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, exclude
   usageCount.set(pick.fixtureId, MAX_FIXTURE_APPEARANCES_PER_DAY); // exclusive to Saint's Lock
 
   const ticketId = `${today}-saints_lock-${slot}`;
-  const availableAtIso = new Date(now.getTime() + AVAILABILITY_DELAY_MS).toISOString();
+  const availableAtIso = releaseTimeFor(slot, now);
 
   return {
     tickets: [
@@ -680,11 +693,11 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, exclude
 
 function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set(), existingMarkets = new Map()) {
   const today = dateStr(now);
-  const availableAtIso = new Date(now.getTime() + AVAILABILITY_DELAY_MS).toISOString();
   const tickets = [];
   const ticketMatches = [];
   const fixturesUsed = new Map();
   const usageCount = new Map();
+  const chosenMarket = new Map(); // fixtureId -> market already used by a ticket built this run
 
   const saintsLockSlot = nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get('saints_lock'));
   if (saintsLockSlot !== null) {
@@ -706,7 +719,27 @@ function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set
       continue;
     }
 
-    const pool = poolForTier(dailyPool, config.tier);
+    let pool;
+    if (config.tier === 'duo') {
+      // A Duo needs two legs totalling >= 2, but each fixture's SAFEST market is
+      // often ~1.2, so the pair could never reach it. Offer every allowed
+      // outcome per fixture instead (the fixtures table holds ONE market per
+      // fixture, so skip any that conflict with a market already stored or
+      // already chosen for that fixture by a ticket built earlier this run).
+      const minConf = TIER_MIN_CONFIDENCE.duo;
+      pool = dailyPool.flatMap((p) =>
+        (p.allowedOutcomes ?? [])
+          .filter((o) => {
+            const stored = existingMarkets.get(p.fixtureId);
+            const chosen = chosenMarket.get(p.fixtureId);
+            return (stored === undefined || stored === o.market) && (chosen === undefined || chosen === o.market);
+          })
+          .map((o) => ({ ...p, market: o.market, odds: o.odds, confidence: impliedConfidence(o.odds) }))
+          .filter((c) => c.confidence >= minConf)
+      );
+    } else {
+      pool = poolForTier(dailyPool, config.tier);
+    }
     const targetRange = TIER_ODDS_TARGET[config.tier];
     const picks =
       config.tier === 'duo'
@@ -731,6 +764,7 @@ function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set
     picks.forEach((p) => {
       fixturesUsed.set(p.fixtureId, p);
       usageCount.set(p.fixtureId, (usageCount.get(p.fixtureId) ?? 0) + 1);
+      chosenMarket.set(p.fixtureId, p.market);
     });
 
     const ticketId = `${today}-${config.tier}-${slot}`;
@@ -744,7 +778,7 @@ function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set
       total_odds: computeTotalOdds(picks),
       is_free: config.alwaysFree,
       release_slot: slot,
-      available_at: availableAtIso,
+      available_at: releaseTimeFor(slot, now),
     });
     picks.forEach((p, idx) => ticketMatches.push({ ticket_id: ticketId, fixture_id: p.fixtureId, sort_order: idx }));
   }
