@@ -12,44 +12,8 @@
     "region": "Europe"
   },
   {
-    "id": 43,
-    "name": "National League",
-    "country": "England",
-    "region": "Europe"
-  },
-  {
-    "id": 41,
-    "name": "League One",
-    "country": "England",
-    "region": "Europe"
-  },
-  {
-    "id": 42,
-    "name": "League Two",
-    "country": "England",
-    "region": "Europe"
-  },
-  {
     "id": 44,
     "name": "FA WSL",
-    "country": "England",
-    "region": "Europe"
-  },
-  {
-    "id": 49,
-    "name": "National League - Play-offs",
-    "country": "England",
-    "region": "Europe"
-  },
-  {
-    "id": 50,
-    "name": "National League - North",
-    "country": "England",
-    "region": "Europe"
-  },
-  {
-    "id": 51,
-    "name": "National League - South",
     "country": "England",
     "region": "Europe"
   },
@@ -108,18 +72,6 @@
     "region": "Europe"
   },
   {
-    "id": 695,
-    "name": "U18 Premier League - North",
-    "country": "England",
-    "region": "Europe"
-  },
-  {
-    "id": 696,
-    "name": "U18 Premier League - South",
-    "country": "England",
-    "region": "Europe"
-  },
-  {
     "id": 699,
     "name": "Women's Championship",
     "country": "England",
@@ -156,26 +108,8 @@
     "region": "Europe"
   },
   {
-    "id": 984,
-    "name": "National League - North - Play-offs",
-    "country": "England",
-    "region": "Europe"
-  },
-  {
-    "id": 985,
-    "name": "National League - South - Play-offs",
-    "country": "England",
-    "region": "Europe"
-  },
-  {
     "id": 986,
     "name": "Non League Div One - Play-offs",
-    "country": "England",
-    "region": "Europe"
-  },
-  {
-    "id": 987,
-    "name": "U18 Premier League - Championship",
     "country": "England",
     "region": "Europe"
   },
@@ -234,12 +168,6 @@
     "region": "Europe"
   },
   {
-    "id": 436,
-    "name": "Primera División RFEF - Group 2",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
     "id": 437,
     "name": "Primera División RFEF - Group 3",
     "country": "Spain",
@@ -252,114 +180,6 @@
     "region": "Europe"
   },
   {
-    "id": 439,
-    "name": "Tercera División RFEF - Group 1",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 440,
-    "name": "Tercera División RFEF - Group 2",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 441,
-    "name": "Tercera División RFEF - Group 3",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 442,
-    "name": "Tercera División RFEF - Group 4",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 443,
-    "name": "Tercera División RFEF - Group 5",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 444,
-    "name": "Tercera División RFEF - Group 6",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 445,
-    "name": "Tercera División RFEF - Group 7",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 446,
-    "name": "Tercera División RFEF - Group 8",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 447,
-    "name": "Tercera División RFEF - Group 9",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 448,
-    "name": "Tercera División RFEF - Group 10",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 449,
-    "name": "Tercera División RFEF - Group 11",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 450,
-    "name": "Tercera División RFEF - Group 12",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 451,
-    "name": "Tercera División RFEF - Group 13",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 452,
-    "name": "Tercera División RFEF - Group 14",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 453,
-    "name": "Tercera División RFEF - Group 15",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 454,
-    "name": "Tercera División RFEF - Group 16",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 455,
-    "name": "Tercera División RFEF - Group 17",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 456,
-    "name": "Tercera División RFEF - Group 18",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
     "id": 692,
     "name": "Primera División RFEF - Group 5",
     "country": "Spain",
@@ -368,12 +188,6 @@
   {
     "id": 875,
     "name": "Segunda División RFEF - Group 1",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 876,
-    "name": "Segunda División RFEF - Group 2",
     "country": "Spain",
     "region": "Europe"
   },
@@ -392,12 +206,6 @@
   {
     "id": 879,
     "name": "Segunda División RFEF - Group 5",
-    "country": "Spain",
-    "region": "Europe"
-  },
-  {
-    "id": 977,
-    "name": "Tercera División RFEF - Promotion - Play-offs",
     "country": "Spain",
     "region": "Europe"
   },
@@ -426,128 +234,8 @@
     "region": "Europe"
   },
   {
-    "id": 138,
-    "name": "Serie C - Girone A",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
     "id": 139,
     "name": "Serie A Women",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 942,
-    "name": "Serie C - Girone B",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 943,
-    "name": "Serie C - Girone C",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 426,
-    "name": "Serie D - Girone A",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 427,
-    "name": "Serie D - Girone B",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 428,
-    "name": "Serie D - Girone C",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 429,
-    "name": "Serie D - Girone D",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 430,
-    "name": "Serie D - Girone E",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 431,
-    "name": "Serie D - Girone F",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 432,
-    "name": "Serie D - Girone G",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 433,
-    "name": "Serie D - Girone H",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 434,
-    "name": "Serie D - Girone I",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 705,
-    "name": "Campionato Primavera - 1",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 706,
-    "name": "Campionato Primavera - 2",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 975,
-    "name": "Serie C - Relegation - Play-offs",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 976,
-    "name": "Serie C - Promotion - Play-offs",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 974,
-    "name": "Serie C - Supercoppa Lega Finals",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 997,
-    "name": "Serie D - Promotion - Play-offs",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 998,
-    "name": "Serie D - Relegation - Play-offs",
-    "country": "Italy",
-    "region": "Europe"
-  },
-  {
-    "id": 999,
-    "name": "Serie D - Championship Round",
     "country": "Italy",
     "region": "Europe"
   },
@@ -564,50 +252,8 @@
     "region": "Europe"
   },
   {
-    "id": 80,
-    "name": "3. Liga",
-    "country": "Germany",
-    "region": "Europe"
-  },
-  {
     "id": 82,
     "name": "Frauen Bundesliga",
-    "country": "Germany",
-    "region": "Europe"
-  },
-  {
-    "id": 488,
-    "name": "U19 Bundesliga",
-    "country": "Germany",
-    "region": "Europe"
-  },
-  {
-    "id": 83,
-    "name": "Regionalliga - Bayern",
-    "country": "Germany",
-    "region": "Europe"
-  },
-  {
-    "id": 84,
-    "name": "Regionalliga - Nord",
-    "country": "Germany",
-    "region": "Europe"
-  },
-  {
-    "id": 85,
-    "name": "Regionalliga - Nordost",
-    "country": "Germany",
-    "region": "Europe"
-  },
-  {
-    "id": 86,
-    "name": "Regionalliga - SudWest",
-    "country": "Germany",
-    "region": "Europe"
-  },
-  {
-    "id": 87,
-    "name": "Regionalliga - West",
     "country": "Germany",
     "region": "Europe"
   },
@@ -708,18 +354,6 @@
     "region": "Europe"
   },
   {
-    "id": 1002,
-    "name": "Regionalliga - Promotion Play-offs",
-    "country": "Germany",
-    "region": "Europe"
-  },
-  {
-    "id": 1003,
-    "name": "Regionalliga - Relegation Round",
-    "country": "Germany",
-    "region": "Europe"
-  },
-  {
     "id": 1034,
     "name": "2. Frauen Bundesliga",
     "country": "Germany",
@@ -734,12 +368,6 @@
   {
     "id": 61,
     "name": "Ligue 1",
-    "country": "France",
-    "region": "Europe"
-  },
-  {
-    "id": 62,
-    "name": "Ligue 2",
     "country": "France",
     "region": "Europe"
   },
@@ -894,32 +522,8 @@
     "region": "Europe"
   },
   {
-    "id": 675,
-    "name": "U21 Divisie 1",
-    "country": "Netherlands",
-    "region": "Europe"
-  },
-  {
-    "id": 724,
-    "name": "U18 Divisie 1",
-    "country": "Netherlands",
-    "region": "Europe"
-  },
-  {
-    "id": 883,
-    "name": "Reserve League",
-    "country": "Netherlands",
-    "region": "Europe"
-  },
-  {
     "id": 1004,
     "name": "Derde Divisie - Relegation Round",
-    "country": "Netherlands",
-    "region": "Europe"
-  },
-  {
-    "id": 1152,
-    "name": "U19 Divisie 1",
     "country": "Netherlands",
     "region": "Europe"
   },
@@ -984,18 +588,6 @@
     "region": "Europe"
   },
   {
-    "id": 701,
-    "name": "Liga Revelação U23",
-    "country": "Portugal",
-    "region": "Europe"
-  },
-  {
-    "id": 865,
-    "name": "Liga 3",
-    "country": "Portugal",
-    "region": "Europe"
-  },
-  {
     "id": 948,
     "name": "1a Divisão - Women",
     "country": "Portugal",
@@ -1004,12 +596,6 @@
   {
     "id": 991,
     "name": "Campeonato de Portugal Prio - Promotion Round",
-    "country": "Portugal",
-    "region": "Europe"
-  },
-  {
-    "id": 1041,
-    "name": "Júniores U19",
     "country": "Portugal",
     "region": "Europe"
   },
@@ -1028,36 +614,6 @@
   {
     "id": 146,
     "name": "Super League Women",
-    "country": "Belgium",
-    "region": "Europe"
-  },
-  {
-    "id": 149,
-    "name": "Second Amateur Division - VFV A",
-    "country": "Belgium",
-    "region": "Europe"
-  },
-  {
-    "id": 150,
-    "name": "Second Amateur Division - VFV B",
-    "country": "Belgium",
-    "region": "Europe"
-  },
-  {
-    "id": 151,
-    "name": "Third Amateur Division - VFV A",
-    "country": "Belgium",
-    "region": "Europe"
-  },
-  {
-    "id": 152,
-    "name": "Third Amateur Division - VFV B",
-    "country": "Belgium",
-    "region": "Europe"
-  },
-  {
-    "id": 148,
-    "name": "Second Amateur Division - ACFF",
     "country": "Belgium",
     "region": "Europe"
   },
@@ -1116,30 +672,6 @@
     "region": "Europe"
   },
   {
-    "id": 487,
-    "name": "First Amateur Division",
-    "country": "Belgium",
-    "region": "Europe"
-  },
-  {
-    "id": 518,
-    "name": "Reserve Pro League",
-    "country": "Belgium",
-    "region": "Europe"
-  },
-  {
-    "id": 689,
-    "name": "Third Amateur Division - ACFF A",
-    "country": "Belgium",
-    "region": "Europe"
-  },
-  {
-    "id": 690,
-    "name": "Third Amateur Division - ACFF B",
-    "country": "Belgium",
-    "region": "Europe"
-  },
-  {
     "id": 691,
     "name": "Provincial - Brabant ACFF",
     "country": "Belgium",
@@ -1155,60 +687,6 @@
     "id": 980,
     "name": "Provincial - Play-offs ACFF",
     "country": "Belgium",
-    "region": "Europe"
-  },
-  {
-    "id": 981,
-    "name": "Third Amateur Division - Play-offs",
-    "country": "Belgium",
-    "region": "Europe"
-  },
-  {
-    "id": 1011,
-    "name": "Second Amateur Division - Play-offs ",
-    "country": "Belgium",
-    "region": "Europe"
-  },
-  {
-    "id": 179,
-    "name": "Premiership",
-    "country": "Scotland",
-    "region": "Europe"
-  },
-  {
-    "id": 180,
-    "name": "Championship",
-    "country": "Scotland",
-    "region": "Europe"
-  },
-  {
-    "id": 183,
-    "name": "League One",
-    "country": "Scotland",
-    "region": "Europe"
-  },
-  {
-    "id": 184,
-    "name": "League Two",
-    "country": "Scotland",
-    "region": "Europe"
-  },
-  {
-    "id": 730,
-    "name": "Football League - Highland League",
-    "country": "Scotland",
-    "region": "Europe"
-  },
-  {
-    "id": 731,
-    "name": "Football League - Lowland League",
-    "country": "Scotland",
-    "region": "Europe"
-  },
-  {
-    "id": 992,
-    "name": "Football League - Championship",
-    "country": "Scotland",
     "region": "Europe"
   },
   {
@@ -1236,12 +714,6 @@
     "region": "Europe"
   },
   {
-    "id": 553,
-    "name": "3. Lig - Group 2",
-    "country": "Turkey",
-    "region": "Europe"
-  },
-  {
     "id": 554,
     "name": "3. Lig - Group 3",
     "country": "Turkey",
@@ -1260,12 +732,6 @@
     "region": "Europe"
   },
   {
-    "id": 1240,
-    "name": "U19 league",
-    "country": "Turkey",
-    "region": "Europe"
-  },
-  {
     "id": 235,
     "name": "Premier League",
     "country": "Russia",
@@ -1274,12 +740,6 @@
   {
     "id": 236,
     "name": "First League",
-    "country": "Russia",
-    "region": "Europe"
-  },
-  {
-    "id": 238,
-    "name": "Youth Championship",
     "country": "Russia",
     "region": "Europe"
   },
@@ -1298,12 +758,6 @@
   {
     "id": 651,
     "name": "Second League - Group 1",
-    "country": "Russia",
-    "region": "Europe"
-  },
-  {
-    "id": 652,
-    "name": "Second League - Group 2",
     "country": "Russia",
     "region": "Europe"
   },
@@ -1368,18 +822,6 @@
     "region": "Europe"
   },
   {
-    "id": 679,
-    "name": "U21 League",
-    "country": "Ukraine",
-    "region": "Europe"
-  },
-  {
-    "id": 1065,
-    "name": "U19 League",
-    "country": "Ukraine",
-    "region": "Europe"
-  },
-  {
     "id": 106,
     "name": "Ekstraklasa",
     "country": "Poland",
@@ -1398,20 +840,8 @@
     "region": "Europe"
   },
   {
-    "id": 676,
-    "name": "Central Youth League",
-    "country": "Poland",
-    "region": "Europe"
-  },
-  {
     "id": 780,
     "name": "III Liga - Group 1",
-    "country": "Poland",
-    "region": "Europe"
-  },
-  {
-    "id": 781,
-    "name": "III Liga - Group 2",
     "country": "Poland",
     "region": "Europe"
   },
@@ -1442,24 +872,6 @@
   {
     "id": 218,
     "name": "Bundesliga",
-    "country": "Austria",
-    "region": "Europe"
-  },
-  {
-    "id": 222,
-    "name": "Regionalliga - Mitte",
-    "country": "Austria",
-    "region": "Europe"
-  },
-  {
-    "id": 221,
-    "name": "Regionalliga - Ost",
-    "country": "Austria",
-    "region": "Europe"
-  },
-  {
-    "id": 223,
-    "name": "Regionalliga - West",
     "country": "Austria",
     "region": "Europe"
   },
@@ -1524,30 +936,6 @@
     "region": "Europe"
   },
   {
-    "id": 687,
-    "name": "Regionalliga - Tirol",
-    "country": "Austria",
-    "region": "Europe"
-  },
-  {
-    "id": 688,
-    "name": "Regionalliga - Salzburg",
-    "country": "Austria",
-    "region": "Europe"
-  },
-  {
-    "id": 1238,
-    "name": "Regionalliga - South",
-    "country": "Austria",
-    "region": "Europe"
-  },
-  {
-    "id": 1239,
-    "name": "Regionalliga - North",
-    "country": "Austria",
-    "region": "Europe"
-  },
-  {
     "id": 207,
     "name": "Super League",
     "country": "Switzerland",
@@ -1572,12 +960,6 @@
     "region": "Europe"
   },
   {
-    "id": 600,
-    "name": "1. Liga Classic - Group 2",
-    "country": "Switzerland",
-    "region": "Europe"
-  },
-  {
     "id": 601,
     "name": "1. Liga Classic - Group 3",
     "country": "Switzerland",
@@ -1592,12 +974,6 @@
   {
     "id": 796,
     "name": "2. Liga Interregional - Group 1",
-    "country": "Switzerland",
-    "region": "Europe"
-  },
-  {
-    "id": 797,
-    "name": "2. Liga Interregional - Group 2",
     "country": "Switzerland",
     "region": "Europe"
   },
@@ -1644,20 +1020,8 @@
     "region": "Europe"
   },
   {
-    "id": 494,
-    "name": "Super League 2",
-    "country": "Greece",
-    "region": "Europe"
-  },
-  {
     "id": 576,
     "name": "Gamma Ethniki - Group 1",
-    "country": "Greece",
-    "region": "Europe"
-  },
-  {
-    "id": 577,
-    "name": "Gamma Ethniki - Group 2",
     "country": "Greece",
     "region": "Europe"
   },
@@ -1824,20 +1188,8 @@
     "region": "Europe"
   },
   {
-    "id": 474,
-    "name": "2. Division - Group 2",
-    "country": "Norway",
-    "region": "Europe"
-  },
-  {
     "id": 774,
     "name": "3. Division - Girone 1",
-    "country": "Norway",
-    "region": "Europe"
-  },
-  {
-    "id": 775,
-    "name": "3. Division - Girone 2",
     "country": "Norway",
     "region": "Europe"
   },
@@ -1902,12 +1254,6 @@
     "region": "Europe"
   },
   {
-    "id": 125,
-    "name": "Denmark Series - Group 2",
-    "country": "Denmark",
-    "region": "Europe"
-  },
-  {
     "id": 126,
     "name": "Denmark Series - Group 3",
     "country": "Denmark",
@@ -1916,12 +1262,6 @@
   {
     "id": 122,
     "name": "2. Division",
-    "country": "Denmark",
-    "region": "Europe"
-  },
-  {
-    "id": 123,
-    "name": "2nd Division - Group 2",
     "country": "Denmark",
     "region": "Europe"
   },
@@ -2046,12 +1386,6 @@
     "region": "Europe"
   },
   {
-    "id": 1241,
-    "name": "U19 league",
-    "country": "Serbia",
-    "region": "Europe"
-  },
-  {
     "id": 345,
     "name": "Czech Liga",
     "country": "Czech-Republic",
@@ -2060,18 +1394,6 @@
   {
     "id": 346,
     "name": "FNL",
-    "country": "Czech-Republic",
-    "region": "Europe"
-  },
-  {
-    "id": 348,
-    "name": "3. liga - CFL A",
-    "country": "Czech-Republic",
-    "region": "Europe"
-  },
-  {
-    "id": 349,
-    "name": "3. liga - MSFL",
     "country": "Czech-Republic",
     "region": "Europe"
   },
@@ -2106,32 +1428,14 @@
     "region": "Europe"
   },
   {
-    "id": 668,
-    "name": "1. Liga U19",
-    "country": "Czech-Republic",
-    "region": "Europe"
-  },
-  {
     "id": 669,
     "name": "1. Liga Women",
     "country": "Czech-Republic",
     "region": "Europe"
   },
   {
-    "id": 685,
-    "name": "3. liga - CFL B",
-    "country": "Czech-Republic",
-    "region": "Europe"
-  },
-  {
     "id": 686,
     "name": "4. liga - Divizie F",
-    "country": "Czech-Republic",
-    "region": "Europe"
-  },
-  {
-    "id": 1010,
-    "name": "3. liga - Promotion Play-off",
     "country": "Czech-Republic",
     "region": "Europe"
   },
@@ -2148,12 +1452,6 @@
     "region": "Europe"
   },
   {
-    "id": 284,
-    "name": "Liga II",
-    "country": "Romania",
-    "region": "Europe"
-  },
-  {
     "id": 728,
     "name": "Liga 1 Feminin",
     "country": "Romania",
@@ -2162,12 +1460,6 @@
   {
     "id": 784,
     "name": "Liga III - Serie 1",
-    "country": "Romania",
-    "region": "Europe"
-  },
-  {
-    "id": 785,
-    "name": "Liga III - Serie 2",
     "country": "Romania",
     "region": "Europe"
   },
@@ -2223,12 +1515,6 @@
     "id": 1009,
     "name": "Liga III - Play-offs",
     "country": "Romania",
-    "region": "Europe"
-  },
-  {
-    "id": 272,
-    "name": "NB II",
-    "country": "Hungary",
     "region": "Europe"
   },
   {
@@ -2430,38 +1716,8 @@
     "region": "Europe"
   },
   {
-    "id": 643,
-    "name": "3. liga - Bratislava",
-    "country": "Slovakia",
-    "region": "Europe"
-  },
-  {
-    "id": 644,
-    "name": "3. liga - West",
-    "country": "Slovakia",
-    "region": "Europe"
-  },
-  {
-    "id": 645,
-    "name": "3. liga - East",
-    "country": "Slovakia",
-    "region": "Europe"
-  },
-  {
-    "id": 646,
-    "name": "3. liga - Center",
-    "country": "Slovakia",
-    "region": "Europe"
-  },
-  {
     "id": 733,
     "name": "I Liga - Women",
-    "country": "Slovakia",
-    "region": "Europe"
-  },
-  {
-    "id": 1185,
-    "name": "3. liga - Play-offs",
     "country": "Slovakia",
     "region": "Europe"
   },
@@ -2538,20 +1794,8 @@
     "region": "Europe"
   },
   {
-    "id": 326,
-    "name": "Erovnuli Liga 2",
-    "country": "Georgia",
-    "region": "Europe"
-  },
-  {
     "id": 327,
     "name": "Erovnuli Liga",
-    "country": "Georgia",
-    "region": "Europe"
-  },
-  {
-    "id": 1104,
-    "name": "Liga 3",
     "country": "Georgia",
     "region": "Europe"
   },
@@ -2582,18 +1826,6 @@
   {
     "id": 169,
     "name": "Super League",
-    "country": "China",
-    "region": "Asia"
-  },
-  {
-    "id": 170,
-    "name": "League One",
-    "country": "China",
-    "region": "Asia"
-  },
-  {
-    "id": 929,
-    "name": "League Two",
     "country": "China",
     "region": "Asia"
   },
@@ -2640,12 +1872,6 @@
     "region": "Asia"
   },
   {
-    "id": 293,
-    "name": "K League 2",
-    "country": "South-Korea",
-    "region": "Asia"
-  },
-  {
     "id": 295,
     "name": "K3 League",
     "country": "South-Korea",
@@ -2670,12 +1896,6 @@
     "region": "Asia"
   },
   {
-    "id": 297,
-    "name": "Thai League 2",
-    "country": "Thailand",
-    "region": "Asia"
-  },
-  {
     "id": 71,
     "name": "Serie A",
     "country": "Brazil",
@@ -2684,18 +1904,6 @@
   {
     "id": 72,
     "name": "Serie B",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 75,
-    "name": "Serie C",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 76,
-    "name": "Serie D",
     "country": "Brazil",
     "region": "South America"
   },
@@ -2724,24 +1932,6 @@
     "region": "South America"
   },
   {
-    "id": 613,
-    "name": "Baiano - 2",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 620,
-    "name": "Cearense - 2",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 625,
-    "name": "Carioca - 2",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
     "id": 475,
     "name": "Paulista - A1",
     "country": "Brazil",
@@ -2756,12 +1946,6 @@
   {
     "id": 477,
     "name": "Gaúcho - 1",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 478,
-    "name": "Gaúcho - 2",
     "country": "Brazil",
     "region": "South America"
   },
@@ -2826,12 +2010,6 @@
     "region": "South America"
   },
   {
-    "id": 614,
-    "name": "Paranaense - 2",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
     "id": 615,
     "name": "Rondoniense",
     "country": "Brazil",
@@ -2840,12 +2018,6 @@
   {
     "id": 616,
     "name": "Potiguar",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 619,
-    "name": "Mineiro - 2",
     "country": "Brazil",
     "region": "South America"
   },
@@ -2916,68 +2088,8 @@
     "region": "South America"
   },
   {
-    "id": 936,
-    "name": "Catarinense - 2",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1030,
-    "name": "Goiano - 2",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1037,
-    "name": "Paraibano 2",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
     "id": 1062,
     "name": "Paulista - A4",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1069,
-    "name": "Goiano U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1071,
-    "name": "Paranaense U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1073,
-    "name": "Baiano U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1076,
-    "name": "Catarinense U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1086,
-    "name": "Paulista - U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1088,
-    "name": "Pernambucano - U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1096,
-    "name": "Matogrossense 2",
     "country": "Brazil",
     "region": "South America"
   },
@@ -2988,44 +2100,8 @@
     "region": "South America"
   },
   {
-    "id": 1100,
-    "name": "Brasiliense U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
     "id": 1106,
     "name": "Carioca C",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1107,
-    "name": "Mineiro U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1108,
-    "name": "Sergipano U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1110,
-    "name": "Alagoano U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1112,
-    "name": "Cearense U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1114,
-    "name": "Carioca U20",
     "country": "Brazil",
     "region": "South America"
   },
@@ -3036,26 +2112,8 @@
     "region": "South America"
   },
   {
-    "id": 1120,
-    "name": "Paraibano U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
     "id": 1124,
     "name": "Cearense - 3",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1125,
-    "name": "Pernambucano - 2",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1128,
-    "name": "Brasileiro U17",
     "country": "Brazil",
     "region": "South America"
   },
@@ -3066,26 +2124,8 @@
     "region": "South America"
   },
   {
-    "id": 1134,
-    "name": "Amazonense - 2",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1135,
-    "name": "Sergipano - 2",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
     "id": 1138,
     "name": "Paranaense - 3",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1139,
-    "name": "Potiguar - U20",
     "country": "Brazil",
     "region": "South America"
   },
@@ -3102,26 +2142,8 @@
     "region": "South America"
   },
   {
-    "id": 1143,
-    "name": "Estadual Junior U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
     "id": 1145,
     "name": "Paraense B1",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1148,
-    "name": "Maranhense - 2",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1149,
-    "name": "Potiguar - 2",
     "country": "Brazil",
     "region": "South America"
   },
@@ -3150,26 +2172,8 @@
     "region": "South America"
   },
   {
-    "id": 1157,
-    "name": "Paraense U20",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
     "id": 1147,
     "name": "Capixaba B",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1203,
-    "name": "Piauiense - 2",
-    "country": "Brazil",
-    "region": "South America"
-  },
-  {
-    "id": 1204,
-    "name": "Rondoniense - 2",
     "country": "Brazil",
     "region": "South America"
   },
@@ -3210,20 +2214,8 @@
     "region": "South America"
   },
   {
-    "id": 906,
-    "name": "Reserve League",
-    "country": "Argentina",
-    "region": "South America"
-  },
-  {
     "id": 1032,
     "name": "Copa de la Liga Profesional",
-    "country": "Argentina",
-    "region": "South America"
-  },
-  {
-    "id": 1067,
-    "name": "Torneo Promocional Amateur",
     "country": "Argentina",
     "region": "South America"
   },
@@ -3366,20 +2358,8 @@
     "region": "North America"
   },
   {
-    "id": 256,
-    "name": "USL League Two",
-    "country": "USA",
-    "region": "North America"
-  },
-  {
     "id": 254,
     "name": "NWSL Women",
-    "country": "USA",
-    "region": "North America"
-  },
-  {
-    "id": 489,
-    "name": "USL League One",
     "country": "USA",
     "region": "North America"
   },
@@ -3392,12 +2372,6 @@
   {
     "id": 909,
     "name": "MLS Next Pro",
-    "country": "USA",
-    "region": "North America"
-  },
-  {
-    "id": 1095,
-    "name": "USL League One Cup",
     "country": "USA",
     "region": "North America"
   },
@@ -3456,26 +2430,8 @@
     "region": "North America"
   },
   {
-    "id": 861,
-    "name": "U20 League",
-    "country": "Mexico",
-    "region": "North America"
-  },
-  {
     "id": 872,
     "name": "Liga Premier Serie B",
-    "country": "Mexico",
-    "region": "North America"
-  },
-  {
-    "id": 1017,
-    "name": "U23 League",
-    "country": "Mexico",
-    "region": "North America"
-  },
-  {
-    "id": 1200,
-    "name": "Liga MX U21",
     "country": "Mexico",
     "region": "North America"
   },
@@ -3518,12 +2474,6 @@
   {
     "id": 200,
     "name": "Botola Pro",
-    "country": "Morocco",
-    "region": "Africa"
-  },
-  {
-    "id": 201,
-    "name": "Botola 2",
     "country": "Morocco",
     "region": "Africa"
   },
@@ -3584,18 +2534,6 @@
   {
     "id": 186,
     "name": "Ligue 1",
-    "country": "Algeria",
-    "region": "Africa"
-  },
-  {
-    "id": 187,
-    "name": "Ligue 2",
-    "country": "Algeria",
-    "region": "Africa"
-  },
-  {
-    "id": 515,
-    "name": "U21 League 1",
     "country": "Algeria",
     "region": "Africa"
   }
