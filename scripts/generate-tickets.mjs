@@ -17,8 +17,9 @@
 //            required (see opponentPenalty).
 //   Over 2.5 Goals, any ticket: BOTH teams must average >= 2 goals scored
 //            over their last 5 finished matches (all competitions).
+//   Double Chance (Mega/Duo only): allowed ONLY when its odds are <= 1.3.
 //   Any other market (Mega/Duo only): no rank/form requirement.
-//   Mega Day: any market, cumulative odds in [1.97, 3], up to 4 legs.
+//   Mega Day: any market, EXACTLY 3 matches, cumulative odds in [1.97, 3].
 //   Duo: any market, exactly 2 legs, cumulative odds in [2, 4].
 //   Saint's Lock: ONE match; market must be a direct win or Over 2.5 Goals
 //            (never Double Chance); odds 1.48-2.0.
@@ -104,7 +105,7 @@ function isExcluded(homeTeam, awayTeam) {
 
 // Must stay in sync with TIER_CONFIG in src/lib/dataFetcher.ts.
 const TIER_CONFIG = [
-  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 4, oddsRange: '1.97-3', alwaysFree: true },
+  { tier: 'mega', label: 'Mega Day Ticket', matchCount: 3, oddsRange: '1.97-3', alwaysFree: true },
   { tier: 'duo', label: 'Duo', matchCount: 2, oddsRange: '2-4', alwaysFree: false },
   { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.48-2', alwaysFree: false },
 ];
@@ -116,7 +117,6 @@ const TIER_ODDS_TARGET = {
   duo: [2, 4],
 };
 const MIN_CUMULATIVE_ODDS = { mega: 1.97, duo: 1.97 };
-const UPPER_TOLERANCE = 0.3;
 
 // Per-tier confidence floor (confidence = 100/odds, clipped to 55-95, so 68
 // means odds of about 1.48 or shorter). Duo needs two legs whose product is
@@ -130,10 +130,12 @@ const SAINTS_LOCK_ODDS_MAX = 2.0;
 const SAINTS_LOCK_MARKETS = new Set(['Home Win', 'Away Win', 'Over 2.5 Goals']);
 
 // Strength rules
-const MIN_RANK_GAP = 4;
+const MIN_RANK_GAP = 6;
 const MIN_GAMES_PLAYED = 5; // early-season tables are meaningless
 const MIN_WINS_LAST_5 = 3; // backed team (hard)
 const OPPONENT_MAX_WINS_LAST_5 = 2; // opponent (preference only)
+// Double Chance is only allowed at short prices: above this it is excluded.
+const DOUBLE_CHANCE_MAX_ODDS = 1.3;
 const MIN_AVG_GOALS_FOR_OVER_25 = 2; // each team, last 5 matches
 
 const SMALL_TICKET_TIERS = new Set(['mega']);
@@ -311,12 +313,17 @@ async function over25Eligible(f) {
 /**
  * Is this outcome allowed for this fixture? Wins need the win assessment
  * AND must back the better-placed side. Over 2.5 needs the goals rule.
- * Other markets are unrestricted on Mega/Duo and forbidden for Saint's Lock.
+ * Double Chance is allowed only at odds <= DOUBLE_CHANCE_MAX_ODDS (never on
+ * Saint's Lock). Other markets are unrestricted on Mega/Duo and forbidden
+ * for Saint's Lock.
  */
 function marketAllowed(outcome, win, canOver25, saintsLockOnly) {
   if (outcome.market === 'Over 2.5 Goals') return canOver25;
   if (outcome.market === 'Home Win') return !!win?.eligible && win.favoured === 'home';
   if (outcome.market === 'Away Win') return !!win?.eligible && win.favoured === 'away';
+  if (outcome.market.startsWith('Double Chance')) {
+    return !saintsLockOnly && outcome.odds <= DOUBLE_CHANCE_MAX_ODDS;
+  }
   return !saintsLockOnly;
 }
 
@@ -327,9 +334,11 @@ function hasMinimumLeadTime(kickoffISO, now) {
   return new Date(kickoffISO).getTime() - now.getTime() >= MIN_HOURS_TO_KICKOFF * 60 * 60 * 1000;
 }
 
-const RESULT_BASED_MARKETS = new Set([
-  'Home Win', 'Away Win', 'Double Chance 1X', 'Double Chance X2', 'Double Chance 12',
-]);
+// Only outright wins are "result-based" for the tight-price guard below.
+// Double Chance is deliberately NOT in this set: it is now allowed ONLY at
+// short prices (<= DOUBLE_CHANCE_MAX_ODDS), so the old rule that swapped a
+// short Double Chance for an Over-goals market would have undone that.
+const RESULT_BASED_MARKETS = new Set(['Home Win', 'Away Win']);
 const WIN_MARKET_MIN_ODDS = 1.3;
 
 function impliedConfidence(odds) {
@@ -518,128 +527,60 @@ function poolForTier(pool, tier) {
   );
 }
 
-/** Keeps at least one outright win leg where the pool allows, without breaking the odds range. Best effort. */
-function ensureFullWinLeg(picks, pool, usageCount, targetRange) {
-  if (picks.length === 0 || picks.some((p) => FULL_WIN_MARKETS.has(p.market))) return picks;
+/**
+ * Picks EXACTLY `k` different fixtures whose cumulative odds land inside
+ * targetRange (lower bound is a hard floor, upper bound a hard cap). Used for
+ * Mega Day (k = 3) and Duo (k = 2). Among valid combinations, prefers:
+ *   (1) fewer weak-opponent warnings (opponentPenalty, a preference only),
+ *   (2) less-reused fixtures,
+ *   (3) for Mega, a combination that includes an outright win leg, where one exists,
+ *   (4) the lowest total odds (the safest valid combination).
+ * Candidates are capped to MAX_COMBO_CANDIDATES so the search stays small.
+ */
+const MAX_COMBO_CANDIDATES = 80;
 
-  const alreadyIn = new Set(picks.map((p) => p.fixtureId));
+function pickCombo(pool, k, usageCount, targetRange, preferFullWin = false) {
+  const [minTotal, maxTotal] = targetRange;
+  const usage = (f) => usageCount.get(f.fixtureId) ?? 0;
+
   const candidates = pool
-    .filter(
-      (f) =>
-        FULL_WIN_MARKETS.has(f.market) &&
-        !alreadyIn.has(f.fixtureId) &&
-        (usageCount.get(f.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY
-    )
-    .sort((a, b) => penaltyOf(a) - penaltyOf(b) || a.odds - b.odds);
-  if (candidates.length === 0) return picks;
-
-  const candidate = candidates[0];
-  const [minTotal, maxTotal] = targetRange;
-  const order = [...picks.keys()].sort((a, b) => picks[b].odds - picks[a].odds);
-  for (const idx of order) {
-    const next = [...picks];
-    next[idx] = candidate;
-    const total = computeRawOdds(next);
-    if (total >= minTotal && total <= maxTotal * (1 + UPPER_TOLERANCE)) return next;
-  }
-  return picks;
-}
-
-/**
- * Mega Day: the FEWEST legs (up to maxMatchCount) whose cumulative odds land
- * in targetRange. The lower bound is a hard floor; opponentPenalty orders
- * legs so fixtures with a weaker opponent are preferred where possible.
- */
-function pickFixturesForSlip(pool, maxMatchCount, usageCount, targetRange) {
-  const eligible = pool.filter((f) => (usageCount.get(f.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY);
-  if (eligible.length === 0) return [];
-
-  const ranked = [...eligible].sort((a, b) => {
-    const usedA = usageCount.get(a.fixtureId) ?? 0;
-    const usedB = usageCount.get(b.fixtureId) ?? 0;
-    if (usedA !== usedB) return usedA - usedB;
-    if (penaltyOf(a) !== penaltyOf(b)) return penaltyOf(a) - penaltyOf(b);
-    return a.odds - b.odds;
-  });
-
-  const [minTotal, maxTotal] = targetRange;
-  let picks = [];
-  let unused = [...ranked];
-
-  for (const fixture of ranked) {
-    if (picks.length >= maxMatchCount) break;
-    picks.push(fixture);
-    unused = unused.filter((f) => f !== fixture);
-
-    const total = computeRawOdds(picks);
-    if (total >= minTotal && total <= maxTotal) return ensureFullWinLeg(picks, pool, usageCount, targetRange);
-    if (total > maxTotal) {
-      picks.pop();
-      unused.unshift(fixture);
-      break;
-    }
-  }
-
-  const MAX_SWAP_ATTEMPTS = 8;
-  for (let attempt = 0; attempt < MAX_SWAP_ATTEMPTS; attempt++) {
-    const total = computeRawOdds(picks);
-    if (total >= minTotal && total <= maxTotal) break;
-
-    if (total < minTotal) {
-      if (picks.length < maxMatchCount && unused.length > 0) {
-        const next = [...unused].sort((a, b) => a.odds - b.odds)[0];
-        picks.push(next);
-        unused = unused.filter((f) => f !== next);
-        continue;
-      }
-      if (picks.length === 0) break;
-      const lowestIdx = picks.reduce((li, p, i) => (p.odds < picks[li].odds ? i : li), 0);
-      const candidate = unused.find((f) => f.odds > picks[lowestIdx].odds);
-      if (!candidate) break;
-      picks[lowestIdx] = candidate;
-      unused = unused.filter((f) => f !== candidate);
-    } else {
-      const highestIdx = picks.reduce((hi, p, i) => (p.odds > picks[hi].odds ? i : hi), 0);
-      const candidate = [...unused].sort((a, b) => a.odds - b.odds).find((f) => f.odds < picks[highestIdx].odds);
-      if (!candidate) break;
-      picks[highestIdx] = candidate;
-      unused = unused.filter((f) => f !== candidate);
-    }
-  }
-
-  const finalTotal = computeRawOdds(picks);
-  const ok = picks.length > 0 && finalTotal >= minTotal && finalTotal <= maxTotal * (1 + UPPER_TOLERANCE);
-  if (!ok) return [];
-  return ensureFullWinLeg(picks, pool, usageCount, targetRange);
-}
-
-/**
- * Duo: EXACTLY two different fixtures whose product is inside targetRange.
- * Among valid pairs prefer (1) fewer weak-opponent warnings, (2) less-reused
- * fixtures, (3) the lowest total odds (the safest pair).
- */
-function pickDuo(pool, usageCount, targetRange) {
-  const [minTotal, maxTotal] = targetRange;
-  const eligible = pool.filter((f) => (usageCount.get(f.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY);
+    .filter((f) => usage(f) < MAX_FIXTURE_APPEARANCES_PER_DAY)
+    .sort((a, b) => usage(a) - usage(b) || penaltyOf(a) - penaltyOf(b) || a.odds - b.odds)
+    .slice(0, MAX_COMBO_CANDIDATES);
 
   let best = null;
-  for (let i = 0; i < eligible.length; i++) {
-    for (let j = i + 1; j < eligible.length; j++) {
-      const a = eligible[i];
-      const b = eligible[j];
-      if (a.fixtureId === b.fixtureId) continue; // two different matches
-      const total = a.odds * b.odds;
-      if (total < minTotal || total > maxTotal) continue;
+  const chosen = [];
+
+  function search(startIdx, product) {
+    if (chosen.length === k) {
+      if (product < minTotal || product > maxTotal) return;
       const score = [
-        penaltyOf(a) + penaltyOf(b),
-        (usageCount.get(a.fixtureId) ?? 0) + (usageCount.get(b.fixtureId) ?? 0),
-        total,
+        chosen.reduce((n, f) => n + penaltyOf(f), 0),
+        chosen.reduce((n, f) => n + usage(f), 0),
+        preferFullWin && chosen.some((f) => FULL_WIN_MARKETS.has(f.market)) ? 0 : preferFullWin ? 1 : 0,
+        product,
       ];
-      if (!best || score[0] < best.score[0] || (score[0] === best.score[0] && (score[1] < best.score[1] || (score[1] === best.score[1] && score[2] < best.score[2])))) {
-        best = { picks: [a, b], score };
-      }
+      const better =
+        !best ||
+        score.some((v, i) => {
+          for (let j = 0; j < i; j++) if (score[j] !== best.score[j]) return false;
+          return v < best.score[i];
+        });
+      if (better) best = { picks: [...chosen], score };
+      return;
+    }
+    for (let i = startIdx; i < candidates.length; i++) {
+      const f = candidates[i];
+      if (chosen.some((c) => c.fixtureId === f.fixtureId)) continue; // different matches only
+      const next = product * f.odds;
+      if (next > maxTotal) continue; // odds >= 1, so the product only grows
+      chosen.push(f);
+      search(i + 1, next);
+      chosen.pop();
     }
   }
+
+  search(0, 1);
   return best ? best.picks : [];
 }
 
@@ -741,10 +682,8 @@ function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set
       pool = poolForTier(dailyPool, config.tier);
     }
     const targetRange = TIER_ODDS_TARGET[config.tier];
-    const picks =
-      config.tier === 'duo'
-        ? pickDuo(pool, usageCount, targetRange)
-        : pickFixturesForSlip(pool, config.matchCount, usageCount, targetRange);
+    // Mega Day = exactly 3 matches, Duo = exactly 2 (both from config.matchCount).
+    const picks = pickCombo(pool, config.matchCount, usageCount, targetRange, config.tier === 'mega');
 
     if (picks.length === 0) {
       console.log(`${config.label}: couldn't assemble a valid combination this run — skipping this slip.`);
@@ -844,7 +783,7 @@ async function main() {
   console.log(`Wrote ${tickets.length} new ticket(s), ${fixtureRows.length} fixture(s). Previous slips today are untouched.`);
 }
 
-export { buildTickets, pickDuo, pickFixturesForSlip, marketAllowed };
+export { buildTickets, pickCombo, marketAllowed };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main().catch((err) => {
