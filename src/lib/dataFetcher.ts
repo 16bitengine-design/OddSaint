@@ -932,6 +932,95 @@ export async function getArchiveAccess(userId: string | null): Promise<ArchiveAc
 }
 
 // ---------------------------------------------------------------------------
+// Correct-score predictions (top 3 scorelines per fixture)
+// ---------------------------------------------------------------------------
+// Used by src/app/CorrectScores.tsx / the /correct-scores route. Reads
+// `correct_score_predictions` (written by scripts/generate-correct-scores.mjs).
+// Kept so the build compiles whether or not that route is removed; safe to
+// delete together with CorrectScores.tsx and the route if that feature is dropped.
+
+export interface CorrectScore {
+  home: number;
+  away: number;
+  probability: number; // 0-1
+}
+
+export type CorrectScoreStatus = 'pending' | 'hit' | 'miss';
+
+export interface CorrectScorePrediction {
+  fixtureId: number;
+  league: string;
+  country: string;
+  homeTeam: string;
+  awayTeam: string;
+  kickoff: string; // ISO
+  topScores: CorrectScore[]; // best first, up to 3
+  status: CorrectScoreStatus;
+  top3Hit?: boolean;
+  finalHomeScore?: number;
+  finalAwayScore?: number;
+}
+
+export interface CorrectScoreStats {
+  windowDays: number;
+  graded: number;
+  topHitRatePct: number;
+  top3HitRatePct: number;
+}
+
+export async function fetchCorrectScores(date: Date = new Date()): Promise<CorrectScorePrediction[]> {
+  try {
+    const { data, error } = await supabase
+      .from('correct_score_predictions')
+      .select(
+        'fixture_id, league, country, home_team, away_team, kickoff, top_scores, result_status, top3_hit, final_home_score, final_away_score'
+      )
+      .eq('prediction_date', dateKey(date))
+      .order('kickoff', { ascending: true });
+    if (error || !data) return [];
+    return data.map((row: any) => ({
+      fixtureId: row.fixture_id,
+      league: row.league,
+      country: row.country,
+      homeTeam: row.home_team,
+      awayTeam: row.away_team,
+      kickoff: row.kickoff,
+      topScores: Array.isArray(row.top_scores) ? row.top_scores : [],
+      status: row.result_status as CorrectScoreStatus,
+      top3Hit: row.top3_hit ?? undefined,
+      finalHomeScore: row.final_home_score ?? undefined,
+      finalAwayScore: row.final_away_score ?? undefined,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchCorrectScoreStats(windowDays: number = 30): Promise<CorrectScoreStats | null> {
+  try {
+    const since = new Date();
+    since.setDate(since.getDate() - windowDays);
+    const { data, error } = await supabase
+      .from('correct_score_predictions')
+      .select('result_status, top3_hit')
+      .in('result_status', ['hit', 'miss'])
+      .gte('prediction_date', dateKey(since));
+    if (error || !data || data.length === 0) return null;
+    const graded = data.length;
+    const topHits = data.filter((r: any) => r.result_status === 'hit').length;
+    const top3Hits = data.filter((r: any) => r.top3_hit === true).length;
+    return {
+      windowDays,
+      graded,
+      topHitRatePct: Math.round((topHits / graded) * 1000) / 10,
+      top3HitRatePct: Math.round((top3Hits / graded) * 1000) / 10,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Exact-score predictions (single most-likely scoreline per fixture)
 // ---------------------------------------------------------------------------
 // Types used by src/app/ScorePredictions.tsx. Shapes are taken from how that
