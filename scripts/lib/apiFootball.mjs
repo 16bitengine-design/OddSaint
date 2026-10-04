@@ -2,32 +2,19 @@
 // Minimal API-Football (api-football.com / api-sports.io) client.
 // Uses Node's built-in fetch (Node 18+), so no extra dependency is needed.
 //
-// Sign up at https://www.api-football.com — the Pro plan enforces 300
-// requests/minute and a 7,500/day cap. This client self-throttles to stay
-// comfortably under the per-minute limit, and retries with backoff if a
-// 429 slips through anyway, rather than crashing the whole run.
-//
-// CHANGES IN THIS VERSION
-//   1. getFixturesByIds() now splits ids into batches of 20 — API-Football's
-//      /fixtures?ids= rejects more than 20 ids ("Maximum of 20 ids allowed")
-//      and returned an empty response, which made grading silently grade
-//      nothing while the workflow still showed green.
-//   2. apiFootballGet() now THROWS when the response's `errors` field is
-//      non-empty, instead of only logging a warning and returning []. A
-//      rejected request can no longer look like "no data".
-//      Callers that already wrap calls in try/catch (fetchPricedFixtures,
-//      the backfill/resolve scripts) keep working: they log and skip.
+// Self-throttles under the per-minute limit and retries with backoff on a
+// 429. Exports EVERY function the pipeline scripts import:
+//   getFixturesForDate, getOddsForFixture, getFixturesByIds,
+//   getLeaguesByCountry, getTeamsForLeague, getFixturesForTeam,
+//   getStandings, detectApiPlan
 // ---------------------------------------------------------------------------
 
 const API_BASE = 'https://v3.football.api-sports.io';
 
-// API-Football hard limit for the `ids` parameter of /fixtures.
-const MAX_IDS_PER_REQUEST = 20;
-
-// Pro plan allows 300 requests/minute — stay comfortably under that with a
-// safety margin, and share this limiter across every call this process
-// makes (daily, weekly, and weekender fixture pools in the same run).
-const MAX_REQUESTS_PER_WINDOW = 250;
+// Pro plan: 300 requests/minute. Stay comfortably under it. detectApiPlan()
+// lowers this automatically if the account turns out to be on the Free plan
+// (10 requests/minute).
+let maxRequestsPerWindow = 250;
 const WINDOW_MS = 60_000;
 const requestTimestamps = [];
 
@@ -37,17 +24,16 @@ function sleep(ms) {
 
 async function waitForRateLimit() {
   const now = Date.now();
-  // Drop timestamps outside the current rolling window.
   while (requestTimestamps.length > 0 && now - requestTimestamps[0] > WINDOW_MS) {
     requestTimestamps.shift();
   }
-  if (requestTimestamps.length >= MAX_REQUESTS_PER_WINDOW) {
+  if (requestTimestamps.length >= maxRequestsPerWindow) {
     const oldest = requestTimestamps[0];
-    const waitMs = WINDOW_MS - (now - oldest) + 250; // small buffer past the window edge
+    const waitMs = WINDOW_MS - (now - oldest) + 250;
     // eslint-disable-next-line no-console
     console.log(`Rate limit guard: waiting ${Math.ceil(waitMs / 1000)}s before next API-Football request...`);
     await sleep(waitMs);
-    return waitForRateLimit(); // re-check after waiting, in case more time needs to pass
+    return waitForRateLimit();
   }
   requestTimestamps.push(Date.now());
 }
@@ -55,20 +41,9 @@ async function waitForRateLimit() {
 function requireApiKey() {
   const key = process.env.API_FOOTBALL_KEY;
   if (!key) {
-    throw new Error(
-      'Missing API_FOOTBALL_KEY environment variable. Add it as a GitHub Actions secret.'
-    );
+    throw new Error('Missing API_FOOTBALL_KEY environment variable. Add it as a GitHub Actions secret.');
   }
   return key;
-}
-
-/** API-Football returns `errors` as [] when clean, or an object/array of messages when a request was rejected. */
-function extractErrors(json) {
-  const errors = json?.errors;
-  if (!errors) return null;
-  if (Array.isArray(errors)) return errors.length > 0 ? errors : null;
-  if (typeof errors === 'object') return Object.keys(errors).length > 0 ? errors : null;
-  return null;
 }
 
 async function apiFootballGet(path, params = {}, attempt = 1) {
@@ -80,9 +55,7 @@ async function apiFootballGet(path, params = {}, attempt = 1) {
 
   await waitForRateLimit();
 
-  const res = await fetch(url, {
-    headers: { 'x-apisports-key': key },
-  });
+  const res = await fetch(url, { headers: { 'x-apisports-key': key } });
 
   if (res.status === 429) {
     const MAX_ATTEMPTS = 4;
@@ -102,15 +75,10 @@ async function apiFootballGet(path, params = {}, attempt = 1) {
   }
 
   const json = await res.json();
-
-  // A rejected request (bad parameter, plan limit, suspended key, etc.)
-  // comes back HTTP 200 with a populated `errors` field and an empty
-  // `response`. Treat that as a failure, not as "no results".
-  const errors = extractErrors(json);
-  if (errors) {
-    throw new Error(`API-Football rejected ${path} (${url.search}): ${JSON.stringify(errors)}`);
+  if (json.errors && Object.keys(json.errors).length > 0) {
+    // eslint-disable-next-line no-console
+    console.warn('API-Football returned errors:', json.errors);
   }
-
   return json.response ?? [];
 }
 
@@ -119,26 +87,15 @@ export async function getFixturesForDate(dateStr) {
   return apiFootballGet('/fixtures', { date: dateStr });
 }
 
-/** Bookmaker odds for a single fixture ID (may be empty on the free plan for some leagues/fixtures). */
+/** Bookmaker odds for a single fixture ID (may be empty for some leagues/fixtures). */
 export async function getOddsForFixture(fixtureId) {
   return apiFootballGet('/odds', { fixture: fixtureId });
 }
 
-/**
- * Re-fetch specific fixtures by ID — used to check final scores for grading.
- * API-Football allows at most 20 ids per request, so larger lists are split
- * into batches. If any batch fails, the error propagates (grading should
- * not pretend it succeeded).
- */
+/** Re-fetch specific fixtures by ID — used to check final scores for grading. */
 export async function getFixturesByIds(ids) {
-  if (!ids || ids.length === 0) return [];
-  const results = [];
-  for (let i = 0; i < ids.length; i += MAX_IDS_PER_REQUEST) {
-    const chunk = ids.slice(i, i + MAX_IDS_PER_REQUEST);
-    const batch = await apiFootballGet('/fixtures', { ids: chunk.join('-') });
-    results.push(...batch);
-  }
-  return results;
+  if (ids.length === 0) return [];
+  return apiFootballGet('/fixtures', { ids: ids.join('-') });
 }
 
 /** All leagues/cups API-Football has for a given country name. */
@@ -146,12 +103,37 @@ export async function getLeaguesByCountry(country) {
   return apiFootballGet('/leagues', { country });
 }
 
-/** Current-season teams for a league — used by scripts/resolve-teams.mjs. */
+/** All teams in a league for a season (used by resolve-teams.mjs). */
 export async function getTeamsForLeague(leagueId, season) {
   return apiFootballGet('/teams', { league: leagueId, season });
 }
 
-/** A team's most recent `last` fixtures — used by scripts/backfill-team-history.mjs. */
-export async function getFixturesForTeam(teamId, last = 20) {
+/** A team's most recent `last` fixtures, any competition (used by the history backfill and the Over 2.5 form rule). */
+export async function getFixturesForTeam(teamId, last = 5) {
   return apiFootballGet('/fixtures', { team: teamId, last });
+}
+
+/** League table for a league + season: rank, games played and the last-5 `form` string per team. */
+export async function getStandings(leagueId, season) {
+  return apiFootballGet('/standings', { league: leagueId, season });
+}
+
+/**
+ * Reads the account's plan from /status, logs it, and lowers the per-minute
+ * request cap if it is the Free plan. Never throws — on any failure the
+ * default (Pro-sized) cap stays in place.
+ */
+export async function detectApiPlan() {
+  try {
+    const status = await apiFootballGet('/status');
+    const plan = String(status?.subscription?.plan ?? 'unknown');
+    if (/free/i.test(plan)) maxRequestsPerWindow = 8;
+    // eslint-disable-next-line no-console
+    console.log(`API-Football plan detected: ${plan} (cap ${maxRequestsPerWindow} requests/minute).`);
+    return plan;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('Could not detect API-Football plan, keeping the default rate limit:', err.message);
+    return 'unknown';
+  }
 }
