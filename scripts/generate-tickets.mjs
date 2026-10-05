@@ -23,8 +23,8 @@
 //            scored over their last 5 finished matches (strict: 2.0).
 //   Double Chance (Mega/Duo only): allowed only when its odds are <= 1.3
 //            (this cap is never relaxed).
-//   Both teams to score (BTTS Yes/No): avoided WHERE POSSIBLE on Mega/Duo — a
-//            preference in selection, not an exclusion.
+//   Both teams to score - NO (BTTS - No): avoided WHERE POSSIBLE on Mega/Duo — a
+//            preference in selection, not an exclusion. BTTS - Yes is not avoided.
 //   Any other market (Mega/Duo only): no rank/form requirement.
 //   Mega Day: any market, EXACTLY 3 matches, cumulative odds in [1.97, 3]
 //            (range and floor never relax).
@@ -516,10 +516,11 @@ function computeTotalOdds(picks) {
 }
 const penaltyOf = (f) => f.opponentPenalty ?? 0;
 
-// Markets to AVOID WHERE POSSIBLE (a preference, never a hard exclusion): both
-// teams to score. A combination without one always beats a combination with
-// one; if the only valid combination needs one, it is still used.
-const AVOIDED_MARKETS = new Set(['BTTS - Yes', 'BTTS - No']);
+// Markets to AVOID WHERE POSSIBLE (a preference, never a hard exclusion): BTTS -
+// No (both teams to score: No), the risky case. BTTS - Yes is NOT avoided. A
+// combination without an avoided leg always beats a combination with one; if
+// the only valid combination needs one, it is still used.
+const AVOIDED_MARKETS = new Set(['BTTS - No']);
 const avoidedOf = (f) => (AVOIDED_MARKETS.has(f.market) ? 1 : 0);
 
 /** Weak-opponent PREFERENCE at a level: 1 when the backed team's opponent has more than 2 wins in its last 5 (only meaningful when the win rule passes). */
@@ -557,7 +558,7 @@ function poolAtLevel(dailyPool, tier, level, existingMarkets, chosenMarket) {
       });
     } else {
       const preferred = allowed.filter((o) => !AVOIDED_MARKETS.has(o.market));
-      const basePool = preferred.length > 0 ? preferred : allowed; // BTTS only if nothing else is allowed
+      const basePool = preferred.length > 0 ? preferred : allowed; // BTTS - No only if nothing else is allowed
       const base = make([...basePool].sort((a, b) => a.odds - b.odds)[0]);
       if (base.confidence >= minConf && (!SMALL_TICKET_TIERS.has(tier) || base.odds <= SMALL_TICKET_MAX_ODDS)) out.push(base);
     }
@@ -569,7 +570,7 @@ function poolAtLevel(dailyPool, tier, level, existingMarkets, chosenMarket) {
  * Picks EXACTLY `k` different fixtures whose cumulative odds land inside
  * targetRange (lower bound is a hard floor, upper bound a hard cap). Used for
  * Mega Day (k = 3) and Duo (k = 2). Among valid combinations, prefers:
- *   (1) fewer "both teams to score" legs (AVOIDED_MARKETS — avoided where possible),
+ *   (1) fewer "BTTS - No" legs (AVOIDED_MARKETS — avoided where possible),
  *   (2) fewer weak-opponent warnings (opponentPenalty, a preference only),
  *   (3) less-reused fixtures,
  *   (4) for Mega, a combination that includes an outright win leg, where one exists,
@@ -594,7 +595,7 @@ function pickCombo(pool, k, usageCount, targetRange, preferFullWin = false) {
     if (chosen.length === k) {
       if (product < minTotal || product > maxTotal) return;
       const score = [
-        chosen.reduce((n, f) => n + avoidedOf(f), 0), // fewest "both teams to score" legs first
+        chosen.reduce((n, f) => n + avoidedOf(f), 0), // fewest "BTTS - No" legs first
         chosen.reduce((n, f) => n + penaltyOf(f), 0),
         chosen.reduce((n, f) => n + usage(f), 0),
         preferFullWin && chosen.some((f) => FULL_WIN_MARKETS.has(f.market)) ? 0 : preferFullWin ? 1 : 0,
