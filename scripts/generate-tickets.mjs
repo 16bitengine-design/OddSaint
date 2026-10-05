@@ -21,12 +21,14 @@
 //            PREFERRED, not required (see opponentPenalty).
 //   Over 2.5 Goals, any ticket: BOTH teams must average >= minAvgGoals goals
 //            scored over their last 5 finished matches (strict: 2.0).
-//   Double Chance (Mega/Duo only): allowed ONLY when its odds are <= 1.3.
+//   Double Chance (Mega/Duo only): allowed only when its odds are <= 1.3
+//            (this cap is never relaxed).
 //   Any other market (Mega/Duo only): no rank/form requirement.
-//   Mega Day: any market, EXACTLY 3 matches, cumulative odds in [1.97, 3].
-//   Duo: any market, exactly 2 legs, cumulative odds in [2, 4].
+//   Mega Day: any market, EXACTLY 3 matches, cumulative odds in [1.97, 3]
+//            (range and floor never relax).
+//   Duo: any market, exactly 2 legs, cumulative odds in [2, 4] (never relaxed).
 //   Saint's Lock: ONE match; market must be a direct win or Over 2.5 Goals
-//            (never Double Chance); odds 1.48-2.0.
+//            (never Double Chance); odds 1.5-2.17. These two are NEVER relaxed.
 //
 // HONEST SCOPE NOTE: "confidence" is a simple function of bookmaker odds
 // (implied probability), not a trained model.
@@ -111,49 +113,52 @@ function isExcluded(homeTeam, awayTeam) {
 const TIER_CONFIG = [
   { tier: 'mega', label: 'Mega Day Ticket', matchCount: 3, oddsRange: '1.97-3', alwaysFree: true },
   { tier: 'duo', label: 'Duo', matchCount: 2, oddsRange: '2-4', alwaysFree: false },
-  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.48-2', alwaysFree: false },
+  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2.17', alwaysFree: false },
 ];
 
-// Cumulative-odds targets, ENFORCED in slip assembly. The lower bound of each
-// is a HARD floor (no tolerance below it); only the upper side has slack.
-const TIER_ODDS_TARGET = {
-  mega: [1.97, 3],
-  duo: [2, 4],
-};
-const MIN_CUMULATIVE_ODDS = { mega: 1.97, duo: 1.97 };
-
-// Per-tier confidence floor (confidence = 100/odds, clipped to 55-95, so 68
-// means odds of about 1.48 or shorter). Duo needs two legs whose product is
-// at least 2 (average leg >= ~1.41), which a 68 floor makes almost impossible —
-// so Duo has its own, lower floor (58 = legs up to about 1.72).
-const TIER_MIN_CONFIDENCE = { mega: 68, duo: 58 };
+// (Cumulative-odds ranges, odds floors and confidence floors now live on each
+// relaxation level — see BASE_LEVEL / RELAXATION_LEVELS below.)
 
 // Saint's Lock
-const SAINTS_LOCK_ODDS_MIN = 1.48;
-const SAINTS_LOCK_ODDS_MAX = 2.0;
+const SAINTS_LOCK_ODDS_MIN = 1.5;
+const SAINTS_LOCK_ODDS_MAX = 2.17;
 const SAINTS_LOCK_MARKETS = new Set(['Home Win', 'Away Win', 'Over 2.5 Goals']);
 
 // Strength rules — applied through a RELAXATION LADDER. Every scheduled run
 // must produce a ticket for each category, so each category first tries the
 // strict rules (level 0) and, only if nothing valid can be built, steps down
 // one level at a time until it can. The level used is logged per ticket.
-//   minRankGap  — direct win: backed team this many places above its opponent
-//   minWins     — direct win: backed team's wins in its last 5 league matches
-//   minAvgGoals — Over 2.5: BOTH teams' average goals scored over last 5
-// NOT relaxed, ever: tier match counts, the 1.97 odds floor, Saint's Lock
-// markets/odds band, the Double Chance cap, backing the better-placed side,
-// and the league exclusions.
+// Per level:
+//   minRankGap / minWins — direct win: backed team this many places above its
+//                          opponent, and this many wins in its last 5
+//   minAvgGoals          — Over 2.5: BOTH teams' average goals over last 5
+//   dcMaxOdds            — Double Chance price cap (null = no cap)
+//   minConf              — per-tier confidence floor (confidence = 100/odds)
+//   oddsRange / oddsFloor— per-tier cumulative-odds range and hard floor
+//   requireStandings     — false = no standings/goals data needed; a win is
+//                          then allowed on the bookmaker's favourite
+// The ladder stops at relaxed-3. NEVER relaxed: Saint's Lock markets (direct
+// win / Over 2.5 only) and odds band, the Double Chance cap (1.3), the Mega /
+// Duo cumulative-odds ranges and 1.97 floor, the per-tier confidence floors,
+// tier sizes (Mega 3, Duo 2), and the requirement that a win backs the
+// better-placed side. Only the rank gap, win count and goal average loosen.
+// (dcMaxOdds, minConf, oddsRange, oddsFloor and requireStandings are kept as
+// per-level fields so a looser level can be added later without code changes.)
+const BASE_LEVEL = {
+  dcMaxOdds: 1.3,
+  minConf: { mega: 68, duo: 58 },
+  oddsRange: { mega: [1.97, 3], duo: [2, 4] },
+  oddsFloor: { mega: 1.97, duo: 1.97 },
+  requireStandings: true,
+};
 const RELAXATION_LEVELS = [
-  { name: 'strict', minRankGap: 6, minWins: 3, minAvgGoals: 2.0 },
-  { name: 'relaxed-1', minRankGap: 5, minWins: 3, minAvgGoals: 1.75 },
-  { name: 'relaxed-2', minRankGap: 4, minWins: 3, minAvgGoals: 1.5 },
-  { name: 'relaxed-3', minRankGap: 4, minWins: 2, minAvgGoals: 1.5 },
-  { name: 'relaxed-4', minRankGap: 3, minWins: 2, minAvgGoals: 1.25 },
+  { ...BASE_LEVEL, name: 'strict', minRankGap: 6, minWins: 3, minAvgGoals: 2.0 },
+  { ...BASE_LEVEL, name: 'relaxed-1', minRankGap: 5, minWins: 3, minAvgGoals: 1.75 },
+  { ...BASE_LEVEL, name: 'relaxed-2', minRankGap: 4, minWins: 3, minAvgGoals: 1.5 },
+  { ...BASE_LEVEL, name: 'relaxed-3', minRankGap: 4, minWins: 2, minAvgGoals: 1.5 },
 ];
 const MIN_GAMES_PLAYED = 5; // early-season tables are meaningless
 const OPPONENT_MAX_WINS_LAST_5 = 2; // opponent (preference only)
-// Double Chance is only allowed at short prices: above this it is excluded.
-const DOUBLE_CHANCE_MAX_ODDS = 1.3;
 
 const SMALL_TICKET_TIERS = new Set(['mega']);
 const SMALL_TICKET_MAX_ODDS = 1.77;
@@ -333,18 +338,29 @@ function over25Passes(goals, level) {
   return !!goals && goals.home !== null && goals.away !== null && goals.home >= level.minAvgGoals && goals.away >= level.minAvgGoals;
 }
 
+/** Last-resort only: is this the bookmaker's favourite (the lower-priced) of the fixture's win outcomes? */
+function isMarketFavourite(outcome, p) {
+  const wins = (p.viable ?? []).filter((o) => FULL_WIN_MARKETS.has(o.market));
+  return wins.every((o) => outcome.odds <= o.odds);
+}
+
 /**
  * Is this outcome allowed for this fixture at this level? Wins need winPasses
- * AND must back the better-placed side. Over 2.5 needs over25Passes. Double
- * Chance only at odds <= DOUBLE_CHANCE_MAX_ODDS (never on Saint's Lock). Other
- * markets are unrestricted on Mega/Duo and forbidden for Saint's Lock.
+ * AND must back the better-placed side (or, at last resort, the bookmaker's
+ * favourite). Over 2.5 needs over25Passes (or no data requirement at last
+ * resort). Double Chance only at odds <= level.dcMaxOdds when a cap exists
+ * (never on Saint's Lock). Other markets are unrestricted on Mega/Duo and
+ * forbidden for Saint's Lock.
  */
 function marketAllowedAt(outcome, p, level, saintsLockOnly) {
-  if (outcome.market === 'Over 2.5 Goals') return over25Passes(p.goals, level);
-  if (outcome.market === 'Home Win') return winPasses(p.win, level) && p.win.favoured === 'home';
-  if (outcome.market === 'Away Win') return winPasses(p.win, level) && p.win.favoured === 'away';
+  if (outcome.market === 'Over 2.5 Goals') return over25Passes(p.goals, level) || !level.requireStandings;
+  if (outcome.market === 'Home Win' || outcome.market === 'Away Win') {
+    const side = outcome.market === 'Home Win' ? 'home' : 'away';
+    if (winPasses(p.win, level) && p.win.favoured === side) return true;
+    return !level.requireStandings && isMarketFavourite(outcome, p);
+  }
   if (outcome.market.startsWith('Double Chance')) {
-    return !saintsLockOnly && outcome.odds <= DOUBLE_CHANCE_MAX_ODDS;
+    return !saintsLockOnly && (level.dcMaxOdds === null || outcome.odds <= level.dcMaxOdds);
   }
   return !saintsLockOnly;
 }
@@ -516,7 +532,7 @@ function compatibleMarket(fixtureId, market, existingMarkets, chosenMarket) {
  * needs a product >= 2, which the safest markets alone rarely reach).
  */
 function poolAtLevel(dailyPool, tier, level, existingMarkets, chosenMarket) {
-  const minConf = TIER_MIN_CONFIDENCE[tier] ?? 0;
+  const minConf = level.minConf[tier] ?? 0;
   const out = [];
   for (const p of dailyPool) {
     const allowed = allowedOutcomesAt(p, level, false).filter((o) =>
@@ -596,7 +612,7 @@ function pickCombo(pool, k, usageCount, targetRange, preferFullWin = false) {
   return best ? best.picks : [];
 }
 
-/** Saint's Lock candidates at one level: allowed win / Over 2.5 outcomes inside the 1.48-2.0 band (never Double Chance). Weak-opponent preference first, then the lowest odds. */
+/** Saint's Lock candidates at one level: allowed win / Over 2.5 outcomes inside the 1.5-2.17 band (never Double Chance). Weak-opponent preference first, then the lowest odds. */
 function saintsLockCandidates(dailyPool, level, usageCount, excludeFixtureIds, existingMarkets) {
   return dailyPool
     .filter((p) => (usageCount.get(p.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY && !excludeFixtureIds.has(p.fixtureId))
@@ -699,11 +715,11 @@ function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set
       continue;
     }
 
-    const targetRange = TIER_ODDS_TARGET[config.tier];
-    const floor = MIN_CUMULATIVE_ODDS[config.tier];
     let built = false;
 
     for (const level of RELAXATION_LEVELS) {
+      const targetRange = level.oddsRange[config.tier];
+      const floor = level.oddsFloor[config.tier];
       const pool = poolAtLevel(dailyPool, config.tier, level, existingMarkets, chosenMarket);
       // Mega Day = exactly 3 matches, Duo = exactly 2 (config.matchCount).
       const picks = pickCombo(pool, config.matchCount, usageCount, targetRange, config.tier === 'mega');
