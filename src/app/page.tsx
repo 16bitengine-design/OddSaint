@@ -10,6 +10,8 @@ import {
   isWithinFreeTrial,
   getAnonymousTrialStart,
   fetchPerformanceHistory,
+  fetchScorePredictions,
+  fetchScorePredictionAccuracyHistory,
   summarizeHistory,
   fetchTeamHistory,
   webSearchUrlForTeam,
@@ -33,7 +35,10 @@ import {
   type ArchiveAccess,
   type TrialPolicy,
   type AvailableFixture,
+  type ScorePrediction,
+  type ScorePredictionDayAccuracy,
 } from '@/lib/dataFetcher';
+import { ScorePredictionsSection, ScorePredictionAccuracyHistory } from './ScorePredictions';
 import {
   submitFeedback,
   fetchPendingFeedback,
@@ -3053,6 +3058,8 @@ export default function Page() {
   const [pricingProduct, setPricingProduct] = useState<'subscription' | 'saints_lock'>('subscription');
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [history, setHistory] = useState<DayPerformance[]>([]);
+  const [scorePredictions, setScorePredictions] = useState<ScorePrediction[]>([]);
+  const [scoreHistory, setScoreHistory] = useState<ScorePredictionDayAccuracy[]>([]);
   const [showHistory, setShowHistory] = useState(false);
   const [loading, setLoading] = useState(true);
   const [ticketsLoading, setTicketsLoading] = useState(true);
@@ -3114,6 +3121,20 @@ export default function Page() {
       .catch((err) => {
         // eslint-disable-next-line no-console
         console.error('[Odd Saint] Failed to load performance history:', err);
+      });
+    // Exact-score predictions + their results history. Both fetchers return
+    // empty results (never throw / never fabricate) if nothing exists yet.
+    fetchScorePredictions()
+      .then(setScorePredictions)
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('[Odd Saint] Failed to load score predictions:', err);
+      });
+    fetchScorePredictionAccuracyHistory(14)
+      .then(setScoreHistory)
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('[Odd Saint] Failed to load score prediction history:', err);
       });
     getTrialPolicy()
       .then(setTrialPolicy)
@@ -3318,7 +3339,12 @@ export default function Page() {
           onViewHistory={() => setShowHistory((s) => !s)}
         />
 
-        {showHistory && <PerformanceHistory history={history} />}
+        {showHistory && (
+          <>
+            <PerformanceHistory history={history} />
+            <ScorePredictionAccuracyHistory history={scoreHistory} />
+          </>
+        )}
 
         {/* Trial banner */}
         <div
@@ -3414,6 +3440,14 @@ export default function Page() {
             No tickets available right now — check back after the next release.
           </div>
         )}
+
+        {/* Exact-score predictions — same access as every ticket: admins,
+            signed-in users and anonymous visitors still inside their trial. */}
+        <ScorePredictionsSection
+          predictions={scorePredictions}
+          unlocked={isAdmin || !!userEmail || trialActive}
+          onSignUp={() => setShowLoginModal(true)}
+        />
 
         <Footer />
       </div>
