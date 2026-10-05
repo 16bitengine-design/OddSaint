@@ -86,7 +86,7 @@ export interface TierConfig {
 export const TIER_CONFIG: TierConfig[] = [
   { tier: 'mega', label: 'Mega Day Ticket', matchCount: 3, oddsRange: '1.97-3', alwaysFree: true },
   { tier: 'duo', label: 'Duo', matchCount: 2, oddsRange: '2-4', alwaysFree: false },
-  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.48-2', alwaysFree: false },
+  { tier: 'saints_lock', label: "Saint's Lock", matchCount: 1, oddsRange: '1.5-2.17', alwaysFree: false },
 ];
 
 const ACTIVE_TIERS = new Set<string>(TIER_CONFIG.map((c) => c.tier));
