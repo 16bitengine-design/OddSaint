@@ -1,66 +1,73 @@
 // ---------------------------------------------------------------------------
 // Odd Saint — shared league-quality filter
 //
-// Used by BOTH scripts/resolve-leagues.mjs (so leagues.json never contains
-// youth/reserve/lower-division competitions in the first place) and
-// scripts/generate-tickets.mjs (as a defense-in-depth check on whatever
-// leagues.json or DEFAULT_LEAGUE_ALLOWLIST actually contains, in case
-// leagues.json is stale or was generated before this filter existed).
-// Keeping this in one place means the two scripts can't drift out of sync
-// on what counts as "amateur" — same principle as scripts/lib/markets.mjs.
+// Used by scripts/resolve-leagues.mjs, scripts/resolve-teams.mjs and
+// scripts/generate-tickets.mjs so they can't drift apart on what counts as
+// "amateur". Excludes youth / reserve / development, non-league (including
+// the Isthmian, Northern Premier and Southern leagues) and third-division-or-
+// lower competitions — bookmakers in the target market do not list them.
 //
-// HONEST SCOPE NOTE: API-Football exposes no explicit division-tier field
-// on a league object (see the "manual review of division-tier assignments"
-// gap already flagged for resolve-leagues.mjs) — this is a NAME-PATTERN
-// heuristic, not a verified tier lookup. It will miss leagues whose name
-// doesn't signal their tier/age-group in English, and could in principle
-// over-match a professional league whose name happens to contain one of
-// these words. Review AMATEUR_LEAGUE_PATTERNS periodically against the
-// actual league names appearing in your Actions logs / leagues.json.
+// HONEST SCOPE NOTE: API-Football exposes no explicit division-tier field, so
+// this is a NAME-PATTERN heuristic. It can miss a competition whose name does
+// not signal its level in English, and could in principle over-match.
+// Review AMATEUR_LEAGUE_PATTERNS against the league names in your logs.
 // ---------------------------------------------------------------------------
 
 const AMATEUR_LEAGUE_PATTERNS = [
-  // Youth / age-group competitions
+  // Youth / age-group / development competitions
   /\bu[-\s]?1[0-9]\b/i,        // U10–U19
   /\bu[-\s]?2[0-3]\b/i,        // U20–U23
   /\byouth\b/i,
   /\bjunior(s)?\b/i,
   /\bacademy\b/i,
   /\bprimavera\b/i,
-  /\byouth league\b/i,
+  /\bdevelopment league\b/i,   // England's "Professional Development League" (U21 sides)
+  /\bpremier league 2\b/i,     // England's U21 "Premier League 2"
 
   // Reserve / B teams
   /\breserves?\b/i,
-  /\b(ii|2)\b$/i,               // trailing "II" / "2" — reserve-side naming
+  // NOTE: the old "trailing II / 2" pattern was removed — it was meant to catch
+  // reserve sides but, applied to LEAGUE names, it wrongly excluded real
+  // second divisions such as "Ligue 2". Reserve sides are caught by TEAM name
+  // below instead (isYouthOrReserveTeam).
   /\bb[-\s]?team\b/i,
 
   // Explicit "amateur" / regional / non-league
   /\bamateur\b/i,
+  /\bnon[-\s]?league\b/i,      // all English "Non League …" competitions
+  /\bisthmian\b/i,             // England, step 3-4 — not offered by target bookmakers
   /\bregionalliga\b/i,
   /\bregional\b/i,
-  /\bnational league\b/i,       // English tier 5 (non-league)
+  /\bnational league\b/i,
   /\bconference\b/i,
 
-  // Named third-division-or-lower competitions (by common naming)
+  // Named third-division-or-lower competitions
   /\b(third|fourth|fifth|sixth)\s*division\b/i,
   /\bdivision\s*[3-9]\b/i,
   /\btier\s*[3-9]\b/i,
-  /\bserie\s*[cd]\b/i,          // Italy tier 3 (C) / tier 4 (D)
-  /\bsegunda\s*b\b/i,           // Spain tier 3 (pre-2021 naming, still seen)
-  /\btercera\b/i,               // Spain tier 4/5
-  /\b3\.?\s*liga\b/i,           // Germany tier 3
+  /\bserie\s*[cd]\b/i,
+  /\bsegunda\s*b\b/i,
+  /\btercera\b/i,
+  /\b3\.?\s*liga\b/i,
   /\bliga\s*3\b/i,
-  /\bleague\s*one\b/i,          // England tier 3
-  /\bleague\s*two\b/i,          // England tier 4
+  /\bleague\s*one\b/i,
+  /\bleague\s*two\b/i,
   /\bnational\s*ii\b/i,
 ];
 
-/**
- * Returns true if a league's name matches a known youth/reserve/lower-
- * division/amateur pattern and should be excluded from ticket generation.
- * Name-only heuristic — see the file header note on its limits.
- */
+/** True if a league's name matches a youth/reserve/lower-division/non-league pattern. */
 export function isAmateurOrYouthLeague(leagueName) {
   if (!leagueName) return false;
   return AMATEUR_LEAGUE_PATTERNS.some((pattern) => pattern.test(leagueName));
+}
+
+// Some youth/reserve sides play inside competitions whose NAME looks normal;
+// their TEAM names give them away ("Colchester United U21", "Reserves", "Mallorca B", "Bayern Munich II").
+const YOUTH_TEAM_PATTERN = /\bu[-\s]?(1[0-9]|2[0-3])\b|\byouth\b|\breserves?\b|\bacademy\b/i;
+const RESERVE_SUFFIX_PATTERN = /\s(II|B)$/; // case-sensitive: "Mallorca B", "Bayern Munich II"
+
+/** True if either team name marks a youth/reserve side. */
+export function isYouthOrReserveTeam(homeTeam, awayTeam) {
+  const check = (name) => YOUTH_TEAM_PATTERN.test(name ?? '') || RESERVE_SUFFIX_PATTERN.test(name ?? '');
+  return check(homeTeam) || check(awayTeam);
 }
