@@ -3,9 +3,11 @@
 //
 // Used by scripts/resolve-leagues.mjs, scripts/resolve-teams.mjs and
 // scripts/generate-tickets.mjs so they can't drift apart on what counts as
-// "amateur". Excludes youth / reserve / development, non-league (including
-// the Isthmian, Northern Premier and Southern leagues) and third-division-or-
-// lower competitions — bookmakers in the target market do not list them.
+// "amateur". Excludes youth / reserve / development competitions and the
+// named third-division-or-lower leagues. Non-league competitions (e.g. the
+// Isthmian and Northern Premier leagues) are deliberately NOT excluded by name:
+// whether a match is eligible is decided by whether the target-location
+// bookmakers actually offer it (see TARGET_BOOKMAKER_IDS in generate-tickets.mjs).
 //
 // HONEST SCOPE NOTE: API-Football exposes no explicit division-tier field, so
 // this is a NAME-PATTERN heuristic. It can miss a competition whose name does
@@ -34,8 +36,6 @@ const AMATEUR_LEAGUE_PATTERNS = [
 
   // Explicit "amateur" / regional / non-league
   /\bamateur\b/i,
-  /\bnon[-\s]?league\b/i,      // all English "Non League …" competitions
-  /\bisthmian\b/i,             // England, step 3-4 — not offered by target bookmakers
   /\bregionalliga\b/i,
   /\bregional\b/i,
   /\bnational league\b/i,

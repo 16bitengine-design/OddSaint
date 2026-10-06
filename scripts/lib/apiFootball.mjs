@@ -6,7 +6,7 @@
 // 429. Exports EVERY function the pipeline scripts import:
 //   getFixturesForDate, getOddsForFixture, getFixturesByIds,
 //   getLeaguesByCountry, getTeamsForLeague, getFixturesForTeam,
-//   getStandings, detectApiPlan
+//   getStandings, getBookmakers, detectApiPlan
 // ---------------------------------------------------------------------------
 
 const API_BASE = 'https://v3.football.api-sports.io';
@@ -116,6 +116,11 @@ export async function getFixturesForTeam(teamId, last = 5) {
 /** League table for a league + season: rank, games played and the last-5 `form` string per team. */
 export async function getStandings(leagueId, season) {
   return apiFootballGet('/standings', { league: leagueId, season });
+}
+
+/** Every bookmaker API-Football carries odds for: [{ id, name }]. Used to find the IDs for TARGET_BOOKMAKER_IDS. */
+export async function getBookmakers() {
+  return apiFootballGet('/odds/bookmakers');
 }
 
 /**
