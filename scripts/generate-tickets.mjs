@@ -36,7 +36,7 @@
 import { getFixturesForDate, getOddsForFixture, getStandings, getFixturesForTeam } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { collectViableOutcomes, FULL_WIN_MARKETS } from './lib/markets.mjs';
-import { isAmateurOrYouthLeague } from './lib/leagueQuality.mjs';
+import { isAmateurOrYouthLeague, isYouthOrReserveTeam } from './lib/leagueQuality.mjs';
 import { isWomensCompetition } from './lib/womensLeagueFilter.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -423,6 +423,7 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
         LEAGUE_ALLOWLIST.has(f.league?.id) &&
         !isSouthAmericanLeague(f.league) &&
         !isAmateurOrYouthLeague(f.league?.name) &&
+        !isYouthOrReserveTeam(f.teams?.home?.name, f.teams?.away?.name) && // U21 / reserve / B sides
         !isWomensCompetition(f.league?.name) &&
         !isBigClash(f.teams?.home?.name, f.teams?.away?.name) &&
         !isExcluded(f.teams?.home?.name, f.teams?.away?.name) &&
