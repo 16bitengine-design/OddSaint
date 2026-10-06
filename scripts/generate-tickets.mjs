@@ -371,6 +371,29 @@ function allowedOutcomesAt(p, level, saintsLockOnly) {
 
 // --- Fetch + price fixtures ---------------------------------------------------
 
+// A match is eligible when the bookmakers in the TARGET LOCATION offer it —
+// not because of its league's name. Set TARGET_BOOKMAKER_IDS (comma-separated
+// API-Football bookmaker IDs, in priority order — run the "List Bookmakers"
+// workflow to find them). When set, odds come ONLY from those bookmakers and
+// a fixture none of them price is skipped. When empty, behaviour is unchanged
+// (the first bookmaker in the response is used and nothing is skipped).
+const TARGET_BOOKMAKER_IDS = (process.env.TARGET_BOOKMAKER_IDS ?? '')
+  .split(',')
+  .map((v) => Number(v.trim()))
+  .filter((n) => Number.isInteger(n) && n > 0);
+let skippedNotOffered = 0;
+
+/** The bookmaker whose odds to use for a fixture, or null if none of the target bookmakers offer it. */
+function chooseBookmaker(oddsResponse) {
+  const bookmakers = oddsResponse?.[0]?.bookmakers ?? [];
+  if (TARGET_BOOKMAKER_IDS.length === 0) return bookmakers[0] ?? null;
+  for (const id of TARGET_BOOKMAKER_IDS) {
+    const match = bookmakers.find((b) => b.id === id);
+    if (match) return match;
+  }
+  return null;
+}
+
 function hasMinimumLeadTime(kickoffISO, now) {
   if (!kickoffISO) return false;
   return new Date(kickoffISO).getTime() - now.getTime() >= MIN_HOURS_TO_KICKOFF * 60 * 60 * 1000;
@@ -388,8 +411,11 @@ function impliedConfidence(odds) {
  * that needs them is actually on offer). Returns null if no outcome exists.
  */
 async function priceFixture(oddsResponse, f) {
-  const bookmaker = oddsResponse?.[0]?.bookmakers?.[0];
-  if (!bookmaker) return null;
+  const bookmaker = chooseBookmaker(oddsResponse);
+  if (!bookmaker) {
+    if (TARGET_BOOKMAKER_IDS.length > 0 && (oddsResponse?.[0]?.bookmakers?.length ?? 0) > 0) skippedNotOffered++;
+    return null;
+  }
 
   const viable = collectViableOutcomes(bookmaker.bets).map((o) => ({ market: o.market, odds: o.odds }));
   if (viable.length === 0) return null;
@@ -490,6 +516,9 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
     }
   }
 
+  if (TARGET_BOOKMAKER_IDS.length > 0) {
+    console.log(`Target bookmakers: ${TARGET_BOOKMAKER_IDS.join(', ')} — ${skippedNotOffered} fixture(s) skipped because none of them offer it.`);
+  }
   if (leagueBreakdown.size > 0) {
     console.log(
       'Priced fixtures by league this run: ' +
@@ -819,7 +848,7 @@ async function main() {
   console.log(`Wrote ${tickets.length} new ticket(s), ${fixtureRows.length} fixture(s). Previous slips today are untouched.`);
 }
 
-export { buildTickets, pickCombo, marketAllowedAt, RELAXATION_LEVELS };
+export { buildTickets, pickCombo, marketAllowedAt, chooseBookmaker, RELAXATION_LEVELS };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main().catch((err) => {
