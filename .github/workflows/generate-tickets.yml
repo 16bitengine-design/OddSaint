@@ -34,4 +34,7 @@ jobs:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Optional repo variable (Settings > Secrets and variables > Actions > Variables):
+          # comma-separated API-Football bookmaker IDs. Only matches these bookmakers offer are used.
+          TARGET_BOOKMAKER_IDS: ${{ vars.TARGET_BOOKMAKER_IDS }}
         run: node scripts/generate-tickets.mjs

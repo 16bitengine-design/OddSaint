@@ -1,0 +1,23 @@
+name: Odd Saint — List Bookmakers
+
+# Manual only. Prints every bookmaker API-Football has odds for (id + name),
+# so you can pick the IDs for the TARGET_BOOKMAKER_IDS repo variable.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: List bookmakers
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+        run: node scripts/list-bookmakers.mjs
