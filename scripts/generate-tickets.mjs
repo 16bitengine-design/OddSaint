@@ -23,6 +23,10 @@
 //            scored over their last 5 finished matches (strict: 2.0).
 //   Double Chance (Mega/Duo only): allowed only when its odds are <= 1.3
 //            (this cap is never relaxed).
+//   Both teams to score (BTTS Yes/No), Mega/Duo only: AVOIDED where possible; when
+//            used, only if both teams' last-5 matches support it (BTTS - Yes:
+//            both sides scored in >= 4 of each team's last 5; BTTS - No: in
+//            <= 1 of each team's last 5). Never relaxed.
 //   Any other market (Mega/Duo only): no rank/form requirement.
 //   Mega Day: any market, EXACTLY 3 matches, cumulative odds in [1.97, 3]
 //            (range and floor never relax).
@@ -249,7 +253,7 @@ async function fetchExistingMarkets(supabase, fixtureIds) {
 
 const FINISHED_STATUSES = new Set(['FT', 'AET', 'PEN']);
 const standingsCache = new Map(); // `${leagueId}-${season}` -> Map(teamId -> { rank, played, form }) | null
-const goalsCache = new Map(); // teamId -> average goals scored over last 5, or null
+const statsCache = new Map(); // teamId -> { avgGoals, bttsCount } over its last 5 finished matches, or null
 
 /** League table for one league+season, cached for the run. Null if unavailable or multi-group (cups, conferences). */
 async function loadStandings(leagueId, season) {
@@ -301,31 +305,46 @@ async function winMetrics(f) {
   };
 }
 
-async function avgGoalsLast5(teamId) {
-  if (goalsCache.has(teamId)) return goalsCache.get(teamId);
-  let avg = null;
+/**
+ * A team's last 5 finished matches (any competition): average goals scored,
+ * and in how many of them BOTH sides scored. Null if fewer than 5 are available.
+ */
+async function last5Stats(teamId) {
+  if (statsCache.has(teamId)) return statsCache.get(teamId);
+  let stats = null;
   try {
     const fixtures = await getFixturesForTeam(teamId, 5);
-    const goals = [];
+    const rows = [];
     for (const m of fixtures ?? []) {
       if (!FINISHED_STATUSES.has(m.fixture?.status?.short)) continue;
       const hg = m.goals?.home;
       const ag = m.goals?.away;
       if (hg == null || ag == null) continue;
-      goals.push(m.teams?.home?.id === teamId ? hg : ag);
+      const isHome = m.teams?.home?.id === teamId;
+      rows.push({ own: isHome ? hg : ag, opp: isHome ? ag : hg });
     }
-    if (goals.length === 5) avg = goals.reduce((s, g) => s + g, 0) / 5;
+    if (rows.length === 5) {
+      stats = {
+        avgGoals: rows.reduce((n, r) => n + r.own, 0) / 5,
+        bttsCount: rows.filter((r) => r.own > 0 && r.opp > 0).length,
+      };
+    }
   } catch (err) {
-    console.warn(`Last-5 goals unavailable for team ${teamId}:`, err.message);
+    console.warn(`Last-5 stats unavailable for team ${teamId}:`, err.message);
   }
-  goalsCache.set(teamId, avg);
-  return avg;
+  statsCache.set(teamId, stats);
+  return stats;
 }
 
-/** Raw Over 2.5 metrics: each team's average goals scored over its last 5 matches (null if unavailable). */
+/** Raw goal metrics for Over 2.5 and both-teams-to-score decisions (null fields if a team's last 5 are unavailable). */
 async function goalMetrics(f) {
-  const [home, away] = await Promise.all([avgGoalsLast5(f.teams?.home?.id), avgGoalsLast5(f.teams?.away?.id)]);
-  return { home, away };
+  const [h, a] = await Promise.all([last5Stats(f.teams?.home?.id), last5Stats(f.teams?.away?.id)]);
+  return {
+    home: h?.avgGoals ?? null,
+    away: a?.avgGoals ?? null,
+    homeBtts: h?.bttsCount ?? null,
+    awayBtts: a?.bttsCount ?? null,
+  };
 }
 
 /** Direct-win rules at a given relaxation level. */
@@ -336,6 +355,24 @@ function winPasses(win, level) {
 /** Over 2.5 rule at a given level: BOTH teams must average at least level.minAvgGoals. */
 function over25Passes(goals, level) {
   return !!goals && goals.home !== null && goals.away !== null && goals.home >= level.minAvgGoals && goals.away >= level.minAvgGoals;
+}
+
+// BOTH-TEAMS-TO-SCORE is a tricky market, so it is AVOIDED WHERE POSSIBLE (see
+// AVOIDED_MARKETS) and, when it is used, only under these conditions — over each
+// team's last 5 finished matches (any competition), never relaxed:
+//   BTTS - Yes: BOTH teams have been in a match where both sides scored in at
+//               least BTTS_YES_MIN_COUNT of their last 5.
+//   BTTS - No : BOTH teams have been in such a match in at most BTTS_NO_MAX_COUNT
+//               of their last 5 (the riskier call, so the stricter test).
+// Missing data = not allowed.
+const BTTS_YES_MIN_COUNT = 4;
+const BTTS_NO_MAX_COUNT = 1;
+
+function bttsYesPasses(goals) {
+  return !!goals && goals.homeBtts !== null && goals.awayBtts !== null && goals.homeBtts >= BTTS_YES_MIN_COUNT && goals.awayBtts >= BTTS_YES_MIN_COUNT;
+}
+function bttsNoPasses(goals) {
+  return !!goals && goals.homeBtts !== null && goals.awayBtts !== null && goals.homeBtts <= BTTS_NO_MAX_COUNT && goals.awayBtts <= BTTS_NO_MAX_COUNT;
 }
 
 /** Last-resort only: is this the bookmaker's favourite (the lower-priced) of the fixture's win outcomes? */
@@ -349,8 +386,9 @@ function isMarketFavourite(outcome, p) {
  * AND must back the better-placed side (or, at last resort, the bookmaker's
  * favourite). Over 2.5 needs over25Passes (or no data requirement at last
  * resort). Double Chance only at odds <= level.dcMaxOdds when a cap exists
- * (never on Saint's Lock). Other markets are unrestricted on Mega/Duo and
- * forbidden for Saint's Lock.
+ * (never on Saint's Lock). Both-teams-to-score only under the BTTS conditions
+ * above (never on Saint's Lock). Other markets are unrestricted on Mega/Duo
+ * and forbidden for Saint's Lock.
  */
 function marketAllowedAt(outcome, p, level, saintsLockOnly) {
   if (outcome.market === 'Over 2.5 Goals') return over25Passes(p.goals, level) || !level.requireStandings;
@@ -362,6 +400,8 @@ function marketAllowedAt(outcome, p, level, saintsLockOnly) {
   if (outcome.market.startsWith('Double Chance')) {
     return !saintsLockOnly && (level.dcMaxOdds === null || outcome.odds <= level.dcMaxOdds);
   }
+  if (outcome.market === 'BTTS - Yes') return !saintsLockOnly && bttsYesPasses(p.goals);
+  if (outcome.market === 'BTTS - No') return !saintsLockOnly && bttsNoPasses(p.goals);
   return !saintsLockOnly;
 }
 
@@ -421,7 +461,7 @@ async function priceFixture(oddsResponse, f) {
   if (viable.length === 0) return null;
 
   const win = viable.some((o) => FULL_WIN_MARKETS.has(o.market)) ? await winMetrics(f) : null;
-  const goals = viable.some((o) => o.market === 'Over 2.5 Goals') ? await goalMetrics(f) : null;
+  const goals = viable.some((o) => o.market === 'Over 2.5 Goals' || o.market.startsWith('BTTS')) ? await goalMetrics(f) : null;
   return { viable, win, goals };
 }
 
@@ -544,6 +584,13 @@ function computeTotalOdds(picks) {
 }
 const penaltyOf = (f) => f.opponentPenalty ?? 0;
 
+// AVOID WHERE POSSIBLE (a preference, not an exclusion): both teams to score.
+// A combination without a BTTS leg always beats one with a BTTS leg; BTTS is
+// used only when the ticket cannot be built without it AND the conditions
+// above are met.
+const AVOIDED_MARKETS = new Set(['BTTS - Yes', 'BTTS - No']);
+const avoidedOf = (f) => (AVOIDED_MARKETS.has(f.market) ? 1 : 0);
+
 
 /** Weak-opponent PREFERENCE at a level: 1 when the backed team's opponent has more than 2 wins in its last 5 (only meaningful when the win rule passes). */
 function opponentPenaltyAt(p, level) {
@@ -579,7 +626,9 @@ function poolAtLevel(dailyPool, tier, level, existingMarkets, chosenMarket) {
         if (c.confidence >= minConf) out.push(c);
       });
     } else {
-      const base = make([...allowed].sort((a, b) => a.odds - b.odds)[0]); // the safest allowed market
+      const preferred = allowed.filter((o) => !AVOIDED_MARKETS.has(o.market));
+      const basePool = preferred.length > 0 ? preferred : allowed; // BTTS only if nothing else is allowed
+      const base = make([...basePool].sort((a, b) => a.odds - b.odds)[0]); // the safest of those
       if (base.confidence >= minConf && (!SMALL_TICKET_TIERS.has(tier) || base.odds <= SMALL_TICKET_MAX_ODDS)) out.push(base);
     }
   }
@@ -590,10 +639,11 @@ function poolAtLevel(dailyPool, tier, level, existingMarkets, chosenMarket) {
  * Picks EXACTLY `k` different fixtures whose cumulative odds land inside
  * targetRange (lower bound is a hard floor, upper bound a hard cap). Used for
  * Mega Day (k = 3) and Duo (k = 2). Among valid combinations, prefers:
- *   (1) fewer weak-opponent warnings (opponentPenalty, a preference only),
- *   (2) less-reused fixtures,
- *   (3) for Mega, a combination that includes an outright win leg, where one exists,
- *   (4) the lowest total odds (the safest valid combination).
+ *   (1) fewer both-teams-to-score legs (avoided where possible),
+ *   (2) fewer weak-opponent warnings (opponentPenalty, a preference only),
+ *   (3) less-reused fixtures,
+ *   (4) for Mega, a combination that includes an outright win leg, where one exists,
+ *   (5) the lowest total odds (the safest valid combination).
  * Candidates are capped to MAX_COMBO_CANDIDATES so the search stays small.
  */
 const MAX_COMBO_CANDIDATES = 80;
@@ -604,7 +654,7 @@ function pickCombo(pool, k, usageCount, targetRange, preferFullWin = false) {
 
   const candidates = pool
     .filter((f) => usage(f) < MAX_FIXTURE_APPEARANCES_PER_DAY)
-    .sort((a, b) => usage(a) - usage(b) || penaltyOf(a) - penaltyOf(b) || a.odds - b.odds)
+    .sort((a, b) => avoidedOf(a) - avoidedOf(b) || usage(a) - usage(b) || penaltyOf(a) - penaltyOf(b) || a.odds - b.odds)
     .slice(0, MAX_COMBO_CANDIDATES);
 
   let best = null;
@@ -614,6 +664,7 @@ function pickCombo(pool, k, usageCount, targetRange, preferFullWin = false) {
     if (chosen.length === k) {
       if (product < minTotal || product > maxTotal) return;
       const score = [
+        chosen.reduce((n, f) => n + avoidedOf(f), 0), // fewest both-teams-to-score legs first
         chosen.reduce((n, f) => n + penaltyOf(f), 0),
         chosen.reduce((n, f) => n + usage(f), 0),
         preferFullWin && chosen.some((f) => FULL_WIN_MARKETS.has(f.market)) ? 0 : preferFullWin ? 1 : 0,
