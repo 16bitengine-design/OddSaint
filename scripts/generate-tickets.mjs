@@ -534,6 +534,7 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
             homeTeam: f.teams?.home?.name ?? 'Home',
             awayTeam: f.teams?.away?.name ?? 'Away',
             kickoff: f.fixture?.date,
+            friendly: classifyLeague(f.league).friendly === true,
             viable: priced.viable,
             win: priced.win,
             goals: priced.goals,
@@ -577,7 +578,10 @@ const penaltyOf = (f) => f.opponentPenalty ?? 0;
 // used only when the ticket cannot be built without it AND the conditions
 // above are met.
 const AVOIDED_MARKETS = new Set(['BTTS - Yes', 'BTTS - No']);
-const avoidedOf = (f) => (AVOIDED_MARKETS.has(f.market) ? 1 : 0);
+// Friendlies (national-team and club) are also used only where necessary: a
+// friendly leg counts the same as an avoided market, so any combination without
+// one wins.
+const avoidedOf = (f) => (AVOIDED_MARKETS.has(f.market) ? 1 : 0) + (f.friendly ? 1 : 0);
 
 
 /** Weak-opponent PREFERENCE at a level: 1 when the backed team's opponent has more than 2 wins in its last 5 (only meaningful when the win rule passes). */
@@ -698,7 +702,7 @@ function saintsLockCandidates(dailyPool, level, usageCount, excludeFixtureIds, e
         )
         .map((o) => ({ ...p, market: o.market, odds: o.odds, confidence: impliedConfidence(o.odds), opponentPenalty: penalty }));
     })
-    .sort((a, b) => penaltyOf(a) - penaltyOf(b) || a.odds - b.odds);
+    .sort((a, b) => (a.friendly ? 1 : 0) - (b.friendly ? 1 : 0) || penaltyOf(a) - penaltyOf(b) || a.odds - b.odds);
 }
 
 /**
