@@ -1,36 +1,24 @@
 // ---------------------------------------------------------------------------
 // Odd Saint — league resolver (run manually, NOT part of the daily pipeline)
 //
-// Hardcoding hundreds of league ID numbers from memory is risky — a wrong
-// ID doesn't error, it just silently returns zero fixtures for that league
-// forever. This script instead asks API-Football's own /leagues endpoint
-// for the real, current IDs per country, and writes a verified league list
-// to scripts/lib/leagues.json for generate-tickets.mjs to read.
+// Asks API-Football's /leagues endpoint for the real, current IDs per country
+// and writes the ones the league policy allows to scripts/lib/leagues.json.
+// (Ticket generation no longer reads leagues.json to choose fixtures — it uses
+// scripts/lib/leaguePolicy.mjs — but resolve-teams.mjs and the history backfill
+// still walk this list.)
 //
-// Costs roughly 1 API request per country below (~60 requests for the full
-// list) — trivial as a ONE-TIME or occasional run, but NOT something to run
-// daily, which is why this has its own manually-triggered workflow
-// (.github/workflows/resolve-leagues.yml) separate from the daily jobs.
-//
-// After running, spot-check scripts/lib/leagues.json — any country that
-// resolved to 0 leagues likely means API-Football expects a different
-// spelling for that country name than what's listed below; the script
-// logs a warning for each of those so they're easy to find and fix.
+// Costs roughly 1 API request per country below. Run occasionally, not daily.
 // ---------------------------------------------------------------------------
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { getLeaguesByCountry } from './lib/apiFootball.mjs';
-import { isAmateurOrYouthLeague } from './lib/leagueQuality.mjs';
+import { classifyLeague } from './lib/leaguePolicy.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_PATH = join(__dirname, 'lib', 'leagues.json');
 
-// Countries to resolve, grouped for readability. Country name spelling
-// must match what API-Football itself expects — if a country below
-// resolves to 0 leagues, try the alternate spelling commonly used by
-// API-Football (check their /leagues?country= docs or the countries
-// endpoint) and adjust here.
+// Countries covered by the league policy (country spelling as API-Football expects).
 const TARGET_COUNTRIES = {
   Europe: [
     'England', 'Spain', 'Italy', 'Germany', 'France', 'Netherlands', 'Portugal',
@@ -38,34 +26,20 @@ const TARGET_COUNTRIES = {
     'Switzerland', 'Greece', 'Sweden', 'Norway', 'Denmark', 'Croatia', 'Serbia',
     'Czech-Republic', 'Romania', 'Hungary', 'Bulgaria', 'Cyprus', 'Ireland',
     'Wales', 'Iceland', 'Finland', 'Slovakia', 'Slovenia', 'Bosnia',
-    'Albania', 'North-Macedonia', 'Georgia', 'Azerbaijan', 'Armenia',
+    'Albania', 'Georgia', 'Azerbaijan', 'Armenia',
   ],
   Asia: ['China', 'Japan', 'South-Korea', 'Thailand'],
-  'South America': [
-    'Brazil', 'Argentina', 'Uruguay', 'Chile', 'Colombia', 'Peru',
-    'Ecuador', 'Paraguay', 'Bolivia', 'Venezuela',
-  ],
   'North America': ['USA', 'Mexico', 'Canada'],
   Africa: ['Morocco', 'Egypt', 'South-Africa', 'Algeria'],
 };
 
-/**
- * Which league "types" to keep from each country's response. API-Football
- * returns both league competitions (what we want) and cup competitions
- * (knockout tournaments — excluded here since their format doesn't suit
- * this product's accumulator-style tickets). Also excludes youth, reserve,
- * and third-division-or-lower competitions by name pattern — see
- * scripts/lib/leagueQuality.mjs, shared with generate-tickets.mjs so the
- * two scripts can't drift on what counts as "amateur." API-Football
- * exposes no explicit division-tier field, so this is a name heuristic,
- * not a verified tier lookup — spot-check leagues.json after running.
- */
-function isUsableLeague(entry) {
-  return entry.league?.type === 'League' && !isAmateurOrYouthLeague(entry.league?.name);
+/** Keep league competitions (not cups) that the league policy allows for that country. */
+function isUsableLeague(entry, country) {
+  return entry.league?.type === 'League' && classifyLeague({ name: entry.league?.name, country }).allowed;
 }
 
 async function main() {
-  const resolved = []; // { id, name, country, region }
+  const resolved = [];
   const emptyCountries = [];
 
   for (const [region, countries] of Object.entries(TARGET_COUNTRIES)) {
@@ -78,31 +52,23 @@ async function main() {
         continue;
       }
 
-      const usable = leagues.filter(isUsableLeague);
+      const usable = leagues.filter((entry) => isUsableLeague(entry, country));
       if (usable.length === 0) {
         emptyCountries.push(country);
         continue;
       }
 
       usable.forEach((entry) => {
-        resolved.push({
-          id: entry.league.id,
-          name: entry.league.name,
-          country,
-          region,
-        });
+        resolved.push({ id: entry.league.id, name: entry.league.name, country, region });
       });
-
       console.log(`${country}: resolved ${usable.length} league(s).`);
     }
   }
 
   if (emptyCountries.length > 0) {
     console.warn(
-      '\nThese countries resolved to 0 leagues — likely a country-name spelling ' +
-        'mismatch with what API-Football expects, OR every league in that country ' +
-        'was filtered out as youth/reserve/lower-division. Check and fix ' +
-        'TARGET_COUNTRIES, or review AMATEUR_LEAGUE_PATTERNS in leagueQuality.mjs:\n' +
+      '\nThese countries resolved to 0 leagues — a country-name spelling mismatch with API-Football, ' +
+        'or no league name matched the policy in scripts/lib/leaguePolicy.mjs:\n' +
         emptyCountries.map((c) => `  - ${c}`).join('\n')
     );
   }

@@ -12,8 +12,12 @@
 //
 // PRODUCT RULES ENFORCED HERE
 //   Tiers: mega, duo, saints_lock. Everything else is eliminated.
-//   Leagues: no South American competitions, no youth/reserve/lower-division,
-//            no women's competitions.
+//   Leagues (see scripts/lib/leaguePolicy.mjs): division caps per country (none
+//            beyond the 5th; England 5 + the U21 league; Sweden/Denmark/Finland/
+//            Norway 4; Russia/France/Germany/Italy/Spain/Scotland 3; rest of
+//            Europe, North America, Africa and Asia 2), ALL continental and
+//            regional competitions, no women's / youth / friendlies, no South
+//            American domestic leagues.
 //   Direct win (Home/Away Win), any ticket: the BACKED team must sit at
 //            least minRankGap places above its opponent in the league table
 //            AND have >= minWins wins in its last 5 league matches (strict
@@ -40,47 +44,17 @@
 import { getFixturesForDate, getOddsForFixture, getStandings, getFixturesForTeam } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { collectViableOutcomes, FULL_WIN_MARKETS } from './lib/markets.mjs';
-import { isAmateurOrYouthLeague, isYouthOrReserveTeam } from './lib/leagueQuality.mjs';
-import { isWomensCompetition } from './lib/womensLeagueFilter.mjs';
-import { readFileSync } from 'node:fs';
+import { isYouthOrReserveTeam } from './lib/leagueQuality.mjs';
+import { classifyLeague } from './lib/leaguePolicy.mjs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const LEAGUES_JSON_PATH = join(__dirname, 'lib', 'leagues.json');
 
 // --- Config -----------------------------------------------------------------
 
-const DEFAULT_LEAGUE_ALLOWLIST = new Set([39, 140, 135, 78, 61, 2, 3, 88]);
-
-// South American competitions are excluded everywhere. leagues.json carries a
-// `region`, but API-Football's continental cups (Libertadores etc.) come back
-// with country "World", so the fixture-level check below also matches names.
-const SOUTH_AMERICAN_COUNTRIES = new Set([
-  'Brazil', 'Argentina', 'Uruguay', 'Chile', 'Colombia', 'Peru', 'Ecuador', 'Paraguay', 'Bolivia', 'Venezuela',
-]);
-const SOUTH_AMERICAN_NAME_PATTERN = /conmebol|libertadores|sudamericana|copa am[eé]rica/i;
-
-function isSouthAmericanLeague(league) {
-  return SOUTH_AMERICAN_COUNTRIES.has(league?.country) || SOUTH_AMERICAN_NAME_PATTERN.test(league?.name ?? '');
-}
-
-function loadLeagueAllowlist() {
-  try {
-    const leagues = JSON.parse(readFileSync(LEAGUES_JSON_PATH, 'utf8'));
-    if (Array.isArray(leagues) && leagues.length > 0) {
-      const usable = leagues.filter((l) => l.region !== 'South America');
-      console.log(`Loaded ${usable.length} league(s) from leagues.json (South America excluded).`);
-      return new Set(usable.map((l) => l.id));
-    }
-  } catch {
-    // leagues.json missing/invalid — fall back below.
-  }
-  console.log('leagues.json not found — using the small built-in default league set.');
-  return DEFAULT_LEAGUE_ALLOWLIST;
-}
-
-const LEAGUE_ALLOWLIST = loadLeagueAllowlist();
+// Which competitions are eligible is decided by scripts/lib/leaguePolicy.mjs
+// (division caps per country, all continental/regional competitions, no
+// women's / youth / friendlies, no South American domestic leagues). It works
+// from the league's own name + country on each fixture, so scripts/lib/
+// leagues.json is no longer needed to pick fixtures.
 
 const MAX_ODDS_LOOKUPS_PER_RUN = 200;
 const PER_LEAGUE_LOOKUPS_PER_ROUND = 3;
@@ -484,17 +458,31 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
       console.warn(`Could not fetch fixtures for ${d}, skipping that date:`, err.message);
       continue;
     }
-    const eligible = fixtures.filter(
-      (f) =>
-        LEAGUE_ALLOWLIST.has(f.league?.id) &&
-        !isSouthAmericanLeague(f.league) &&
-        !isAmateurOrYouthLeague(f.league?.name) &&
-        !isYouthOrReserveTeam(f.teams?.home?.name, f.teams?.away?.name) && // U21 / reserve / B sides
-        !isWomensCompetition(f.league?.name) &&
+    const notClassified = new Map(); // "country | league" -> count, for the run log
+    const eligible = fixtures.filter((f) => {
+      const verdict = classifyLeague(f.league);
+      if (!verdict.allowed) {
+        if (verdict.reason.startsWith('unclassified') || verdict.reason.startsWith('country not covered')) {
+          const key = `${f.league?.country} | ${f.league?.name}`;
+          notClassified.set(key, (notClassified.get(key) ?? 0) + 1);
+        }
+        return false;
+      }
+      return (
+        // U21 / reserve / B sides are excluded everywhere EXCEPT England's U21 league.
+        (verdict.allowYouthTeams || !isYouthOrReserveTeam(f.teams?.home?.name, f.teams?.away?.name)) &&
         !isBigClash(f.teams?.home?.name, f.teams?.away?.name) &&
         !isExcluded(f.teams?.home?.name, f.teams?.away?.name) &&
         hasMinimumLeadTime(f.fixture?.date, now)
-    );
+      );
+    });
+    if (notClassified.size > 0) {
+      console.log(
+        `Not eligible under the league policy (unclassified): ` +
+          Array.from(notClassified.entries()).slice(0, 15).map(([k, c]) => `${k} (${c})`).join('; ') +
+          (notClassified.size > 15 ? `; +${notClassified.size - 15} more` : '')
+      );
+    }
     if (eligible.length === 0) continue;
 
     const byLeague = new Map();
@@ -899,7 +887,7 @@ async function main() {
   console.log(`Wrote ${tickets.length} new ticket(s), ${fixtureRows.length} fixture(s). Previous slips today are untouched.`);
 }
 
-export { buildTickets, pickCombo, marketAllowedAt, chooseBookmaker, RELAXATION_LEVELS };
+export { buildTickets, pickCombo, marketAllowedAt, chooseBookmaker, fetchPricedFixtures, RELAXATION_LEVELS };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main().catch((err) => {

@@ -10,9 +10,9 @@
 // so every team carries the one stable numeric ID API-Football maintains
 // (stable across name variants like "Man United" / "Manchester United").
 //
-// LEAGUE FILTER (new): leagues.json may contain competitions the ticket and
-// score pipelines never use — youth, reserve, lower-division/non-league,
-// women's, and South American competitions. Resolving their teams only wastes
+// LEAGUE FILTER: leagues.json may contain competitions the ticket and score
+// pipelines never use — anything beyond each country's allowed divisions,
+// youth, women's, and South American domestic leagues (see scripts/lib/leaguePolicy.mjs). Resolving their teams only wastes
 // API requests and bloats teams.json (and the history backfill that walks
 // it). The same filters generate-tickets.mjs applies are applied here, so
 // teams.json only covers leagues that can actually be picked.
@@ -24,8 +24,7 @@ import { writeFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { getTeamsForLeague } from './lib/apiFootball.mjs';
-import { isAmateurOrYouthLeague } from './lib/leagueQuality.mjs';
-import { isWomensCompetition } from './lib/womensLeagueFilter.mjs';
+import { classifyLeague } from './lib/leaguePolicy.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LEAGUES_PATH = join(__dirname, 'lib', 'leagues.json');
@@ -38,12 +37,9 @@ function currentSeasonYear(date = new Date()) {
   return month >= 7 ? year : year - 1;
 }
 
+/** Same league policy the ticket generator uses (division caps per country, no women's/youth, no South American domestic leagues). */
 function isUsableLeagueEntry(league) {
-  return (
-    league.region !== 'South America' &&
-    !isAmateurOrYouthLeague(league.name) &&
-    !isWomensCompetition(league.name)
-  );
+  return classifyLeague({ name: league.name, country: league.country }).allowed;
 }
 
 async function main() {
@@ -60,7 +56,7 @@ async function main() {
   const season = currentSeasonYear();
   console.log(
     `Resolving teams for season ${season} across ${leagues.length} league(s) ` +
-      `(${allLeagues.length - leagues.length} youth/amateur/women's/South American league(s) skipped).`
+      `(${allLeagues.length - leagues.length} league(s) outside the league policy skipped).`
   );
 
   const resolved = [];
