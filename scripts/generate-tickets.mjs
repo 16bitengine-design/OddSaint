@@ -31,6 +31,8 @@
 //            used, only if both teams' last-5 matches support it (BTTS - Yes:
 //            both sides scored in >= 4 of each team's last 5; BTTS - No: in
 //            <= 1 of each team's last 5). Never relaxed.
+//   MARKETS: direct win (Home/Away Win) and Over goals (1.5 / 2.5 / 3.5) ONLY, on
+//            every ticket. Double Chance, BTTS and Under markets are dropped.
 //   Any other market (Mega/Duo only): no rank/form requirement.
 //   Mega Day: any market, EXACTLY 3 matches, cumulative odds in [1.97, 3]
 //            (range and floor never relax).
@@ -96,6 +98,13 @@ const TIER_CONFIG = [
 
 // (Cumulative-odds ranges, odds floors and confidence floors now live on each
 // relaxation level — see BASE_LEVEL / RELAXATION_LEVELS below.)
+
+// MARKETS: tickets focus on DIRECT WINS and OVER-GOALS markets only — the
+// markets bookmakers in the target (African) market offer most widely. Every
+// other market (Double Chance, both-teams-to-score, Under goals ...) is dropped
+// at pricing time. The Double Chance cap / BTTS conditions below are therefore
+// dormant; to bring a market back, add it to TICKET_MARKETS.
+const TICKET_MARKETS = new Set(['Home Win', 'Away Win', 'Over 1.5 Goals', 'Over 2.5 Goals', 'Over 3.5 Goals']);
 
 // Saint's Lock
 const SAINTS_LOCK_ODDS_MIN = 1.5;
@@ -365,6 +374,7 @@ function isMarketFavourite(outcome, p) {
  * and forbidden for Saint's Lock.
  */
 function marketAllowedAt(outcome, p, level, saintsLockOnly) {
+  if (!TICKET_MARKETS.has(outcome.market)) return false; // direct wins and Over goals only
   if (outcome.market === 'Over 2.5 Goals') return over25Passes(p.goals, level) || !level.requireStandings;
   if (outcome.market === 'Home Win' || outcome.market === 'Away Win') {
     const side = outcome.market === 'Home Win' ? 'home' : 'away';
@@ -431,7 +441,9 @@ async function priceFixture(oddsResponse, f) {
     return null;
   }
 
-  const viable = collectViableOutcomes(bookmaker.bets).map((o) => ({ market: o.market, odds: o.odds }));
+  const viable = collectViableOutcomes(bookmaker.bets)
+    .map((o) => ({ market: o.market, odds: o.odds }))
+    .filter((o) => TICKET_MARKETS.has(o.market)); // direct wins and Over goals only
   if (viable.length === 0) return null;
 
   const win = viable.some((o) => FULL_WIN_MARKETS.has(o.market)) ? await winMetrics(f) : null;
