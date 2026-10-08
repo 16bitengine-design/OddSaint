@@ -4,7 +4,8 @@
 // RULES (product decision):
 //   - Nothing beyond the 5th division, for any country.
 //   - England: up to the 5th division, PLUS the Under-21 league as a 6th level
-//     (Premier League 2 / Professional Development League).
+//     (Premier League 2 / Professional Development League) and, by product
+//     decision, the National League South.
 //   - Sweden, Denmark, Finland, Norway: up to the 4th division.
 //   - Russia, France, Germany, Italy, Spain, Scotland: up to the 3rd division.
 //   - The rest of Europe: up to the 2nd division.
@@ -49,6 +50,7 @@ const COUNTRY_POLICY = {
   england: [
     L(1, /^Premier League$/i), L(2, /^Championship$/i), L(3, /^League One$/i), L(4, /^League Two$/i),
     L(5, /^National League( - Play-offs)?$/i),
+    L(6, /^National League - South( - Play-offs)?$/i), // added by product decision (National League North is NOT included)
     L(6, /^Premier League 2/i, true), L(6, /^Professional Development League$/i, true),
   ],
 
