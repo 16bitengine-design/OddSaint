@@ -10,8 +10,14 @@
 //   - The rest of Europe: up to the 2nd division.
 //   - North America, Africa, Asia: up to the 2nd division per country.
 //   - ALL continental and regional competitions are included (UEFA, CAF, AFC,
-//     CONCACAF, CONMEBOL, Nations Leagues, regional cups ...), but never
-//     friendlies, women's or youth versions.
+//     CONCACAF, CONMEBOL, World Cup, Nations Leagues, regional cups ...), but
+//     never women's or youth versions.
+//   - DOMESTIC CUPS (FA Cup, League Cup / Carabao, Community Shield, Copa del
+//     Rey, Coppa Italia, DFB Pokal, Coupe de France, KNVB Beker, Taca de
+//     Portugal ...) are included for the TOP_EUROPEAN_COUNTRIES below.
+//   - FRIENDLIES (national-team "Friendlies" and "Friendlies Clubs") are
+//     included but flagged `friendly: true` — the generator uses them only
+//     where necessary (it prefers every other match).
 //   - South American DOMESTIC leagues stay excluded (earlier product rule).
 //   - Women's competitions are excluded everywhere.
 //
@@ -114,6 +120,20 @@ const COUNTRY_POLICY = {
   thailand: [L(1, /^Thai League 1$/i), L(2, /^Thai League 2$/i)],
 };
 
+// The 20 European countries whose domestic CUPS are eligible (edit to change).
+// Chosen from the countries this policy already covers, roughly by UEFA ranking.
+export const TOP_EUROPEAN_COUNTRIES = new Set([
+  'england', 'spain', 'italy', 'germany', 'france', 'netherlands', 'portugal', 'belgium', 'turkey',
+  'scotland', 'austria', 'switzerland', 'greece', 'czechrepublic', 'norway', 'denmark', 'poland',
+  'cyprus', 'croatia', 'sweden',
+]);
+
+// A competition NAME that is a domestic cup / super cup (accents already stripped)...
+const CUP_NAME = /\b(cup|cupen|copa|coppa|pokal|pokalen|taca|coupe|beker|puchar|kupa|cupa|shield|schaal|trophee|supercup|supercopa|supercoppa|supertaca)\b/i;
+// ...unless it is a youth / women's / amateur / lower-league or "trophy" competition.
+const CUP_EXCLUDE = /youth|junior|reserve|women|femin|\bu[-\s]?\d{2}\b|under[-\s]?\d{2}|amateur|regional|county|vase|trophy|isthmian|non league|qualif/i;
+const FRIENDLY = /friendl/i;
+
 // South American DOMESTIC leagues stay excluded (earlier product rule).
 const SOUTH_AMERICAN_DOMESTIC = new Set([
   'brazil', 'argentina', 'uruguay', 'chile', 'colombia', 'peru', 'ecuador', 'paraguay', 'bolivia', 'venezuela',
@@ -122,7 +142,7 @@ const SOUTH_AMERICAN_DOMESTIC = new Set([
 // Continental / regional / world competitions come back from API-Football with a
 // non-country "country". ALL of them are included, except the kinds below.
 const CONTINENTAL_SCOPES = new Set(['world', 'europe', 'asia', 'africa', 'northamerica', 'southamerica', 'oceania']);
-const CONTINENTAL_EXCLUDE = /friendl|youth|women|femin|\bu[-\s]?\d{2}\b|under[-\s]?\d{2}|olympic|futsal|beach/i;
+const CONTINENTAL_EXCLUDE = /youth|women|femin|\bu[-\s]?\d{2}\b|under[-\s]?\d{2}|olympic|futsal|beach/i;
 
 /**
  * Classifies a league as eligible or not. Input: { name, country } (an
@@ -132,17 +152,30 @@ const CONTINENTAL_EXCLUDE = /friendl|youth|women|femin|\bu[-\s]?\d{2}\b|under[-\
 export function classifyLeague(league) {
   const name = stripAccents(league?.name).trim();
   const key = countryKey(league?.country);
-  const no = (reason) => ({ allowed: false, kind: 'excluded', division: null, allowYouthTeams: false, reason });
+  const no = (reason) => ({ allowed: false, kind: 'excluded', division: null, allowYouthTeams: false, friendly: false, reason });
 
   if (!name) return no('no league name');
   if (isWomensCompetition(league?.name)) return no('women\'s competition');
 
   if (CONTINENTAL_SCOPES.has(key)) {
-    if (CONTINENTAL_EXCLUDE.test(name)) return no('continental but friendly / women\'s / youth / olympic');
-    return { allowed: true, kind: 'continental', division: null, allowYouthTeams: false, reason: 'continental / regional competition' };
+    if (CONTINENTAL_EXCLUDE.test(name)) return no('continental but women\'s / youth / olympic');
+    const friendly = FRIENDLY.test(name);
+    return {
+      allowed: true,
+      kind: friendly ? 'friendly' : 'continental',
+      division: null,
+      allowYouthTeams: false,
+      friendly,
+      reason: friendly ? 'friendly (only where necessary)' : 'continental / regional competition',
+    };
   }
 
   if (SOUTH_AMERICAN_DOMESTIC.has(key)) return no('South American domestic league');
+
+  // Domestic cups for the top European countries.
+  if (TOP_EUROPEAN_COUNTRIES.has(key) && CUP_NAME.test(name) && !CUP_EXCLUDE.test(name)) {
+    return { allowed: true, kind: 'cup', division: null, allowYouthTeams: false, friendly: false, reason: 'domestic cup' };
+  }
 
   const entries = COUNTRY_POLICY[key];
   if (!entries) return no('country not covered by the league policy');
@@ -154,6 +187,7 @@ export function classifyLeague(league) {
     kind: 'domestic',
     division: hit.d,
     allowYouthTeams: hit.youth, // England's U21 league is made of U21 sides
+    friendly: false,
     reason: `division ${hit.d}`,
   };
 }
