@@ -39,6 +39,7 @@ import {
   type ScorePredictionDayAccuracy,
 } from '@/lib/dataFetcher';
 import { ScorePredictionsSection, ScorePredictionAccuracyHistory } from './ScorePredictions';
+import { AuthModal } from './AuthModal';
 import {
   submitFeedback,
   fetchPendingFeedback,
@@ -1848,240 +1849,6 @@ function AdminGrantAccessModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Auth gate
-// ---------------------------------------------------------------------------
-
-function LoginModal({ onSent, onClose }: { onSent: (email: string) => void; onClose: () => void }) {
-  const [email, setEmail] = useState('');
-  const [agreed, setAgreed] = useState(false);
-  const [marketingOptIn, setMarketingOptIn] = useState(false);
-  const [status, setStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
-
-  async function handleLogin(e: FormEvent) {
-    e.preventDefault();
-    if (!agreed || !email) return;
-    setStatus('sending');
-    // marketing_opt_in is stored in the user's auth metadata — set here at
-    // signup time so there's a real, explicit opt-in on record before
-    // anyone's added to a marketing list, rather than assuming consent.
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: { data: { marketing_opt_in: marketingOptIn } },
-    });
-    if (error) {
-      setStatus('error');
-      return;
-    }
-    setStatus('sent');
-    onSent(email);
-  }
-
-  async function handleOAuth(provider: 'google' | 'facebook') {
-    await supabase.auth.signInWithOAuth({ provider });
-  }
-
-  return (
-    <div
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(0,0,0,0.8)',
-        zIndex: 40,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        padding: 20,
-      }}
-    >
-      <div style={{ width: '100%', maxWidth: 360 }}>
-        <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 16 }}>
-          <Logo />
-        </div>
-        <form
-          onSubmit={handleLogin}
-          style={{
-            width: '100%',
-            background: SURFACE_GRADIENT,
-            border: `1px solid ${COLORS.hairline}`,
-            borderRadius: 14,
-            padding: 22,
-            position: 'relative',
-            boxShadow: '0 20px 60px -20px rgba(0,0,0,0.6)',
-          }}
-        >
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            style={{
-              position: 'absolute',
-              top: 12,
-              right: 12,
-              background: 'none',
-              border: 'none',
-              color: COLORS.textMuted,
-              fontSize: 16,
-              cursor: 'pointer',
-            }}
-          >
-            ✕
-          </button>
-
-          <div style={{ fontSize: 13, color: COLORS.textMuted, marginBottom: 14, paddingRight: 20, lineHeight: 1.5 }}>
-            Sign in with a magic link to sync your trial and unlocks across devices.
-          </div>
-
-          <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
-            <button
-              type="button"
-              onClick={() => handleOAuth('google')}
-              style={{
-                flex: 1,
-                padding: '9px 0',
-                borderRadius: 8,
-                border: `1px solid ${COLORS.border}`,
-                background: '#ffffff',
-                color: COLORS.textPrimary,
-                fontFamily: FONT_BODY,
-                fontWeight: 600,
-                fontSize: 12,
-                cursor: 'pointer',
-              }}
-            >
-              Google
-            </button>
-            <button
-              type="button"
-              onClick={() => handleOAuth('facebook')}
-              style={{
-                flex: 1,
-                padding: '9px 0',
-                borderRadius: 8,
-                border: `1px solid ${COLORS.border}`,
-                background: '#ffffff',
-                color: COLORS.textPrimary,
-                fontFamily: FONT_BODY,
-                fontWeight: 600,
-                fontSize: 12,
-                cursor: 'pointer',
-              }}
-            >
-              Facebook
-            </button>
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '2px 0 14px' }}>
-            <div style={{ flex: 1, height: 1, background: COLORS.border }} />
-            <span style={{ fontSize: 10.5, color: COLORS.textMuted }}>or use email</span>
-            <div style={{ flex: 1, height: 1, background: COLORS.border }} />
-          </div>
-
-          <input
-            type="email"
-            required
-            placeholder="you@example.com"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            style={{
-              width: '100%',
-              padding: '11px 12px',
-              borderRadius: 8,
-              border: `1px solid ${COLORS.border}`,
-              background: COLORS.surfaceAlt,
-              color: COLORS.textPrimary,
-              fontFamily: FONT_BODY,
-              fontSize: 13,
-              marginBottom: 12,
-              boxSizing: 'border-box',
-            }}
-          />
-
-          <div style={{ marginBottom: 14 }}>
-            <IndemnificationNotice compact />
-          </div>
-
-          <label
-            style={{
-              display: 'flex',
-              alignItems: 'flex-start',
-              gap: 8,
-              fontSize: 12,
-              color: COLORS.textMuted,
-              marginBottom: 14,
-              cursor: 'pointer',
-              lineHeight: 1.4,
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={agreed}
-              onChange={(e) => setAgreed(e.target.checked)}
-              style={{ marginTop: 2 }}
-            />
-            I have read and accept the Hold-Harmless Indemnification Agreement.
-          </label>
-
-          {/* Marketing consent — deliberately a separate, optional checkbox,
-              unchecked by default. Bundling this with the required legal
-              agreement above would make consent meaningless. */}
-          <label
-            style={{
-              display: 'flex',
-              alignItems: 'flex-start',
-              gap: 8,
-              fontSize: 12,
-              color: COLORS.textMuted,
-              marginBottom: 14,
-              cursor: 'pointer',
-              lineHeight: 1.4,
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={marketingOptIn}
-              onChange={(e) => setMarketingOptIn(e.target.checked)}
-              style={{ marginTop: 2 }}
-            />
-            Send me occasional emails about new ticket drops and offers (optional).
-          </label>
-
-          <button
-            type="submit"
-            disabled={!agreed || !email || status === 'sending'}
-            style={{
-              width: '100%',
-              padding: '11px 0',
-              borderRadius: 9,
-              border: 'none',
-              fontFamily: FONT_BODY,
-              fontWeight: 600,
-              fontSize: 13,
-              cursor: !agreed || !email ? 'not-allowed' : 'pointer',
-              background:
-                !agreed || !email ? COLORS.border : `linear-gradient(135deg, ${COLORS.emerald}, #0d9668)`,
-              color: !agreed || !email ? COLORS.textMuted : '#04150f',
-            }}
-          >
-            {status === 'sending' ? 'Sending link...' : 'Send Magic Link'}
-          </button>
-
-          {status === 'sent' && (
-            <div style={{ marginTop: 10, fontSize: 12, color: COLORS.emerald, textAlign: 'center' }}>
-              Check your inbox for the sign-in link.
-            </div>
-          )}
-          {status === 'error' && (
-            <div style={{ marginTop: 10, fontSize: 12, color: COLORS.red, textAlign: 'center' }}>
-              Something went wrong. Please try again.
-            </div>
-          )}
-        </form>
-      </div>
-    </div>
-  );
-}
-
 /**
  * The daily ticket-generation job releases two staggered batches per tier
  * (see RELEASE_SLOT_HOURS_UTC / .github/workflows/generate-tickets.yml).
@@ -2967,7 +2734,7 @@ function TrialReminderBanner({
       }}
     >
       <div style={{ fontSize: 11.5, color: COLORS.textPrimary, lineHeight: 1.4 }}>
-        {`Sign up free to keep full access after your trial ends — ${daysLeft} day${daysLeft === 1 ? '' : 's'} left.`}
+        {`Create a free account to keep full access after your trial ends — ${daysLeft} day${daysLeft === 1 ? '' : 's'} left.`}
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
         <button
@@ -3045,6 +2812,12 @@ export default function Page() {
   const [registeredAt, setRegisteredAt] = useState<string | null>(null);
   const [anonTrialStart, setAnonTrialStart] = useState<string | null>(null);
   const [showLoginModal, setShowLoginModal] = useState(false);
+  const [authMode, setAuthMode] = useState<'signup' | 'signin'>('signup');
+
+  function openAuth(mode: 'signup' | 'signin') {
+    setAuthMode(mode);
+    setShowLoginModal(true);
+  }
   const [selectedMatch, setSelectedMatch] = useState<Match | null>(null);
   const [showTeamSearch, setShowTeamSearch] = useState(false);
   const [showArchive, setShowArchive] = useState(false);
@@ -3312,7 +3085,7 @@ export default function Page() {
             </button>
           ) : (
             <button
-              onClick={() => setShowLoginModal(true)}
+              onClick={() => openAuth('signin')}
               style={{
                 background: '#ffffff',
                 border: 'none',
@@ -3366,15 +3139,15 @@ export default function Page() {
             : userEmail
             ? "You're signed in — every ticket, every tier, including Saint's Lock, is free for you."
             : trialActive
-            ? `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Every ticket is unlocked, no account needed. Sign up anytime to keep full access for free.`
-            : 'Your free trial has ended. The Mega Day Ticket stays free forever — sign up free to unlock everything else, including Saint\'s Lock.'}
+            ? `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Every ticket is unlocked, no account needed. Create a free account before it ends to keep full access.`
+            : 'Your free trial has ended. The Mega Day Ticket stays free forever — create a free account to unlock everything else, including Saint\'s Lock.'}
         </div>
 
         {!isAdmin && (
           <TrialReminderBanner
             userEmail={userEmail}
             daysLeft={daysLeft}
-            onSignUpClick={() => setShowLoginModal(true)}
+            onSignUpClick={() => openAuth('signup')}
           />
         )}
 
@@ -3398,7 +3171,7 @@ export default function Page() {
               color: COLORS.textMuted,
             }}
           >
-            Saint's Lock requires a free account to access — sign in to continue.
+            Saint's Lock requires a free account — create one to continue.
           </div>
         )}
 
@@ -3415,7 +3188,7 @@ export default function Page() {
               trialActive={trialActive}
               isSignedIn={!!userEmail}
               isAdmin={isAdmin}
-              onSignUp={() => setShowLoginModal(true)}
+              onSignUp={() => openAuth('signup')}
               onSelectMatch={setSelectedMatch}
               onEditAsAdmin={setEditingTicket}
             />
@@ -3446,7 +3219,7 @@ export default function Page() {
         <ScorePredictionsSection
           predictions={scorePredictions}
           unlocked={isAdmin || !!userEmail || trialActive}
-          onSignUp={() => setShowLoginModal(true)}
+          onSignUp={() => openAuth('signup')}
         />
 
         <Footer />
@@ -3460,14 +3233,9 @@ export default function Page() {
       {/* Support / feedback entry point — always available */}
       <SupportButton onClick={() => setShowSupport(true)} />
 
-      {/* Optional sign-in modal — never blocks browsing, only opened by choice */}
+      {/* Account modal (sign up / sign in) — never blocks browsing, only opened by choice */}
       {showLoginModal && (
-        <LoginModal
-          onSent={(email) => {
-            setUserEmail(email);
-          }}
-          onClose={() => setShowLoginModal(false)}
-        />
+        <AuthModal initialMode={authMode} onClose={() => setShowLoginModal(false)} />
       )}
 
       {/* Tap-to-analyze modal — reads only data already in memory, no extra API calls */}
