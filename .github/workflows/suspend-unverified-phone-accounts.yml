@@ -1,0 +1,40 @@
+name: Odd Saint — Suspend Unverified Phone Accounts
+
+# Daily. Phone-only accounts that still haven't verified an email 10 days
+# after creation (3 days to the on-screen warning + the 7 days it promises)
+# are banned in Supabase Auth — reversible, nothing deleted. See the header
+# of scripts/suspend-unverified-phone-accounts.mjs.
+#
+# Scheduled runs are LIVE. A manual run defaults to dry-run (report only);
+# untick "dry_run" to suspend for real.
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report only — do not suspend anyone'
+        type: boolean
+        default: true
+
+jobs:
+  suspend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Suspend overdue unverified phone accounts
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: node scripts/suspend-unverified-phone-accounts.mjs
