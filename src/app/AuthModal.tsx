@@ -58,6 +58,11 @@ function normalizePhone(raw: string): string {
   return cleaned.startsWith('00') ? `+${cleaned.slice(2)}` : cleaned;
 }
 
+// Supabase's message for a banned account (see the suspension job in
+// scripts/suspend-unverified-phone-accounts.mjs).
+const SUSPENDED_MESSAGE =
+  'This account has been suspended because it was not verified with an email. Please contact support.';
+
 const MIN_PASSWORD_LENGTH = 8;
 
 const inputStyle = {
@@ -200,6 +205,8 @@ export function AuthModal({
         setError(
           phoneErr.message === 'Invalid login credentials'
             ? 'Wrong phone number or password.'
+            : /banned/i.test(phoneErr.message)
+            ? SUSPENDED_MESSAGE
             : phoneErr.message
         );
         return;
