@@ -527,6 +527,35 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function public.handle_new_user();
 
+-- Keeps user_profiles in step when an account's email or phone changes —
+-- mainly a phone-only user verifying an email: auth.users.email is only set
+-- once they click the confirmation link, so an unverified address never
+-- reaches user_profiles (and therefore never receives lifecycle emails).
+create or replace function public.handle_user_contact_update()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.user_profiles
+     set email = coalesce(nullif(new.email, ''), email),
+         phone = coalesce(nullif(new.phone, ''), phone)
+   where user_id = new.id;
+  return new;
+exception when others then
+  raise warning 'handle_user_contact_update failed for %: %', new.id, sqlerrm;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_updated on auth.users;
+create trigger on_auth_user_updated
+  after update of email, phone on auth.users
+  for each row
+  when (old.email is distinct from new.email or old.phone is distinct from new.phone)
+  execute function public.handle_user_contact_update();
+
 -- ---------------------------------------------------------------------------
 -- 14. Notification log (lifecycle email idempotency ledger)
 -- ---------------------------------------------------------------------------
