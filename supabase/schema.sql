@@ -454,6 +454,7 @@ create table if not exists user_profiles (
 -- this is safe against a table that already exists without these columns.
 alter table public.user_profiles add column if not exists username text;
 alter table public.user_profiles add column if not exists country text; -- ISO 3166-1 alpha-2
+alter table public.user_profiles add column if not exists phone text;   -- phone-only accounts (no email); E.164, unverified
 
 -- Backstop uniqueness, case-insensitive. The signup form pre-checks via
 -- username_available() below for a friendly error message.
@@ -501,15 +502,17 @@ security definer
 set search_path = public
 as $$
 begin
-  insert into public.user_profiles (user_id, email, username, country)
+  insert into public.user_profiles (user_id, email, phone, username, country)
   values (
     new.id,
-    new.email,
+    nullif(new.email, ''),
+    nullif(new.phone, ''),
     nullif(new.raw_user_meta_data->>'username', ''),
     nullif(upper(new.raw_user_meta_data->>'country'), '')
   )
   on conflict (user_id) do update
     set email    = coalesce(excluded.email, public.user_profiles.email),
+        phone    = coalesce(excluded.phone, public.user_profiles.phone),
         username = coalesce(excluded.username, public.user_profiles.username),
         country  = coalesce(excluded.country, public.user_profiles.country);
   return new;

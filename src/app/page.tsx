@@ -2697,11 +2697,11 @@ function markDismissedToday(): void {
 }
 
 function TrialReminderBanner({
-  userEmail,
+  isSignedIn,
   daysLeft,
   onSignUpClick,
 }: {
-  userEmail: string | null;
+  isSignedIn: boolean;
   daysLeft: number;
   onSignUpClick: () => void;
 }) {
@@ -2716,7 +2716,7 @@ function TrialReminderBanner({
   // Signed-up users already have permanent free access to everything, so
   // this banner only ever nudges an anonymous visitor still within their
   // trial window to sign up before it ends.
-  const showSignUpNudge = !userEmail && daysLeft > 0;
+  const showSignUpNudge = !isSignedIn && daysLeft > 0;
   if (!showSignUpNudge) return null;
 
   return (
@@ -2842,6 +2842,8 @@ export default function Page() {
   const [showGrantAccess, setShowGrantAccess] = useState(false);
 
   const isAdmin = archiveAccess.level === 'admin';
+  // Phone-only accounts have no email, so "signed in" must key off the user id.
+  const signedIn = !!userId;
 
   // Every visitor gets the trial immediately — no account required. The
   // clock starts on first visit and is stored locally on their device.
@@ -3066,7 +3068,7 @@ export default function Page() {
               🎁
             </button>
           )}
-          {userEmail ? (
+          {signedIn ? (
             <button
               onClick={() => supabase.auth.signOut()}
               style={{
@@ -3136,7 +3138,7 @@ export default function Page() {
         >
           {isAdmin
             ? 'Admin account — every ticket, every tier, including Saint\'s Lock, is unlocked for you automatically.'
-            : userEmail
+            : signedIn
             ? "You're signed in — every ticket, every tier, including Saint's Lock, is free for you."
             : trialActive
             ? `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Every ticket is unlocked, no account needed. Create a free account before it ends to keep full access.`
@@ -3145,7 +3147,7 @@ export default function Page() {
 
         {!isAdmin && (
           <TrialReminderBanner
-            userEmail={userEmail}
+            isSignedIn={signedIn}
             daysLeft={daysLeft}
             onSignUpClick={() => openAuth('signup')}
           />
@@ -3159,7 +3161,7 @@ export default function Page() {
         {saintsLockTickets.map((t) => (
           <SaintsLockCountdown key={`countdown-${t.id}`} ticket={t} />
         ))}
-        {saintsLockTickets.length > 0 && !userEmail && (
+        {saintsLockTickets.length > 0 && !signedIn && (
           <div
             style={{
               background: COLORS.surfaceAlt,
@@ -3186,7 +3188,7 @@ export default function Page() {
               key={item.ticket.id}
               ticket={item.ticket}
               trialActive={trialActive}
-              isSignedIn={!!userEmail}
+              isSignedIn={signedIn}
               isAdmin={isAdmin}
               onSignUp={() => openAuth('signup')}
               onSelectMatch={setSelectedMatch}
@@ -3218,7 +3220,7 @@ export default function Page() {
             signed-in users and anonymous visitors still inside their trial. */}
         <ScorePredictionsSection
           predictions={scorePredictions}
-          unlocked={isAdmin || !!userEmail || trialActive}
+          unlocked={isAdmin || signedIn || trialActive}
           onSignUp={() => openAuth('signup')}
         />
 
