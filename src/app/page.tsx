@@ -2697,11 +2697,11 @@ function markDismissedToday(): void {
 }
 
 function TrialReminderBanner({
-  isSignedIn,
+  userEmail,
   daysLeft,
   onSignUpClick,
 }: {
-  isSignedIn: boolean;
+  userEmail: string | null;
   daysLeft: number;
   onSignUpClick: () => void;
 }) {
@@ -2716,7 +2716,7 @@ function TrialReminderBanner({
   // Signed-up users already have permanent free access to everything, so
   // this banner only ever nudges an anonymous visitor still within their
   // trial window to sign up before it ends.
-  const showSignUpNudge = !isSignedIn && daysLeft > 0;
+  const showSignUpNudge = !userEmail && daysLeft > 0;
   if (!showSignUpNudge) return null;
 
   return (
@@ -2767,120 +2767,6 @@ function TrialReminderBanner({
 }
 
 
-// ---------------------------------------------------------------------------
-// Phone-account verification
-// A phone number alone is not treated as a verified account. Phone-only users
-// are asked for an email and must click the confirmation link. If they have
-// not verified 3 days after creating the account, the banner switches to a
-// suspension warning. NOTE: this is a message only — nothing in the codebase
-// actually suspends an account yet.
-// ---------------------------------------------------------------------------
-
-const PHONE_VERIFY_WARN_AFTER_DAYS = 3;
-const PHONE_SUSPEND_WITHIN_DAYS = 7;
-
-function PhoneVerifyBanner({
-  createdAt,
-  pendingEmail,
-}: {
-  createdAt: string | null;
-  pendingEmail: string | null;
-}) {
-  const [email, setEmail] = useState('');
-  const [sentTo, setSentTo] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const ageDays = createdAt ? Math.floor((Date.now() - new Date(createdAt).getTime()) / 86_400_000) : 0;
-  const warn = ageDays >= PHONE_VERIFY_WARN_AFTER_DAYS;
-  const waitingOn = sentTo ?? pendingEmail;
-
-  async function sendLink(e: FormEvent) {
-    e.preventDefault();
-    const clean = email.trim();
-    if (!clean) return;
-    setBusy(true);
-    setError(null);
-    const { error: err } = await supabase.auth.updateUser(
-      { email: clean },
-      { emailRedirectTo: window.location.origin }
-    );
-    setBusy(false);
-    if (err) {
-      setError(err.message);
-      return;
-    }
-    setSentTo(clean);
-  }
-
-  return (
-    <div
-      style={{
-        background: warn ? 'rgba(211,50,31,0.08)' : COLORS.surfaceAlt,
-        border: `1px solid ${warn ? COLORS.red + '55' : COLORS.hairline}`,
-        borderRadius: 10,
-        padding: '11px 14px',
-        marginBottom: 14,
-        fontFamily: FONT_BODY,
-        fontSize: 12,
-        lineHeight: 1.5,
-        color: COLORS.textPrimary,
-      }}
-    >
-      <div style={{ fontWeight: 700, marginBottom: 4, color: warn ? COLORS.red : COLORS.textPrimary }}>
-        {warn
-          ? `Verify your email — your account will be suspended within ${PHONE_SUSPEND_WITHIN_DAYS} days.`
-          : 'Verify your account with an email address.'}
-      </div>
-      <div style={{ color: COLORS.textMuted, marginBottom: 8 }}>
-        {waitingOn
-          ? `We sent a verification link to ${waitingOn}. Click it to finish. You can send it again below or use a different address.`
-          : 'Your account was created with a phone number. Add an email and click the link we send to verify it.'}
-      </div>
-      <form onSubmit={sendLink} style={{ display: 'flex', gap: 6 }}>
-        <input
-          type="email"
-          required
-          autoComplete="email"
-          placeholder="you@example.com"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          style={{
-            flex: 1,
-            minWidth: 0,
-            padding: '8px 10px',
-            borderRadius: 7,
-            border: `1px solid ${COLORS.border}`,
-            background: '#ffffff',
-            color: COLORS.textPrimary,
-            fontFamily: FONT_BODY,
-            fontSize: 12.5,
-          }}
-        />
-        <button
-          type="submit"
-          disabled={busy || !email.trim()}
-          style={{
-            padding: '8px 12px',
-            borderRadius: 7,
-            border: 'none',
-            background: busy || !email.trim() ? COLORS.border : COLORS.emerald,
-            color: busy || !email.trim() ? COLORS.textMuted : '#ffffff',
-            fontFamily: FONT_BODY,
-            fontWeight: 700,
-            fontSize: 11.5,
-            cursor: busy || !email.trim() ? 'not-allowed' : 'pointer',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {busy ? 'Sending…' : waitingOn ? 'Resend' : 'Send link'}
-        </button>
-      </form>
-      {error && <div style={{ marginTop: 6, color: COLORS.red }}>{error}</div>}
-    </div>
-  );
-}
-
 function Footer() {
   const [showLegal, setShowLegal] = useState(false);
 
@@ -2924,9 +2810,6 @@ export default function Page() {
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
   const [registeredAt, setRegisteredAt] = useState<string | null>(null);
-  // Phone-only accounts (no confirmed email yet) must verify an email — see PhoneVerifyBanner.
-  const [phoneUnverified, setPhoneUnverified] = useState(false);
-  const [pendingEmail, setPendingEmail] = useState<string | null>(null);
   const [anonTrialStart, setAnonTrialStart] = useState<string | null>(null);
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [authMode, setAuthMode] = useState<'signup' | 'signin'>('signup');
@@ -2959,8 +2842,6 @@ export default function Page() {
   const [showGrantAccess, setShowGrantAccess] = useState(false);
 
   const isAdmin = archiveAccess.level === 'admin';
-  // Phone-only accounts have no email, so "signed in" must key off the user id.
-  const signedIn = !!userId;
 
   // Every visitor gets the trial immediately — no account required. The
   // clock starts on first visit and is stored locally on their device.
@@ -2977,8 +2858,6 @@ export default function Page() {
       setUserEmail(user?.email ?? null);
       setUserId(user?.id ?? null);
       setRegisteredAt(user?.created_at ?? null);
-      setPhoneUnverified(!!user?.phone && !user?.email_confirmed_at);
-      setPendingEmail(user?.new_email ?? null);
       setLoading(false);
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
     });
@@ -2988,8 +2867,6 @@ export default function Page() {
       setUserEmail(user?.email ?? null);
       setUserId(user?.id ?? null);
       setRegisteredAt(user?.created_at ?? null);
-      setPhoneUnverified(!!user?.phone && !user?.email_confirmed_at);
-      setPendingEmail(user?.new_email ?? null);
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
     });
 
@@ -3189,7 +3066,7 @@ export default function Page() {
               🎁
             </button>
           )}
-          {signedIn ? (
+          {userEmail ? (
             <button
               onClick={() => supabase.auth.signOut()}
               style={{
@@ -3259,20 +3136,16 @@ export default function Page() {
         >
           {isAdmin
             ? 'Admin account — every ticket, every tier, including Saint\'s Lock, is unlocked for you automatically.'
-            : signedIn
+            : userEmail
             ? "You're signed in — every ticket, every tier, including Saint's Lock, is free for you."
             : trialActive
             ? `Free trial active — ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining. Every ticket is unlocked, no account needed. Create a free account before it ends to keep full access.`
             : 'Your free trial has ended. The Mega Day Ticket stays free forever — create a free account to unlock everything else, including Saint\'s Lock.'}
         </div>
 
-        {!isAdmin && signedIn && phoneUnverified && (
-          <PhoneVerifyBanner createdAt={registeredAt} pendingEmail={pendingEmail} />
-        )}
-
         {!isAdmin && (
           <TrialReminderBanner
-            isSignedIn={signedIn}
+            userEmail={userEmail}
             daysLeft={daysLeft}
             onSignUpClick={() => openAuth('signup')}
           />
@@ -3286,7 +3159,7 @@ export default function Page() {
         {saintsLockTickets.map((t) => (
           <SaintsLockCountdown key={`countdown-${t.id}`} ticket={t} />
         ))}
-        {saintsLockTickets.length > 0 && !signedIn && (
+        {saintsLockTickets.length > 0 && !userEmail && (
           <div
             style={{
               background: COLORS.surfaceAlt,
@@ -3313,7 +3186,7 @@ export default function Page() {
               key={item.ticket.id}
               ticket={item.ticket}
               trialActive={trialActive}
-              isSignedIn={signedIn}
+              isSignedIn={!!userEmail}
               isAdmin={isAdmin}
               onSignUp={() => openAuth('signup')}
               onSelectMatch={setSelectedMatch}
@@ -3345,7 +3218,7 @@ export default function Page() {
             signed-in users and anonymous visitors still inside their trial. */}
         <ScorePredictionsSection
           predictions={scorePredictions}
-          unlocked={isAdmin || signedIn || trialActive}
+          unlocked={isAdmin || !!userEmail || trialActive}
           onSignUp={() => openAuth('signup')}
         />
 
