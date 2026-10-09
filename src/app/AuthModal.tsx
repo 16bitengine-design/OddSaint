@@ -50,6 +50,14 @@ const COUNTRIES: Array<[string, string]> = [
 ];
 
 const USERNAME_PATTERN = /^[a-zA-Z0-9_]{3,20}$/;
+// Phone accounts: international format, e.g. +256700000000. Spaces, dashes and
+// brackets are stripped; a leading 00 is read as +.
+const PHONE_PATTERN = /^\+[1-9]\d{7,14}$/;
+function normalizePhone(raw: string): string {
+  const cleaned = raw.replace(/[\s\-().]/g, '');
+  return cleaned.startsWith('00') ? `+${cleaned.slice(2)}` : cleaned;
+}
+
 const MIN_PASSWORD_LENGTH = 8;
 
 const inputStyle = {
@@ -73,7 +81,9 @@ export function AuthModal({
   initialMode?: 'signup' | 'signin';
 }) {
   const [mode, setMode] = useState<'signup' | 'signin'>(initialMode);
+  const [method, setMethod] = useState<'email' | 'phone'>('email');
   const [email, setEmail] = useState('');
+  const [phone, setPhone] = useState('');
   const [username, setUsername] = useState('');
   const [country, setCountry] = useState('');
   const [password, setPassword] = useState('');
@@ -84,9 +94,11 @@ export function AuthModal({
   const [confirmSent, setConfirmSent] = useState(false);
 
   const isSignup = mode === 'signup';
+  const isPhone = method === 'phone';
+  const hasIdentifier = isPhone ? !!phone.trim() : !!email;
   const canSubmit = isSignup
-    ? !!email && !!username && !!country && !!password && agreed && !busy
-    : !!email && !!password && !busy;
+    ? hasIdentifier && !!username && !!country && !!password && agreed && !busy
+    : hasIdentifier && !!password && !busy;
 
   function switchMode(next: 'signup' | 'signin') {
     setMode(next);
@@ -101,6 +113,11 @@ export function AuthModal({
     }
     if (password.length < MIN_PASSWORD_LENGTH) {
       setError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+      return;
+    }
+
+    if (isPhone) {
+      await handlePhoneSignUp(cleanUsername);
       return;
     }
 
@@ -143,7 +160,53 @@ export function AuthModal({
     }
   }
 
+  // Phone accounts are created server-side (/api/auth/phone-signup) so the
+  // number is stored as a confirmed phone identity without sending an SMS.
+  // The number is NOT verified — see the route's header comment.
+  async function handlePhoneSignUp(cleanUsername: string) {
+    const cleanPhone = normalizePhone(phone);
+    if (!PHONE_PATTERN.test(cleanPhone)) {
+      setError('Enter your phone number with country code, e.g. +256700000000.');
+      return;
+    }
+    const res = await fetch('/api/auth/phone-signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: cleanPhone, password, username: cleanUsername, country }),
+    });
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    if (!res.ok) {
+      setError(body.error ?? 'Could not create the account. Please try again.');
+      return;
+    }
+    const { error: signInErr } = await supabase.auth.signInWithPassword({ phone: cleanPhone, password });
+    if (signInErr) {
+      setError('Account created, but automatic sign-in failed. Please sign in.');
+      switchMode('signin');
+      return;
+    }
+    onClose();
+  }
+
   async function handleSignIn() {
+    if (isPhone) {
+      const cleanPhone = normalizePhone(phone);
+      if (!PHONE_PATTERN.test(cleanPhone)) {
+        setError('Enter your phone number with country code, e.g. +256700000000.');
+        return;
+      }
+      const { error: phoneErr } = await supabase.auth.signInWithPassword({ phone: cleanPhone, password });
+      if (phoneErr) {
+        setError(
+          phoneErr.message === 'Invalid login credentials'
+            ? 'Wrong phone number or password.'
+            : phoneErr.message
+        );
+        return;
+      }
+      onClose();
+      return;
+    }
     const { error: signInErr } = await supabase.auth.signInWithPassword({
       email: email.trim(),
       password,
@@ -224,6 +287,8 @@ export function AuthModal({
           <p style={{ fontFamily: FONT, fontSize: 12, color: COLORS.textMuted, margin: '0 0 16px', lineHeight: 1.5 }}>
             {isSignup
               ? 'A free Odd Saint account keeps your access after the 7-day trial.'
+              : isPhone
+              ? 'Sign in with your phone number and password.'
               : 'Sign in with your email and password.'}
           </p>
 
@@ -256,15 +321,48 @@ export function AuthModal({
             </div>
           ) : (
             <>
-              <input
-                type="email"
-                required
-                autoComplete="email"
-                placeholder="Email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                style={inputStyle}
-              />
+              {isPhone ? (
+                <input
+                  type="tel"
+                  required
+                  autoComplete="tel"
+                  placeholder="Phone number, e.g. +256700000000"
+                  value={phone}
+                  onChange={(e) => setPhone(e.target.value)}
+                  style={{ ...inputStyle, marginBottom: 6 }}
+                />
+              ) : (
+                <input
+                  type="email"
+                  required
+                  autoComplete="email"
+                  placeholder="Email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  style={{ ...inputStyle, marginBottom: 6 }}
+                />
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setMethod(isPhone ? 'email' : 'phone');
+                  setError(null);
+                }}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  padding: 0,
+                  marginBottom: 12,
+                  color: COLORS.emerald,
+                  fontFamily: FONT,
+                  fontSize: 11.5,
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  textDecoration: 'underline',
+                }}
+              >
+                {isPhone ? 'Use email instead' : 'No email? Use a phone number'}
+              </button>
 
               {isSignup && (
                 <>
@@ -338,27 +436,29 @@ export function AuthModal({
                       opinions, never a guarantee of any result, and I am responsible for my own decisions.
                     </span>
                   </label>
-                  <label
-                    style={{
-                      display: 'flex',
-                      alignItems: 'flex-start',
-                      gap: 8,
-                      fontFamily: FONT,
-                      fontSize: 11.5,
-                      color: COLORS.textMuted,
-                      marginBottom: 14,
-                      cursor: 'pointer',
-                      lineHeight: 1.45,
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={marketingOptIn}
-                      onChange={(e) => setMarketingOptIn(e.target.checked)}
-                      style={{ marginTop: 2 }}
-                    />
-                    Send me occasional emails about new ticket drops and offers (optional).
-                  </label>
+                  {!isPhone && (
+                    <label
+                      style={{
+                        display: 'flex',
+                        alignItems: 'flex-start',
+                        gap: 8,
+                        fontFamily: FONT,
+                        fontSize: 11.5,
+                        color: COLORS.textMuted,
+                        marginBottom: 14,
+                        cursor: 'pointer',
+                        lineHeight: 1.45,
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={marketingOptIn}
+                        onChange={(e) => setMarketingOptIn(e.target.checked)}
+                        style={{ marginTop: 2 }}
+                      />
+                      Send me occasional emails about new ticket drops and offers (optional).
+                    </label>
+                  )}
                 </>
               )}
 
