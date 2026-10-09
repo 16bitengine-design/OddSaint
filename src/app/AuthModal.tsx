@@ -255,10 +255,16 @@ export function AuthModal({
     });
     setBusy(false);
     if (resetErr) {
+      // Log the real cause (check Supabase -> Logs -> Auth for the matching
+      // entry) and show it, so a misconfigured email setup is diagnosable.
+      // This can't reveal which emails are registered: Supabase answers
+      // success for unknown addresses.
+      // eslint-disable-next-line no-console
+      console.error('[password reset]', resetErr.status, resetErr.message);
       setError(
         /rate|too many|seconds/i.test(resetErr.message)
           ? 'Please wait a minute before requesting another link.'
-          : 'Could not send the reset link. Please try again.'
+          : `Could not send the reset link: ${resetErr.message}`
       );
       return;
     }
