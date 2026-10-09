@@ -39,7 +39,7 @@ import {
   type ScorePredictionDayAccuracy,
 } from '@/lib/dataFetcher';
 import { ScorePredictionsSection, ScorePredictionAccuracyHistory } from './ScorePredictions';
-import { AuthModal } from './AuthModal';
+import { AuthModal, NewPasswordModal } from './AuthModal';
 import {
   submitFeedback,
   fetchPendingFeedback,
@@ -2929,6 +2929,7 @@ export default function Page() {
   const [pendingEmail, setPendingEmail] = useState<string | null>(null);
   const [anonTrialStart, setAnonTrialStart] = useState<string | null>(null);
   const [showLoginModal, setShowLoginModal] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
   const [authMode, setAuthMode] = useState<'signup' | 'signin'>('signup');
 
   function openAuth(mode: 'signup' | 'signin') {
@@ -2966,6 +2967,9 @@ export default function Page() {
   // clock starts on first visit and is stored locally on their device.
   useEffect(() => {
     setAnonTrialStart(getAnonymousTrialStart());
+    // Belt and braces for the reset link: the recovery event can fire before
+    // the auth listener below is attached, but the URL still says so.
+    if (/type=recovery/.test(window.location.hash)) setShowNewPassword(true);
   }, []);
 
   useEffect(() => {
@@ -2983,7 +2987,9 @@ export default function Page() {
       getArchiveAccess(user?.id ?? null).then((a) => mounted && setArchiveAccess(a));
     });
 
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+      // The emailed reset link signs the user in with a recovery session.
+      if (event === 'PASSWORD_RECOVERY') setShowNewPassword(true);
       const user = session?.user ?? null;
       setUserEmail(user?.email ?? null);
       setUserId(user?.id ?? null);
@@ -3363,6 +3369,15 @@ export default function Page() {
       {/* Account modal (sign up / sign in) — never blocks browsing, only opened by choice */}
       {showLoginModal && (
         <AuthModal initialMode={authMode} onClose={() => setShowLoginModal(false)} />
+      )}
+
+      {showNewPassword && (
+        <NewPasswordModal
+          onClose={() => {
+            setShowNewPassword(false);
+            window.history.replaceState(null, '', window.location.pathname);
+          }}
+        />
       )}
 
       {/* Tap-to-analyze modal — reads only data already in memory, no extra API calls */}

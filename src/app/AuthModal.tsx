@@ -63,6 +63,8 @@ function normalizePhone(raw: string): string {
 const SUSPENDED_MESSAGE =
   'This account has been suspended because it was not verified with an email. Please contact support.';
 
+const WRONG_PASSWORD_PROMPT_AFTER = 3;
+
 const MIN_PASSWORD_LENGTH = 8;
 
 const inputStyle = {
@@ -97,6 +99,12 @@ export function AuthModal({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmSent, setConfirmSent] = useState(false);
+  // Password reset: `resetting` swaps the form for the reset panel; after
+  // WRONG_PASSWORD_PROMPT_AFTER wrong passwords in a row we put a reset
+  // prompt in front of the user (a nudge, not a lockout).
+  const [resetting, setResetting] = useState(false);
+  const [resetSent, setResetSent] = useState(false);
+  const [failedAttempts, setFailedAttempts] = useState(0);
 
   const isSignup = mode === 'signup';
   const isPhone = method === 'phone';
@@ -107,6 +115,9 @@ export function AuthModal({
 
   function switchMode(next: 'signup' | 'signin') {
     setMode(next);
+    setResetting(false);
+    setResetSent(false);
+    setFailedAttempts(0);
     setError(null);
   }
 
@@ -202,6 +213,7 @@ export function AuthModal({
       }
       const { error: phoneErr } = await supabase.auth.signInWithPassword({ phone: cleanPhone, password });
       if (phoneErr) {
+        if (phoneErr.message === 'Invalid login credentials') setFailedAttempts((n) => n + 1);
         setError(
           phoneErr.message === 'Invalid login credentials'
             ? 'Wrong phone number or password.'
@@ -219,6 +231,7 @@ export function AuthModal({
       password,
     });
     if (signInErr) {
+      if (signInErr.message === 'Invalid login credentials') setFailedAttempts((n) => n + 1);
       setError(
         signInErr.message === 'Invalid login credentials'
           ? 'Wrong email or password.'
@@ -227,6 +240,37 @@ export function AuthModal({
       return;
     }
     onClose();
+  }
+
+  async function sendReset() {
+    const clean = email.trim();
+    if (!clean) {
+      setError('Enter the email address on your account.');
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    const { error: resetErr } = await supabase.auth.resetPasswordForEmail(clean, {
+      redirectTo: window.location.origin,
+    });
+    setBusy(false);
+    if (resetErr) {
+      setError(
+        /rate|too many|seconds/i.test(resetErr.message)
+          ? 'Please wait a minute before requesting another link.'
+          : 'Could not send the reset link. Please try again.'
+      );
+      return;
+    }
+    // Same message whether or not the email has an account — never reveal
+    // which emails are registered.
+    setResetSent(true);
+  }
+
+  function startReset() {
+    setResetting(true);
+    setResetSent(false);
+    setError(null);
   }
 
   async function handleSubmit(e: FormEvent) {
@@ -289,10 +333,12 @@ export function AuthModal({
           </button>
 
           <h2 style={{ fontFamily: FONT, fontSize: 18, fontWeight: 800, color: COLORS.textPrimary, margin: '0 0 4px' }}>
-            {isSignup ? 'Create your account' : 'Welcome back'}
+            {resetting ? 'Reset your password' : isSignup ? 'Create your account' : 'Welcome back'}
           </h2>
           <p style={{ fontFamily: FONT, fontSize: 12, color: COLORS.textMuted, margin: '0 0 16px', lineHeight: 1.5 }}>
-            {isSignup
+            {resetting
+              ? "We'll email you a link to choose a new password."
+              : isSignup
               ? 'A free Odd Saint account keeps your access after the 7-day trial.'
               : isPhone
               ? 'Sign in with your phone number and password.'
@@ -324,6 +370,76 @@ export function AuthModal({
                 }}
               >
                 Go to sign in
+              </button>
+            </div>
+          ) : resetting ? (
+            <div style={{ fontFamily: FONT, fontSize: 12.5 }}>
+              {resetSent ? (
+                <div style={{ color: COLORS.emerald, lineHeight: 1.6, marginBottom: 14 }}>
+                  If an account exists for <strong>{email.trim()}</strong>, we&apos;ve emailed it a link to reset the
+                  password. Check your inbox (and spam), then open the link on this device.
+                </div>
+              ) : (
+                <>
+                  {isPhone && (
+                    <div style={{ color: COLORS.textMuted, lineHeight: 1.5, marginBottom: 10 }}>
+                      Phone numbers can&apos;t receive reset links. If you verified an email on your account, enter it
+                      here. If you never did, contact support.
+                    </div>
+                  )}
+                  <input
+                    type="email"
+                    autoComplete="email"
+                    placeholder="Email on your account"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        void sendReset();
+                      }
+                    }}
+                    style={inputStyle}
+                  />
+                  {error && <div style={{ color: COLORS.red, marginBottom: 10 }}>{error}</div>}
+                  <button
+                    type="button"
+                    onClick={() => void sendReset()}
+                    disabled={busy || !email.trim()}
+                    style={{
+                      width: '100%',
+                      padding: '11px 0',
+                      borderRadius: 9,
+                      border: 'none',
+                      fontFamily: FONT,
+                      fontWeight: 700,
+                      fontSize: 13,
+                      cursor: busy || !email.trim() ? 'not-allowed' : 'pointer',
+                      background: busy || !email.trim() ? COLORS.border : COLORS.emerald,
+                      color: busy || !email.trim() ? COLORS.textMuted : '#ffffff',
+                      marginBottom: 12,
+                    }}
+                  >
+                    {busy ? 'Sending…' : 'Send reset link'}
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => switchMode('signin')}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  padding: 0,
+                  color: COLORS.emerald,
+                  fontFamily: FONT,
+                  fontSize: 12,
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  textDecoration: 'underline',
+                }}
+              >
+                Back to sign in
               </button>
             </div>
           ) : (
@@ -408,6 +524,62 @@ export function AuthModal({
                 onChange={(e) => setPassword(e.target.value)}
                 style={inputStyle}
               />
+
+              {!isSignup && failedAttempts >= WRONG_PASSWORD_PROMPT_AFTER && (
+                <div
+                  style={{
+                    background: 'rgba(211,50,31,0.08)',
+                    border: `1px solid ${COLORS.red}55`,
+                    borderRadius: 8,
+                    padding: '9px 11px',
+                    marginBottom: 10,
+                    fontFamily: FONT,
+                    fontSize: 12,
+                    lineHeight: 1.5,
+                    color: COLORS.textPrimary,
+                  }}
+                >
+                  Wrong password {failedAttempts} times.{' '}
+                  <button
+                    type="button"
+                    onClick={startReset}
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      padding: 0,
+                      color: COLORS.red,
+                      fontFamily: FONT,
+                      fontSize: 12,
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                      textDecoration: 'underline',
+                    }}
+                  >
+                    Reset your password
+                  </button>
+                </div>
+              )}
+              {!isSignup && (
+                <div style={{ textAlign: 'right', marginTop: -6, marginBottom: 12 }}>
+                  <button
+                    type="button"
+                    onClick={startReset}
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      padding: 0,
+                      color: COLORS.emerald,
+                      fontFamily: FONT,
+                      fontSize: 11.5,
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      textDecoration: 'underline',
+                    }}
+                  >
+                    Forgot password?
+                  </button>
+                </div>
+              )}
 
               {isSignup && (
                 <>
@@ -516,6 +688,142 @@ export function AuthModal({
           )}
         </form>
       </div>
+    </div>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// Shown after the user opens the emailed reset link (Supabase signs them in
+// with a recovery session and fires PASSWORD_RECOVERY — see page.tsx).
+// ---------------------------------------------------------------------------
+export function NewPasswordModal({ onClose }: { onClose: () => void }) {
+  const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      setError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+      return;
+    }
+    if (password !== confirm) {
+      setError('The two passwords do not match.');
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    const { error: updateErr } = await supabase.auth.updateUser({ password });
+    setBusy(false);
+    if (updateErr) {
+      setError(updateErr.message);
+      return;
+    }
+    setDone(true);
+  }
+
+  const can = !!password && !!confirm && !busy;
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.8)',
+        zIndex: 50,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 20,
+      }}
+    >
+      <form
+        onSubmit={handleSubmit}
+        style={{
+          width: '100%',
+          maxWidth: 380,
+          background: COLORS.surface,
+          border: `1px solid ${COLORS.hairline}`,
+          borderRadius: 14,
+          padding: 22,
+          boxShadow: '0 20px 60px -20px rgba(0,0,0,0.6)',
+        }}
+      >
+        <h2 style={{ fontFamily: FONT, fontSize: 18, fontWeight: 800, color: COLORS.textPrimary, margin: '0 0 4px' }}>
+          Choose a new password
+        </h2>
+        {done ? (
+          <>
+            <p style={{ fontFamily: FONT, fontSize: 13, color: COLORS.emerald, lineHeight: 1.5, margin: '8px 0 14px' }}>
+              Your password has been changed. You&apos;re signed in.
+            </p>
+            <button
+              type="button"
+              onClick={onClose}
+              style={{
+                width: '100%',
+                padding: '11px 0',
+                borderRadius: 9,
+                border: 'none',
+                background: COLORS.emerald,
+                color: '#ffffff',
+                fontFamily: FONT,
+                fontWeight: 700,
+                fontSize: 13,
+                cursor: 'pointer',
+              }}
+            >
+              Continue
+            </button>
+          </>
+        ) : (
+          <>
+            <p style={{ fontFamily: FONT, fontSize: 12, color: COLORS.textMuted, margin: '0 0 16px', lineHeight: 1.5 }}>
+              Enter a new password for your Odd Saint account.
+            </p>
+            <input
+              type="password"
+              required
+              autoComplete="new-password"
+              placeholder={`New password (min ${MIN_PASSWORD_LENGTH} characters)`}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              style={inputStyle}
+            />
+            <input
+              type="password"
+              required
+              autoComplete="new-password"
+              placeholder="Repeat new password"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+              style={inputStyle}
+            />
+            {error && <div style={{ fontFamily: FONT, fontSize: 12, color: COLORS.red, marginBottom: 10 }}>{error}</div>}
+            <button
+              type="submit"
+              disabled={!can}
+              style={{
+                width: '100%',
+                padding: '11px 0',
+                borderRadius: 9,
+                border: 'none',
+                fontFamily: FONT,
+                fontWeight: 700,
+                fontSize: 13,
+                cursor: can ? 'pointer' : 'not-allowed',
+                background: can ? COLORS.emerald : COLORS.border,
+                color: can ? '#ffffff' : COLORS.textMuted,
+              }}
+            >
+              {busy ? 'Saving…' : 'Save new password'}
+            </button>
+          </>
+        )}
+      </form>
     </div>
   );
 }
