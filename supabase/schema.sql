@@ -197,6 +197,9 @@ create table if not exists admins (
 );
 
 grant select on admins to authenticated;
+-- Server-side scripts (e.g. suspend-unverified-phone-accounts.mjs) read admins with the service-role key;
+-- without this grant they fail with 42501 "permission denied for table admins".
+grant select on admins to service_role;
 alter table admins enable row level security;
 drop policy if exists "authenticated can read admins" on admins;
 create policy "authenticated can read admins" on admins for select to authenticated using (true);
