@@ -65,8 +65,8 @@
 // ---------------------------------------------------------------------------
 import { getFixturesForDate } from './lib/apiFootball.mjs';
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
-import { isAmateurOrYouthLeague } from './lib/leagueQuality.mjs';
-import { isWomensCompetition } from './lib/womensLeagueFilter.mjs';
+import { isYouthOrReserveTeam } from './lib/leagueQuality.mjs';
+import { classifyLeague } from './lib/leaguePolicy.mjs';
 import { getOwnModelForFixture, DEFAULT_MIN_SAMPLE_MATCHES } from './lib/teamModel.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -106,7 +106,14 @@ function loadLeagueAllowlist() {
   return DEFAULT_LEAGUE_ALLOWLIST;
 }
 
-const LEAGUE_ALLOWLIST = loadLeagueAllowlist();
+// League eligibility now follows scripts/lib/leaguePolicy.mjs (same as tickets).
+function leagueOk(f) {
+  const c = classifyLeague({ name: f.league?.name, country: f.league?.country });
+  if (!c.allowed) return false;
+  if (!c.allowYouthTeams &&
+      (isYouthOrReserveTeam(f.teams?.home?.name) || isYouthOrReserveTeam(f.teams?.away?.name))) return false;
+  return true;
+}
 
 // Mirrors EXCLUDED_TEAMS in generate-tickets.mjs — same integrity-driven
 // business decision, applied here too since it should hold everywhere the
@@ -171,9 +178,7 @@ async function main() {
 
   const eligible = fixtures.filter(
     (f) =>
-      LEAGUE_ALLOWLIST.has(f.league?.id) &&
-      !isAmateurOrYouthLeague(f.league?.name) &&
-      !isWomensCompetition(f.league?.name) &&
+      leagueOk(f) &&
       !isExcluded(f.teams?.home?.name, f.teams?.away?.name) &&
       hasMinimumLeadTime(f.fixture?.date, now)
   );
