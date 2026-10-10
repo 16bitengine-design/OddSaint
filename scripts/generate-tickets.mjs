@@ -37,6 +37,9 @@
 //            <= 1 of each team's last 5). Never relaxed.
 //   MARKETS: direct win (Home/Away Win) and Over goals (1.5 / 2.5 / 3.5) ONLY, on
 //            every ticket. Double Chance, BTTS and Under markets are dropped.
+//   Direct wins are only allowed in domestic leagues up to the 3rd division for the top-ten
+//            European countries and up to the 2nd division elsewhere (leaguePolicy.mjs,
+//            directWinAllowedForLeague); cups / continental competitions are unaffected. Never relaxed.
 //   Any other market (Mega/Duo only): no rank/form requirement.
 //   Mega Day: any market, EXACTLY 3 matches, cumulative odds >= 1.97 (floor never
 //            relaxes; NO ceiling — going above the displayed 3 is fine).
@@ -54,7 +57,7 @@ import { getFixturesForDate, getOddsForFixture, getStandings, getFixturesForTeam
 import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { collectViableOutcomes, FULL_WIN_MARKETS } from './lib/markets.mjs';
 import { isYouthOrReserveTeam } from './lib/leagueQuality.mjs';
-import { classifyLeague } from './lib/leaguePolicy.mjs';
+import { classifyLeague, directWinAllowedForLeague } from './lib/leaguePolicy.mjs';
 import { evaluateGoalsMarket } from './lib/goalsQuality.mjs';
 import { getOwnModelForFixture } from './lib/teamModel.mjs';
 import { fileURLToPath } from 'node:url';
@@ -422,6 +425,7 @@ function marketAllowedAt(outcome, p, level, saintsLockOnly) {
   if (!TICKET_MARKETS.has(outcome.market)) return false; // direct wins and Over goals only
   if (GOALS_MARKETS.has(outcome.market)) return goalsVerdict(outcome, p, level).ok; // never bypassed, even at last resort
   if (outcome.market === 'Home Win' || outcome.market === 'Away Win') {
+    if (p.directWinOk === false) return false; // division cap for direct wins — never relaxed, even at last resort
     const side = outcome.market === 'Home Win' ? 'home' : 'away';
     if (winPasses(p.win, level) && p.win.favoured === side) return true;
     return !level.requireStandings && isMarketFavourite(outcome, p);
@@ -510,10 +514,13 @@ async function priceFixture(oddsResponse, f) {
     .filter((o) => TICKET_MARKETS.has(o.market)); // direct wins and Over goals only
   if (viable.length === 0) return null;
 
-  const win = viable.some((o) => FULL_WIN_MARKETS.has(o.market)) ? await winMetrics(f) : null;
+  // Direct wins only in the divisions the league policy allows for them (top-ten European
+  // countries: up to 3rd division; everywhere else: up to 2nd). Never relaxed.
+  const directWinOk = directWinAllowedForLeague(f.league);
+  const win = directWinOk && viable.some((o) => FULL_WIN_MARKETS.has(o.market)) ? await winMetrics(f) : null;
   const goals = viable.some((o) => GOALS_MARKETS.has(o.market) || o.market.startsWith('BTTS')) ? await goalMetrics(f) : null;
   const model = viable.some((o) => GOALS_MARKETS.has(o.market)) ? await modelFor(f) : null;
-  return { viable, win, goals, model };
+  return { viable, win, goals, model, directWinOk };
 }
 
 /**
@@ -616,6 +623,7 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
             win: priced.win,
             goals: priced.goals,
             model: priced.model,
+            directWinOk: priced.directWinOk,
           });
           leagueBreakdown.set(leagueName, (leagueBreakdown.get(leagueName) ?? 0) + 1);
         }
