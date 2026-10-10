@@ -130,6 +130,28 @@ export const TOP_EUROPEAN_COUNTRIES = new Set([
   'cyprus', 'croatia', 'sweden',
 ]);
 
+// DIRECT WINS (Home Win / Away Win) are riskier in lower divisions — teams there often have
+// little to play for — so a direct-win leg is only allowed in DOMESTIC LEAGUES up to division
+// 3 for the top-ten European countries below, and up to division 2 everywhere else. Cups and
+// continental / regional competitions are not division-ranked and are unaffected. Over-goals
+// markets are unaffected too. (The top ten are the first ten of the list above — edit to change.)
+export const TOP_TEN_EUROPEAN_COUNTRIES = new Set([
+  'england', 'spain', 'italy', 'germany', 'france', 'netherlands', 'portugal', 'belgium', 'turkey', 'scotland',
+]);
+export const DIRECT_WIN_MAX_DIVISION_TOP_TEN = 3;
+export const DIRECT_WIN_MAX_DIVISION_OTHER = 2;
+
+/** Is a direct win (Home/Away Win) permitted for a fixture in this league? Input: an API-Football `league` object. */
+export function directWinAllowedForLeague(league) {
+  const verdict = classifyLeague(league);
+  if (!verdict.allowed) return false;
+  if (verdict.kind !== 'domestic') return true; // cups, continental, friendlies: no division ranking
+  const cap = TOP_TEN_EUROPEAN_COUNTRIES.has(countryKey(league?.country))
+    ? DIRECT_WIN_MAX_DIVISION_TOP_TEN
+    : DIRECT_WIN_MAX_DIVISION_OTHER;
+  return verdict.division <= cap;
+}
+
 // A competition NAME that is a domestic cup / super cup (accents already stripped)...
 const CUP_NAME = /\b(cup|cupen|copa|coppa|pokal|pokalen|taca|coupe|beker|puchar|kupa|cupa|shield|schaal|trophee|supercup|supercopa|supercoppa|supertaca)\b/i;
 // ...unless it is a youth / women's / amateur / lower-league or "trophy" competition.
