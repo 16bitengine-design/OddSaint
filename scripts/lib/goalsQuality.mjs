@@ -142,7 +142,7 @@ function summarise(matches, venue, line) {
  *                                    [{ goalsFor, goalsAgainst, venue: 'home'|'away' }]
  * @returns {{ ok: boolean, reasons: string[], qualityScore: number|null }}
  *   reasons lists every failed check (empty when ok) — log it so rejected
- *   fixtures are explainable. qualityScore (0-1) ranks passing candidates.
+ *   fixtures are explainable. qualityScore (0-1, form-based, price-independent) ranks passing candidates.
  */
 export function evaluateGoalsMarket({ fixture, market, fairProb, model, history, level = 'strict' }) {
   if (!isSupportedGoalsMarket(market)) {
@@ -218,8 +218,11 @@ export function evaluateGoalsMarket({ fixture, market, fairProb, model, history,
 
   if (reasons.length > 0) return { ok: false, reasons, qualityScore: null };
 
-  // Passing candidates are ranked: market + model probability dominate, form-based goal volume breaks ties.
-  const volume = Math.min(1, ((home.avgTotal + away.avgTotal) / 2) / 4);
-  const qualityScore = 0.4 * fairProb + 0.4 * (typeof modelProb === 'number' ? modelProb : fairProb) + 0.2 * volume;
+  // Passing candidates are ranked by FORM only (how often both teams' recent matches cleared
+  // this line, and how much goal volume they carry). Price is deliberately NOT part of the
+  // score: it would always favour the shortest-odds market (Over 1.5) over Over 2.5.
+  const overRate = (home.overCount + away.overCount) / (2 * SAMPLE_SIZE);
+  const volume = Math.min(1, ((home.avgTotal + away.avgTotal) / 2) / (rule.line + 2));
+  const qualityScore = 0.5 * overRate + 0.5 * volume;
   return { ok: true, reasons: [], qualityScore };
 }

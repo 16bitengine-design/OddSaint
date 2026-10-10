@@ -38,9 +38,12 @@
 //   MARKETS: direct win (Home/Away Win) and Over goals (1.5 / 2.5 / 3.5) ONLY, on
 //            every ticket. Double Chance, BTTS and Under markets are dropped.
 //   Any other market (Mega/Duo only): no rank/form requirement.
-//   Mega Day: any market, EXACTLY 3 matches, cumulative odds in [1.97, 3]
-//            (range and floor never relax).
-//   Duo: any market, exactly 2 legs, cumulative odds in [2, 4] (never relaxed).
+//   Mega Day: any market, EXACTLY 3 matches, cumulative odds >= 1.97 (floor never
+//            relaxes; NO ceiling — going above the displayed 3 is fine).
+//   Duo: any market, exactly 2 legs, cumulative odds >= 2 (floor never relaxes; NO
+//            ceiling — going above the displayed 4 is fine).
+//   Markets are NOT chosen by price: every allowed market of a fixture is a candidate
+//            leg; combinations are ranked by rule quality, not by cheapest odds.
 //   Saint's Lock: ONE match; market must be a direct win or Over 2.5 Goals
 //            (never Double Chance); odds 1.5-2.17. These two are NEVER relaxed.
 //
@@ -147,7 +150,9 @@ const SAINTS_LOCK_MARKETS = new Set(['Home Win', 'Away Win', 'Over 2.5 Goals']);
 const BASE_LEVEL = {
   dcMaxOdds: 1.3,
   minConf: { mega: 68, duo: 58 },
-  oddsRange: { mega: [1.97, 3], duo: [2, 4] },
+  // Cumulative odds: the FLOOR is hard (never below it); there is NO ceiling — a total above the
+  // nominal 3 / 4 is fine. Infinity = no cap.
+  oddsRange: { mega: [1.97, Infinity], duo: [2, Infinity] },
   oddsFloor: { mega: 1.97, duo: 1.97 },
   requireStandings: true,
 };
@@ -680,9 +685,12 @@ function compatibleMarket(fixtureId, market, existingMarkets, chosenMarket) {
 }
 
 /**
- * Candidate legs for Mega / Duo at one relaxation level. Mega offers each
- * fixture's safest allowed market; Duo offers EVERY allowed market (a pair
- * needs a product >= 2, which the safest markets alone rarely reach).
+ * Candidate legs for Mega / Duo at one relaxation level. EVERY allowed market of a
+ * fixture is offered (never just the cheapest one); pickCombo ranks the resulting
+ * combinations. The odds-derived confidence floor and Mega's per-leg odds cap guard
+ * the win markets; Over 1.5 / 2.5 legs are already held to the goals-quality gate's
+ * own probability floors, so they are exempt (otherwise Over 2.5 prices would be
+ * filtered out purely for being longer than Over 1.5).
  */
 function poolAtLevel(dailyPool, tier, level, existingMarkets, chosenMarket) {
   const minConf = level.minConf[tier] ?? 0;
@@ -691,20 +699,16 @@ function poolAtLevel(dailyPool, tier, level, existingMarkets, chosenMarket) {
     const allowed = allowedOutcomesAt(p, level, false).filter((o) =>
       compatibleMarket(p.fixtureId, o.market, existingMarkets, chosenMarket)
     );
-    if (allowed.length === 0) continue;
     const penalty = opponentPenaltyAt(p, level);
-    const make = (o) => ({ ...p, market: o.market, odds: o.odds, confidence: impliedConfidence(o.odds), opponentPenalty: penalty, quality: qualityOf(o, p, level) });
-
-    if (tier === 'duo') {
-      allowed.forEach((o) => {
-        const c = make(o);
-        if (c.confidence >= minConf) out.push(c);
-      });
-    } else {
-      const preferred = allowed.filter((o) => !AVOIDED_MARKETS.has(o.market));
-      const basePool = preferred.length > 0 ? preferred : allowed; // BTTS only if nothing else is allowed
-      const base = make([...basePool].sort((a, b) => a.odds - b.odds)[0]); // the safest of those
-      if (base.confidence >= minConf && (!SMALL_TICKET_TIERS.has(tier) || base.odds <= SMALL_TICKET_MAX_ODDS)) out.push(base);
+    const hasOver25 = allowed.some((o) => o.market === 'Over 2.5 Goals');
+    for (const o of allowed) {
+      // A fixture that qualifies for Over 2.5 never also offers the weaker Over 1.5 leg.
+      if (o.market === 'Over 1.5 Goals' && hasOver25) continue;
+      const c = { ...p, market: o.market, odds: o.odds, confidence: impliedConfidence(o.odds), opponentPenalty: penalty, quality: qualityOf(o, p, level) };
+      const goalsLeg = GOALS_MARKETS.has(o.market);
+      if (!goalsLeg && c.confidence < minConf) continue;
+      if (!goalsLeg && SMALL_TICKET_TIERS.has(tier) && c.odds > SMALL_TICKET_MAX_ODDS) continue;
+      out.push(c);
     }
   }
   return out;
@@ -712,13 +716,13 @@ function poolAtLevel(dailyPool, tier, level, existingMarkets, chosenMarket) {
 
 /**
  * Picks EXACTLY `k` different fixtures whose cumulative odds land inside
- * targetRange (lower bound is a hard floor, upper bound a hard cap). Used for
+ * targetRange (lower bound is a hard floor; the upper bound is Infinity = no ceiling). Used for
  * Mega Day (k = 3) and Duo (k = 2). Among valid combinations, prefers:
  *   (1) fewer both-teams-to-score legs (avoided where possible),
  *   (2) fewer weak-opponent warnings (opponentPenalty, a preference only),
  *   (3) less-reused fixtures,
  *   (4) for Mega, a combination that includes an outright win leg, where one exists,
- *   (5) the lowest total odds (the safest valid combination).
+ *   (5) higher goals-quality, then the lowest total odds among otherwise-equal combinations.
  * Candidates are capped to MAX_COMBO_CANDIDATES so the search stays small.
  */
 const MAX_COMBO_CANDIDATES = 80;
@@ -729,7 +733,7 @@ function pickCombo(pool, k, usageCount, targetRange, preferFullWin = false) {
 
   const candidates = pool
     .filter((f) => usage(f) < MAX_FIXTURE_APPEARANCES_PER_DAY)
-    .sort((a, b) => avoidedOf(a) - avoidedOf(b) || usage(a) - usage(b) || penaltyOf(a) - penaltyOf(b) || a.odds - b.odds)
+    .sort((a, b) => avoidedOf(a) - avoidedOf(b) || usage(a) - usage(b) || penaltyOf(a) - penaltyOf(b) || qualityScoreOf(b) - qualityScoreOf(a) || a.odds - b.odds)
     .slice(0, MAX_COMBO_CANDIDATES);
 
   let best = null;
@@ -737,7 +741,7 @@ function pickCombo(pool, k, usageCount, targetRange, preferFullWin = false) {
 
   function search(startIdx, product) {
     if (chosen.length === k) {
-      if (product < minTotal || product > maxTotal) return;
+      if (product < minTotal || product > maxTotal) return; // maxTotal may be Infinity (no ceiling)
       const score = [
         chosen.reduce((n, f) => n + avoidedOf(f), 0), // fewest both-teams-to-score legs first
         chosen.reduce((n, f) => n + penaltyOf(f), 0),
@@ -759,7 +763,7 @@ function pickCombo(pool, k, usageCount, targetRange, preferFullWin = false) {
       const f = candidates[i];
       if (chosen.some((c) => c.fixtureId === f.fixtureId)) continue; // different matches only
       const next = product * f.odds;
-      if (next > maxTotal) continue; // odds >= 1, so the product only grows
+      if (next > maxTotal) continue; // no-op while maxTotal is Infinity
       chosen.push(f);
       search(i + 1, next);
       chosen.pop();
