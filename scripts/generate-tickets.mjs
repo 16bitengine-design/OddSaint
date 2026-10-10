@@ -167,7 +167,9 @@ const OPPONENT_MAX_WINS_LAST_5 = 2; // opponent (preference only)
 
 const SMALL_TICKET_TIERS = new Set(['mega']);
 const SMALL_TICKET_MAX_ODDS = 1.77;
-const MAX_FIXTURE_APPEARANCES_PER_DAY = 3;
+// A match appears on AT MOST ONE ticket per day: not twice within a batch, and never again in a
+// later batch (see fetchTodaysUsedFixtureIds, which removes earlier batches' matches from the pool).
+const MAX_FIXTURE_APPEARANCES_PER_DAY = 1;
 
 const MAX_TICKETS_PER_CATEGORY = 2;
 const MIN_HOURS_BETWEEN_SLOTS = 5; // runs are 6h apart (03:00 and 09:00 UTC); 5 leaves room for GitHub start-up jitter
@@ -220,20 +222,13 @@ function nextSlotFor(maxSlipsToday, slipState) {
   return state.count;
 }
 
-/** Fixture IDs already used by today's Saint's Lock tickets — slot 1 must never repeat slot 0's match. */
-async function fetchTodaysSaintsLockFixtureIds(supabase, today) {
-  const { data: tix, error } = await supabase
-    .from('tickets')
-    .select('id')
-    .eq('ticket_date', today)
-    .eq('tier', 'saints_lock');
+/** Fixture IDs already used by ANY of today's tickets (every tier, every earlier batch) — a later batch must never reuse them. */
+async function fetchTodaysUsedFixtureIds(supabase, today) {
+  const { data: tix, error } = await supabase.from('tickets').select('id').eq('ticket_date', today);
   if (error) throw error;
   const ids = (tix ?? []).map((t) => t.id);
   if (ids.length === 0) return new Set();
-  const { data: links, error: linksErr } = await supabase
-    .from('ticket_matches')
-    .select('fixture_id')
-    .in('ticket_id', ids);
+  const { data: links, error: linksErr } = await supabase.from('ticket_matches').select('fixture_id').in('ticket_id', ids);
   if (linksErr) throw linksErr;
   return new Set((links ?? []).map((l) => l.fixture_id));
 }
@@ -947,9 +942,13 @@ async function main() {
 
   const existingMarkets = await fetchExistingMarkets(supabase, dailyPool.map((p) => p.fixtureId));
 
-  const excludeFromSaintsLock = await fetchTodaysSaintsLockFixtureIds(supabase, todayStr);
+  const alreadyUsed = await fetchTodaysUsedFixtureIds(supabase, todayStr);
+  const freshPool = dailyPool.filter((p) => !alreadyUsed.has(p.fixtureId));
+  if (freshPool.length < dailyPool.length) {
+    console.log(`Excluded ${dailyPool.length - freshPool.length} fixture(s) already used by earlier batches today.`);
+  }
 
-  const { tickets, ticketMatches, fixturesUsed } = buildTickets(dailyPool, slipState, today, excludeFromSaintsLock, existingMarkets);
+  const { tickets, ticketMatches, fixturesUsed } = buildTickets(freshPool, slipState, today, new Set(), existingMarkets);
 
   if (tickets.length === 0) {
     console.warn('No tickets could be assembled this run — nothing written.');
