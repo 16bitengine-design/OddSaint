@@ -48,7 +48,7 @@ const L = (d, re, youth = false) => ({ d, re, youth });
 const COUNTRY_POLICY = {
   // --- England: up to division 5, U21 league as level 6 ----------------------
   england: [
-    L(1, /^Premier League$/i), L(2, /^Championship$/i), L(3, /^League One$/i), L(4, /^League Two$/i),
+    L(1, /^(English )?Premier League$/i), L(2, /^(EFL )?Championship$/i), L(3, /^(EFL )?League (One|1)$/i), L(4, /^(EFL )?League (Two|2)$/i),
     L(5, /^National League( - Play-offs)?$/i),
     L(6, /^National League - South( - Play-offs)?$/i), // added by product decision (National League North is NOT included)
     L(6, /^Premier League 2/i, true), L(6, /^Professional Development League$/i, true),
