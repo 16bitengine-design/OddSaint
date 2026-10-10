@@ -23,8 +23,12 @@
 //            AND have >= minWins wins in its last 5 league matches (strict
 //            level: 6 places, 3 wins). The opponent having <= 2 wins is
 //            PREFERRED, not required (see opponentPenalty).
-//   Over 2.5 Goals, any ticket: BOTH teams must average >= minAvgGoals goals
-//            scored over their last 5 finished matches (strict: 2.0).
+//   Over goals (1.5 / 2.5), any ticket: must pass the fixture-quality gate in
+//            scripts/lib/goalsQuality.mjs (market price, each team's last-5 goal
+//            volume / over-rate / scoring consistency, defensive leakiness at the
+//            relevant venue, Poisson-model veto when it has an opinion). Over 2.5
+//            keeps the product rule that EACH team averages >= 2.0 goals scored
+//            (looser on the relaxation ladder). Over 3.5 and Under are never used.
 //   Double Chance (Mega/Duo only): allowed only when its odds are <= 1.3
 //            (this cap is never relaxed).
 //   Both teams to score (BTTS Yes/No), Mega/Duo only: AVOIDED where possible; when
@@ -48,6 +52,8 @@ import { getSupabaseAdmin } from './lib/supabaseAdmin.mjs';
 import { collectViableOutcomes, FULL_WIN_MARKETS } from './lib/markets.mjs';
 import { isYouthOrReserveTeam } from './lib/leagueQuality.mjs';
 import { classifyLeague } from './lib/leaguePolicy.mjs';
+import { evaluateGoalsMarket } from './lib/goalsQuality.mjs';
+import { getOwnModelForFixture } from './lib/teamModel.mjs';
 import { fileURLToPath } from 'node:url';
 
 // --- Config -----------------------------------------------------------------
@@ -104,7 +110,14 @@ const TIER_CONFIG = [
 // other market (Double Chance, both-teams-to-score, Under goals ...) is dropped
 // at pricing time. The Double Chance cap / BTTS conditions below are therefore
 // dormant; to bring a market back, add it to TICKET_MARKETS.
-const TICKET_MARKETS = new Set(['Home Win', 'Away Win', 'Over 1.5 Goals', 'Over 2.5 Goals', 'Over 3.5 Goals']);
+// Over 3.5 is deliberately NOT here: its true probability is too low for these tickets
+// (see goalsQuality.mjs). Over 1.5 / 2.5 are further gated per fixture by goalsQuality.mjs.
+const TICKET_MARKETS = new Set(['Home Win', 'Away Win', 'Over 1.5 Goals', 'Over 2.5 Goals']);
+const GOALS_MARKETS = new Set(['Over 1.5 Goals', 'Over 2.5 Goals']);
+// The bookmaker's quoted odds include its margin; dividing implied probability by this
+// approximates the devigged probability the goals gate's floors are written against.
+// APPROXIMATION (single bookmaker, no Under price to devig against) — not a measured value.
+const ASSUMED_OVERROUND = 1.06;
 
 // Saint's Lock
 const SAINTS_LOCK_ODDS_MIN = 1.5;
@@ -118,7 +131,7 @@ const SAINTS_LOCK_MARKETS = new Set(['Home Win', 'Away Win', 'Over 2.5 Goals']);
 // Per level:
 //   minRankGap / minWins — direct win: backed team this many places above its
 //                          opponent, and this many wins in its last 5
-//   minAvgGoals          — Over 2.5: BOTH teams' average goals over last 5
+//   (goals markets)      — thresholds per level live in goalsQuality.mjs, same level names
 //   dcMaxOdds            — Double Chance price cap (null = no cap)
 //   minConf              — per-tier confidence floor (confidence = 100/odds)
 //   oddsRange / oddsFloor— per-tier cumulative-odds range and hard floor
@@ -128,7 +141,7 @@ const SAINTS_LOCK_MARKETS = new Set(['Home Win', 'Away Win', 'Over 2.5 Goals']);
 // win / Over 2.5 only) and odds band, the Double Chance cap (1.3), the Mega /
 // Duo cumulative-odds ranges and 1.97 floor, the per-tier confidence floors,
 // tier sizes (Mega 3, Duo 2), and the requirement that a win backs the
-// better-placed side. Only the rank gap, win count and goal average loosen.
+// better-placed side. Only the rank gap, win count and the goals-gate thresholds loosen.
 // (dcMaxOdds, minConf, oddsRange, oddsFloor and requireStandings are kept as
 // per-level fields so a looser level can be added later without code changes.)
 const BASE_LEVEL = {
@@ -139,10 +152,10 @@ const BASE_LEVEL = {
   requireStandings: true,
 };
 const RELAXATION_LEVELS = [
-  { ...BASE_LEVEL, name: 'strict', minRankGap: 6, minWins: 3, minAvgGoals: 2.0 },
-  { ...BASE_LEVEL, name: 'relaxed-1', minRankGap: 5, minWins: 3, minAvgGoals: 1.75 },
-  { ...BASE_LEVEL, name: 'relaxed-2', minRankGap: 4, minWins: 3, minAvgGoals: 1.5 },
-  { ...BASE_LEVEL, name: 'relaxed-3', minRankGap: 4, minWins: 2, minAvgGoals: 1.5 },
+  { ...BASE_LEVEL, name: 'strict', minRankGap: 6, minWins: 3 },
+  { ...BASE_LEVEL, name: 'relaxed-1', minRankGap: 5, minWins: 3 },
+  { ...BASE_LEVEL, name: 'relaxed-2', minRankGap: 4, minWins: 3 },
+  { ...BASE_LEVEL, name: 'relaxed-3', minRankGap: 4, minWins: 2 },
 ];
 const MIN_GAMES_PLAYED = 5; // early-season tables are meaningless
 const OPPONENT_MAX_WINS_LAST_5 = 2; // opponent (preference only)
@@ -236,7 +249,8 @@ async function fetchExistingMarkets(supabase, fixtureIds) {
 
 const FINISHED_STATUSES = new Set(['FT', 'AET', 'PEN']);
 const standingsCache = new Map(); // `${leagueId}-${season}` -> Map(teamId -> { rank, played, form }) | null
-const statsCache = new Map(); // teamId -> { avgGoals, bttsCount } over its last 5 finished matches, or null
+const statsCache = new Map(); // teamId -> { avgGoals, bttsCount, matches } (matches: newest-first last-10 rows) or null
+const HISTORY_FETCH = 10; // finished matches requested per team (the goals gate needs 5 overall + venue splits)
 
 /** League table for one league+season, cached for the run. Null if unavailable or multi-group (cups, conferences). */
 async function loadStandings(leagueId, season) {
@@ -289,14 +303,16 @@ async function winMetrics(f) {
 }
 
 /**
- * A team's last 5 finished matches (any competition): average goals scored,
- * and in how many of them BOTH sides scored. Null if fewer than 5 are available.
+ * A team's recent finished matches (any competition, newest first, up to
+ * HISTORY_FETCH): the last-5 average goals scored and both-teams-scored count
+ * (used by the BTTS rule) plus the raw rows for the goals-quality gate.
+ * Null if fewer than 5 finished matches are available.
  */
 async function last5Stats(teamId) {
   if (statsCache.has(teamId)) return statsCache.get(teamId);
   let stats = null;
   try {
-    const fixtures = await getFixturesForTeam(teamId, 5);
+    const fixtures = await getFixturesForTeam(teamId, HISTORY_FETCH);
     const rows = [];
     for (const m of fixtures ?? []) {
       if (!FINISHED_STATUSES.has(m.fixture?.status?.short)) continue;
@@ -304,12 +320,20 @@ async function last5Stats(teamId) {
       const ag = m.goals?.away;
       if (hg == null || ag == null) continue;
       const isHome = m.teams?.home?.id === teamId;
-      rows.push({ own: isHome ? hg : ag, opp: isHome ? ag : hg });
+      rows.push({
+        goalsFor: isHome ? hg : ag,
+        goalsAgainst: isHome ? ag : hg,
+        venue: isHome ? 'home' : 'away',
+        date: new Date(m.fixture?.date ?? 0).getTime(),
+      });
     }
-    if (rows.length === 5) {
+    rows.sort((x, y) => y.date - x.date); // newest first — don't rely on the API's ordering
+    if (rows.length >= 5) {
+      const last5 = rows.slice(0, 5);
       stats = {
-        avgGoals: rows.reduce((n, r) => n + r.own, 0) / 5,
-        bttsCount: rows.filter((r) => r.own > 0 && r.opp > 0).length,
+        avgGoals: last5.reduce((n, r) => n + r.goalsFor, 0) / 5,
+        bttsCount: last5.filter((r) => r.goalsFor > 0 && r.goalsAgainst > 0).length,
+        matches: rows,
       };
     }
   } catch (err) {
@@ -327,6 +351,7 @@ async function goalMetrics(f) {
     away: a?.avgGoals ?? null,
     homeBtts: h?.bttsCount ?? null,
     awayBtts: a?.bttsCount ?? null,
+    history: { home: h?.matches ?? [], away: a?.matches ?? [] }, // for goalsQuality.mjs
   };
 }
 
@@ -335,9 +360,30 @@ function winPasses(win, level) {
   return !!win && win.gap >= level.minRankGap && win.backedWins !== null && win.backedWins >= level.minWins;
 }
 
-/** Over 2.5 rule at a given level: BOTH teams must average at least level.minAvgGoals. */
-function over25Passes(goals, level) {
-  return !!goals && goals.home !== null && goals.away !== null && goals.home >= level.minAvgGoals && goals.away >= level.minAvgGoals;
+/**
+ * Over 1.5 / Over 2.5 at a given level: the fixture must pass the goals-quality gate
+ * (scripts/lib/goalsQuality.mjs). The verdict is memoised per fixture + market + level;
+ * a failing verdict's reasons are kept for the run log. Returns { ok, qualityScore }.
+ */
+function goalsVerdict(outcome, p, level) {
+  const key = `${outcome.market}|${level.name}`;
+  if (p.goalsVerdicts?.has(key)) return p.goalsVerdicts.get(key);
+  let verdict;
+  if (!p.goals || !p.goals.history) {
+    verdict = { ok: false, reasons: ['no recent-match history'], qualityScore: null };
+  } else {
+    verdict = evaluateGoalsMarket({
+      fixture: { homeTeam: p.homeTeam, awayTeam: p.awayTeam },
+      market: outcome.market,
+      fairProb: 1 / outcome.odds / ASSUMED_OVERROUND,
+      model: p.model,
+      history: p.goals.history,
+      level: level.name,
+    });
+  }
+  if (!p.goalsVerdicts) p.goalsVerdicts = new Map();
+  p.goalsVerdicts.set(key, verdict);
+  return verdict;
 }
 
 // BOTH-TEAMS-TO-SCORE is a tricky market, so it is AVOIDED WHERE POSSIBLE (see
@@ -367,15 +413,14 @@ function isMarketFavourite(outcome, p) {
 /**
  * Is this outcome allowed for this fixture at this level? Wins need winPasses
  * AND must back the better-placed side (or, at last resort, the bookmaker's
- * favourite). Over 2.5 needs over25Passes (or no data requirement at last
- * resort). Double Chance only at odds <= level.dcMaxOdds when a cap exists
+ * favourite). Over 1.5 / 2.5 need the goals-quality gate (goalsVerdict). Double Chance only at odds <= level.dcMaxOdds when a cap exists
  * (never on Saint's Lock). Both-teams-to-score only under the BTTS conditions
  * above (never on Saint's Lock). Other markets are unrestricted on Mega/Duo
  * and forbidden for Saint's Lock.
  */
 function marketAllowedAt(outcome, p, level, saintsLockOnly) {
   if (!TICKET_MARKETS.has(outcome.market)) return false; // direct wins and Over goals only
-  if (outcome.market === 'Over 2.5 Goals') return over25Passes(p.goals, level) || !level.requireStandings;
+  if (GOALS_MARKETS.has(outcome.market)) return goalsVerdict(outcome, p, level).ok; // never bypassed, even at last resort
   if (outcome.market === 'Home Win' || outcome.market === 'Away Win') {
     const side = outcome.market === 'Home Win' ? 'home' : 'away';
     if (winPasses(p.win, level) && p.win.favoured === side) return true;
@@ -428,6 +473,25 @@ function impliedConfidence(odds) {
   return Math.min(95, Math.max(55, raw));
 }
 
+let modelClient = null;
+/** Poisson model opinion for a fixture (null when unavailable — the gate treats that as "no veto", not as a pass signal of its own). */
+async function modelFor(f) {
+  try {
+    modelClient ??= getSupabaseAdmin();
+    const res = await getOwnModelForFixture(modelClient, {
+      league: f.league?.name,
+      homeTeamId: f.teams?.home?.id,
+      awayTeamId: f.teams?.away?.id,
+      homeTeamName: f.teams?.home?.name,
+      awayTeamName: f.teams?.away?.name,
+    });
+    return res?.available ? res : null;
+  } catch (err) {
+    console.warn(`Model lookup failed for fixture ${f.fixture?.id}:`, err.message);
+    return null;
+  }
+}
+
 /**
  * Reads a fixture's bookmaker odds and gathers EVERYTHING the ladder needs
  * once, so relaxing a rule later costs no extra API requests: every viable
@@ -447,8 +511,9 @@ async function priceFixture(oddsResponse, f) {
   if (viable.length === 0) return null;
 
   const win = viable.some((o) => FULL_WIN_MARKETS.has(o.market)) ? await winMetrics(f) : null;
-  const goals = viable.some((o) => o.market === 'Over 2.5 Goals' || o.market.startsWith('BTTS')) ? await goalMetrics(f) : null;
-  return { viable, win, goals };
+  const goals = viable.some((o) => GOALS_MARKETS.has(o.market) || o.market.startsWith('BTTS')) ? await goalMetrics(f) : null;
+  const model = viable.some((o) => GOALS_MARKETS.has(o.market)) ? await modelFor(f) : null;
+  return { viable, win, goals, model };
 }
 
 /**
@@ -550,6 +615,7 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
             viable: priced.viable,
             win: priced.win,
             goals: priced.goals,
+            model: priced.model,
           });
           leagueBreakdown.set(leagueName, (leagueBreakdown.get(leagueName) ?? 0) + 1);
         }
@@ -584,6 +650,11 @@ function computeTotalOdds(picks) {
   return Math.round(computeRawOdds(picks) * 100) / 100;
 }
 const penaltyOf = (f) => f.opponentPenalty ?? 0;
+/** Goals-quality score (0-1) of a passing Over pick; 0 for non-goals markets. Used only to rank among already-valid candidates. */
+function qualityOf(outcome, p, level) {
+  return GOALS_MARKETS.has(outcome.market) ? goalsVerdict(outcome, p, level).qualityScore ?? 0 : 0;
+}
+const qualityScoreOf = (f) => f.quality ?? 0;
 
 // AVOID WHERE POSSIBLE (a preference, not an exclusion): both teams to score.
 // A combination without a BTTS leg always beats one with a BTTS leg; BTTS is
@@ -622,7 +693,7 @@ function poolAtLevel(dailyPool, tier, level, existingMarkets, chosenMarket) {
     );
     if (allowed.length === 0) continue;
     const penalty = opponentPenaltyAt(p, level);
-    const make = (o) => ({ ...p, market: o.market, odds: o.odds, confidence: impliedConfidence(o.odds), opponentPenalty: penalty });
+    const make = (o) => ({ ...p, market: o.market, odds: o.odds, confidence: impliedConfidence(o.odds), opponentPenalty: penalty, quality: qualityOf(o, p, level) });
 
     if (tier === 'duo') {
       allowed.forEach((o) => {
@@ -672,6 +743,7 @@ function pickCombo(pool, k, usageCount, targetRange, preferFullWin = false) {
         chosen.reduce((n, f) => n + penaltyOf(f), 0),
         chosen.reduce((n, f) => n + usage(f), 0),
         preferFullWin && chosen.some((f) => FULL_WIN_MARKETS.has(f.market)) ? 0 : preferFullWin ? 1 : 0,
+        -chosen.reduce((n, f) => n + qualityScoreOf(f), 0), // higher goals-quality first
         product,
       ];
       const better =
@@ -712,9 +784,9 @@ function saintsLockCandidates(dailyPool, level, usageCount, excludeFixtureIds, e
             o.odds <= SAINTS_LOCK_ODDS_MAX &&
             (!existingMarkets.has(p.fixtureId) || existingMarkets.get(p.fixtureId) === o.market)
         )
-        .map((o) => ({ ...p, market: o.market, odds: o.odds, confidence: impliedConfidence(o.odds), opponentPenalty: penalty }));
+        .map((o) => ({ ...p, market: o.market, odds: o.odds, confidence: impliedConfidence(o.odds), opponentPenalty: penalty, quality: qualityOf(o, p, level) }));
     })
-    .sort((a, b) => (a.friendly ? 1 : 0) - (b.friendly ? 1 : 0) || penaltyOf(a) - penaltyOf(b) || a.odds - b.odds);
+    .sort((a, b) => (a.friendly ? 1 : 0) - (b.friendly ? 1 : 0) || penaltyOf(a) - penaltyOf(b) || qualityScoreOf(b) - qualityScoreOf(a) || a.odds - b.odds);
 }
 
 /**
