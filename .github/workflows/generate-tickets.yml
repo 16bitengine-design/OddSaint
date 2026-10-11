@@ -1,8 +1,8 @@
 name: Odd Saint — Generate Daily Tickets
 
-# Tickets are generated ahead of their fixed release times (04:00 and 10:00 UTC =
-# 07:00 and 13:00 EAT; see RELEASE_SLOT_HOURS_UTC in scripts/generate-tickets.mjs), so
-# a late GitHub start still releases on time.
+# Tickets are generated ahead of their fixed release times (03:00 and 09:00 UTC =
+# 06:00 and 12:00 EAT; see RELEASE_SLOT_HOURS_UTC in scripts/generate-tickets.mjs and
+# src/lib/dataFetcher.ts), so a late GitHub start still releases on time.
 #
 # WHY SO MANY CRON LINES: GitHub's scheduled runs are best-effort — they are often
 # delayed by hours at busy times (top of the hour is the worst) and are occasionally
@@ -10,17 +10,17 @@ name: Odd Saint — Generate Daily Tickets
 # The script is safe to run repeatedly: it skips a tier that already has today's slot
 # filled or whose last batch is under MIN_HOURS_BETWEEN_SLOTS (5h) old, so a retry that
 # isn't needed does nothing. No manual runs should be necessary.
-#   Slot 0 (released 04:00 UTC): 02:13 primary, retries 03:43 and 05:13
-#   Slot 1 (released 10:00 UTC): 08:23 primary, retries 09:53 and 11:23
+#   Slot 0 (released 03:00 UTC): 00:13 primary, retries 01:43 and 03:13
+#   Slot 1 (released 09:00 UTC): 06:23 primary, retries 07:53 and 09:23
 # Can still be triggered manually (workflow_dispatch) if ever wanted.
 on:
   schedule:
-    - cron: '13 2 * * *'
-    - cron: '43 3 * * *'
-    - cron: '13 5 * * *'
-    - cron: '23 8 * * *'
-    - cron: '53 9 * * *'
-    - cron: '23 11 * * *'
+    - cron: '13 0 * * *'
+    - cron: '43 1 * * *'
+    - cron: '13 3 * * *'
+    - cron: '23 6 * * *'
+    - cron: '53 7 * * *'
+    - cron: '23 9 * * *'
   workflow_dispatch: {}
 
 # Never run two generations at once (a retry must wait for the one in progress).
