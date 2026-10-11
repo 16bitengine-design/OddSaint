@@ -107,14 +107,13 @@ const LEGACY_TIER_ORDER = Object.keys(LEGACY_TIER_LABELS);
 /**
  * Availability hours (UTC) — when each day's release slot actually
  * becomes ACCESSIBLE to users, not when the pipeline runs. Generation
- * itself runs at 03:00 and 09:00 UTC (06:00 and 12:00 EAT — see
- * .github/workflows/generate-tickets.yml); tickets are then held back for
- * AVAILABILITY_DELAY_MS (1 hour, see scripts/generate-tickets.mjs) before
- * being shown, which is why these hours are 04:00 and 10:00, not 03:00
- * and 09:00. fetchRealTicketsForDate below enforces this by filtering out
- * any row whose available_at hasn't passed yet.
+ * itself runs ahead of these times (00:13 and 06:23 UTC primary runs plus
+ * catch-up retries — see .github/workflows/generate-tickets.yml), and each batch
+ * becomes visible at the FIXED hour below (a run that starts late and has already
+ * passed its hour is visible immediately). fetchRealTicketsForDate below enforces
+ * this by filtering out any row whose available_at hasn't passed yet.
  */
-export const RELEASE_SLOT_HOURS_UTC = [4, 10]; // 07:00 and 13:00 EAT
+export const RELEASE_SLOT_HOURS_UTC = [3, 9]; // 06:00 and 12:00 EAT
 
 /**
  * Given "today" in the visitor's local view, returns a human label for

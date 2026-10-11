@@ -175,13 +175,13 @@ const SMALL_TICKET_MAX_ODDS = 1.77;
 const MAX_FIXTURE_APPEARANCES_PER_DAY = 1;
 
 const MAX_TICKETS_PER_CATEGORY = 2;
-const MIN_HOURS_BETWEEN_SLOTS = 5; // runs are 6h apart (03:00 and 09:00 UTC); 5 leaves room for GitHub start-up jitter
+const MIN_HOURS_BETWEEN_SLOTS = 5; // primary runs are ~6h apart (00:13 and 06:23 UTC); 5 leaves room for GitHub start-up jitter
 // Batches become visible at FIXED clock times, not "generation + 1h": slot 0 at
-// 04:00 UTC (07:00 EAT), slot 1 at 10:00 UTC (13:00 EAT). Generation runs at
-// 03:00 / 09:00 UTC; if a run starts late (GitHub jitter) and has already
+// 03:00 UTC (06:00 EAT), slot 1 at 09:00 UTC (12:00 EAT). Generation runs ahead
+// of that (00:13 / 06:23 UTC primaries plus retries); if a run starts late (GitHub jitter) and has already
 // passed its release time, the batch is available immediately instead of later.
 // MUST match RELEASE_SLOT_HOURS_UTC in src/lib/dataFetcher.ts.
-const RELEASE_SLOT_HOURS_UTC = [4, 10];
+const RELEASE_SLOT_HOURS_UTC = [3, 9];
 
 function releaseTimeFor(slot, now) {
   const hour = RELEASE_SLOT_HOURS_UTC[Math.min(slot, RELEASE_SLOT_HOURS_UTC.length - 1)];
