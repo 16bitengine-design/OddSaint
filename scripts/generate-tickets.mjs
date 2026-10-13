@@ -40,6 +40,8 @@
 //   Direct wins are only allowed in domestic leagues up to the 3rd division for the top-ten
 //            European countries and up to the 2nd division elsewhere (leaguePolicy.mjs,
 //            directWinAllowedForLeague); cups / continental competitions are unaffected. Never relaxed.
+//   Direct wins also need the BACKED team to average >= 1.75 goals scored and < 1.0 conceded per
+//            match over its last 5 finished matches (never relaxed; missing history = rejected).
 //   Any other market (Mega/Duo only): no rank/form requirement.
 //   Mega Day: any market, EXACTLY 3 matches, cumulative odds >= 1.97 (floor never
 //            relaxes; NO ceiling — going above the displayed 3 is fine).
@@ -363,6 +365,22 @@ async function goalMetrics(f) {
   };
 }
 
+// A team may only be BACKED to win outright if, over its last 5 finished matches (any competition),
+// it scores at least WIN_MIN_AVG_SCORED goals per match AND concedes fewer than WIN_MAX_AVG_CONCEDED
+// per match. Applies to every ticket including Saint's Lock; never relaxed. Missing history = rejected.
+const WIN_MIN_AVG_SCORED = 1.75;
+const WIN_MAX_AVG_CONCEDED = 1; // strictly less than
+const WIN_FORM_SAMPLE = 5;
+
+/** Does the backed side ('home' | 'away') pass the scoring / conceding rule? Uses that team's own last-5 rows (newest first). */
+function winGoalFormPasses(goals, side) {
+  const rows = goals?.history?.[side]?.slice(0, WIN_FORM_SAMPLE) ?? [];
+  if (rows.length < WIN_FORM_SAMPLE) return false;
+  const scored = rows.reduce((n, r) => n + r.goalsFor, 0) / WIN_FORM_SAMPLE;
+  const conceded = rows.reduce((n, r) => n + r.goalsAgainst, 0) / WIN_FORM_SAMPLE;
+  return scored >= WIN_MIN_AVG_SCORED && conceded < WIN_MAX_AVG_CONCEDED;
+}
+
 /** Direct-win rules at a given relaxation level. */
 function winPasses(win, level) {
   return !!win && win.gap >= level.minRankGap && win.backedWins !== null && win.backedWins >= level.minWins;
@@ -432,6 +450,7 @@ function marketAllowedAt(outcome, p, level, saintsLockOnly) {
   if (outcome.market === 'Home Win' || outcome.market === 'Away Win') {
     if (p.directWinOk === false) return false; // division cap for direct wins — never relaxed, even at last resort
     const side = outcome.market === 'Home Win' ? 'home' : 'away';
+    if (!winGoalFormPasses(p.goals, side)) return false; // scoring / conceding rule — never relaxed
     if (winPasses(p.win, level) && p.win.favoured === side) return true;
     return !level.requireStandings && isMarketFavourite(outcome, p);
   }
@@ -523,7 +542,8 @@ async function priceFixture(oddsResponse, f) {
   // countries: up to 3rd division; everywhere else: up to 2nd). Never relaxed.
   const directWinOk = directWinAllowedForLeague(f.league);
   const win = directWinOk && viable.some((o) => FULL_WIN_MARKETS.has(o.market)) ? await winMetrics(f) : null;
-  const goals = viable.some((o) => GOALS_MARKETS.has(o.market) || o.market.startsWith('BTTS')) ? await goalMetrics(f) : null;
+  const needsGoalHistory = viable.some((o) => GOALS_MARKETS.has(o.market) || o.market.startsWith('BTTS') || (directWinOk && FULL_WIN_MARKETS.has(o.market)));
+  const goals = needsGoalHistory ? await goalMetrics(f) : null;
   const model = viable.some((o) => GOALS_MARKETS.has(o.market)) ? await modelFor(f) : null;
   return { viable, win, goals, model, directWinOk };
 }
