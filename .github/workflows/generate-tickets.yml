@@ -8,7 +8,7 @@ name: Odd Saint — Generate Daily Tickets
 # delayed by hours at busy times (top of the hour is the worst) and are occasionally
 # dropped. So each slot has a primary run at an off-peak minute plus catch-up retries.
 # The script is safe to run repeatedly: it skips a tier that already has today's slot
-# filled or whose last batch is under MIN_HOURS_BETWEEN_SLOTS (5h) old, so a retry that
+# filled, or (for slot 1) before 06:00 UTC, so a retry that
 # isn't needed does nothing. No manual runs should be necessary.
 #   Slot 0 (released 03:00 UTC): 00:13 primary, retries 01:43 and 03:13
 #   Slot 1 (released 09:00 UTC): 06:23 primary, retries 07:53 and 09:23

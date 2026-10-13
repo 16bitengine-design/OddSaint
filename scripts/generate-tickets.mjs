@@ -175,7 +175,12 @@ const SMALL_TICKET_MAX_ODDS = 1.77;
 const MAX_FIXTURE_APPEARANCES_PER_DAY = 1;
 
 const MAX_TICKETS_PER_CATEGORY = 2;
-const MIN_HOURS_BETWEEN_SLOTS = 5; // primary runs are ~6h apart (00:13 and 06:23 UTC); 5 leaves room for GitHub start-up jitter
+// Slot 1 (the second batch of the day) may only be generated from this UTC hour on. This replaces
+// the old "5 hours since the last batch" gap, which broke whenever slot 0 itself was generated late:
+// a batch created at 05:50 UTC blocked every slot-1 retry until 10:50 UTC, and the last scheduled
+// retry is at 09:23 UTC — so slot 1 slipped to the afternoon. Release times are fixed clock hours
+// (RELEASE_SLOT_HOURS_UTC), so a batch generated early or late is still SHOWN at its own hour.
+const SLOT_1_EARLIEST_GENERATION_HOUR_UTC = 6; // first slot-1 cron is 06:23 UTC
 // Batches become visible at FIXED clock times, not "generation + 1h": slot 0 at
 // 03:00 UTC (06:00 EAT), slot 1 at 09:00 UTC (12:00 EAT). Generation runs ahead
 // of that (00:13 / 06:23 UTC primaries plus retries); if a run starts late (GitHub jitter) and has already
@@ -215,13 +220,13 @@ async function fetchTodaysSlipState(supabase, today) {
   return byTier;
 }
 
-function nextSlotFor(maxSlipsToday, slipState) {
+function nextSlotFor(maxSlipsToday, slipState, now = new Date()) {
   const state = slipState ?? { count: 0, lastCreatedAt: null };
   if (state.count >= maxSlipsToday) return null;
   if (state.count === 0) return 0;
-  // created_at is the real generation time (available_at is a fixed release time now).
-  const hoursSinceLast = (Date.now() - new Date(state.lastCreatedAt).getTime()) / 3_600_000;
-  if (hoursSinceLast < MIN_HOURS_BETWEEN_SLOTS) return null;
+  // Later slots wait for their generation window (by clock hour, not by how long ago the previous
+  // batch happened to be created).
+  if (now.getUTCHours() < SLOT_1_EARLIEST_GENERATION_HOUR_UTC) return null;
   return state.count;
 }
 
@@ -986,7 +991,7 @@ async function main() {
   console.log(`Wrote ${tickets.length} new ticket(s), ${fixtureRows.length} fixture(s). Previous slips today are untouched.`);
 }
 
-export { buildTickets, pickCombo, marketAllowedAt, chooseBookmaker, fetchPricedFixtures, RELAXATION_LEVELS };
+export { nextSlotFor, buildTickets, pickCombo, marketAllowedAt, chooseBookmaker, fetchPricedFixtures, RELAXATION_LEVELS };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main().catch((err) => {
