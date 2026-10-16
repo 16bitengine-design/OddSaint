@@ -145,13 +145,22 @@ const SAINTS_LOCK_MARKETS = new Set(['Home Win', 'Away Win', 'Over 2.5 Goals']);
 //   oddsRange / oddsFloor— per-tier cumulative-odds range and hard floor
 //   requireStandings     — false = no standings/goals data needed; a win is
 //                          then allowed on the bookmaker's favourite
-// The ladder stops at relaxed-3. NEVER relaxed: Saint's Lock markets (direct
-// win / Over 2.5 only) and odds band, the Double Chance cap (1.3), the Mega /
-// Duo cumulative-odds ranges and 1.97 floor, the per-tier confidence floors,
-// tier sizes (Mega 3, Duo 2), and the requirement that a win backs the
-// better-placed side. Only the rank gap, win count and the goals-gate thresholds loosen.
-// (dcMaxOdds, minConf, oddsRange, oddsFloor and requireStandings are kept as
-// per-level fields so a looser level can be added later without code changes.)
+// GUARANTEE: every run must leave Mega Day, Duo and Saint's Lock tickets for each
+// release slot that is due (slot 0 = 03:00 UTC release, slot 1 = 09:00 UTC
+// release). Pass 1 walks strict -> relaxed-3 on today's pool. If a due category
+// is still missing, pass 2 widens the pool with tomorrow's fixtures and walks the
+// FULL ladder, which ends in relaxed-4 (last resort). If something is STILL
+// missing, the run exits non-zero so the failure is loud (and the next cron retry
+// tries again).
+// NEVER relaxed, even at relaxed-4: Saint's Lock markets (direct win / Over 2.5
+// only) and odds band, the Double Chance cap (1.3), the Mega / Duo
+// cumulative-odds ranges and 1.97 floor, per-tier confidence floors, tier sizes
+// (Mega 3, Duo 2), the direct-win division cap and scoring/conceding rule, the
+// goals-quality gate (relaxed-4 reuses the relaxed-3 thresholds), no South
+// American leagues, the 2h minimum before kickoff, and no fixture reuse.
+// relaxed-4 ONLY drops the rank-gap / last-5-wins requirement
+// (requireStandings: false), so a win may back the bookmaker's favourite.
+// (goalsLevel names the goals-gate thresholds in goalsQuality.mjs; default = level name.)
 const BASE_LEVEL = {
   dcMaxOdds: 1.3,
   minConf: { mega: 68, duo: 58 },
@@ -166,7 +175,10 @@ const RELAXATION_LEVELS = [
   { ...BASE_LEVEL, name: 'relaxed-1', minRankGap: 5, minWins: 3 },
   { ...BASE_LEVEL, name: 'relaxed-2', minRankGap: 4, minWins: 3 },
   { ...BASE_LEVEL, name: 'relaxed-3', minRankGap: 4, minWins: 2 },
+  // LAST RESORT — only used in pass 2 (see GUARANTEE above).
+  { ...BASE_LEVEL, name: 'relaxed-4', minRankGap: 0, minWins: 0, requireStandings: false, goalsLevel: 'relaxed-3' },
 ];
+const STANDARD_LEVELS = RELAXATION_LEVELS.slice(0, 4);
 const MIN_GAMES_PLAYED = 5; // early-season tables are meaningless
 const OPPONENT_MAX_WINS_LAST_5 = 2; // opponent (preference only)
 
@@ -212,8 +224,9 @@ async function fetchTodaysSlipState(supabase, today) {
 
   const byTier = new Map();
   (data ?? []).forEach((row) => {
-    const existing = byTier.get(row.tier) ?? { count: 0, lastCreatedAt: null };
+    const existing = byTier.get(row.tier) ?? { count: 0, lastCreatedAt: null, slots: new Set() };
     existing.count += 1;
+    existing.slots.add(row.release_slot ?? 0);
     if (!existing.lastCreatedAt || row.created_at > existing.lastCreatedAt) {
       existing.lastCreatedAt = row.created_at;
     }
@@ -230,6 +243,18 @@ function nextSlotFor(maxSlipsToday, slipState, now = new Date()) {
   // batch happened to be created).
   if (now.getUTCHours() < SLOT_1_EARLIEST_GENERATION_HOUR_UTC) return null;
   return state.count;
+}
+
+/**
+ * Release slots that are DUE and still missing for a tier: slot 0 always, slot 1 from
+ * SLOT_1_EARLIEST_GENERATION_HOUR_UTC. Based on which slots exist (not on a count), so a
+ * missing slot 0 is retried even when slot 1 already exists.
+ */
+function slotsToFill(state, now = new Date()) {
+  const have = state?.slots ?? new Set();
+  const due = [0];
+  if (now.getUTCHours() >= SLOT_1_EARLIEST_GENERATION_HOUR_UTC) due.push(1);
+  return due.filter((s) => s < MAX_TICKETS_PER_CATEGORY && !have.has(s));
 }
 
 /** Fixture IDs already used by ANY of today's tickets (every tier, every earlier batch) — a later batch must never reuse them. */
@@ -392,7 +417,8 @@ function winPasses(win, level) {
  * a failing verdict's reasons are kept for the run log. Returns { ok, qualityScore }.
  */
 function goalsVerdict(outcome, p, level) {
-  const key = `${outcome.market}|${level.name}`;
+  const goalsLevel = level.goalsLevel ?? level.name;
+  const key = `${outcome.market}|${goalsLevel}`;
   if (p.goalsVerdicts?.has(key)) return p.goalsVerdicts.get(key);
   let verdict;
   if (!p.goals || !p.goals.history) {
@@ -404,7 +430,7 @@ function goalsVerdict(outcome, p, level) {
       fairProb: 1 / outcome.odds / ASSUMED_OVERROUND,
       model: p.model,
       history: p.goals.history,
-      level: level.name,
+      level: goalsLevel,
     });
   }
   if (!p.goalsVerdicts) p.goalsVerdicts = new Map();
@@ -827,10 +853,10 @@ function saintsLockCandidates(dailyPool, level, usageCount, excludeFixtureIds, e
  * ticket so no other ticket reuses it with a different market (the fixtures
  * table stores one market per fixture).
  */
-function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, excludeFixtureIds, existingMarkets) {
+function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, excludeFixtureIds, existingMarkets, levels = STANDARD_LEVELS) {
   const config = TIER_CONFIG.find((c) => c.tier === 'saints_lock');
 
-  for (const level of RELAXATION_LEVELS) {
+  for (const level of levels) {
     const candidates = saintsLockCandidates(dailyPool, level, usageCount, excludeFixtureIds, existingMarkets);
     if (candidates.length === 0) continue;
 
@@ -862,95 +888,102 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, exclude
 }
 
 /**
- * Builds one ticket per category for this run. Each category walks the
- * relaxation ladder from the strictest rules down and stops at the first
- * level that yields a valid ticket — so every category gets a ticket
- * whenever ANY qualifying combination exists, and never a looser ticket than
- * it had to settle for.
+ * Builds the tickets that are DUE for this run: for every release slot still missing
+ * (slotsToFill) a Saint's Lock, a Duo and a Mega Day. Each category walks `levels`
+ * from the strictest rules down and stops at the first level that yields a valid
+ * ticket. `opts.need` ([{tier, slot}]) overrides what is due (used by pass 2);
+ * `opts.levels` picks the ladder. Returns the tickets plus `missing` = categories
+ * that could not be built.
  */
-function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set(), existingMarkets = new Map()) {
+function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set(), existingMarkets = new Map(), opts = {}) {
+  const levels = opts.levels ?? STANDARD_LEVELS;
   const today = dateStr(now);
   const tickets = [];
   const ticketMatches = [];
   const fixturesUsed = new Map();
   const usageCount = new Map();
   const chosenMarket = new Map(); // fixtureId -> market already used by a ticket built this run
+  const missing = [];
 
-  const saintsLockSlot = nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get('saints_lock'));
-  if (saintsLockSlot !== null) {
-    const sl = buildSaintsLockTickets(dailyPool, usageCount, today, saintsLockSlot, now, excludeFromSaintsLock, existingMarkets);
-    if (sl.tickets.length === 0) console.warn("Saint's Lock: no fixture qualified even at the most relaxed rule level — no ticket this run.");
-    tickets.push(...sl.tickets);
-    ticketMatches.push(...sl.ticketMatches);
-    sl.fixturesUsed.forEach((f) => {
-      fixturesUsed.set(f.fixtureId, f);
-      chosenMarket.set(f.fixtureId, f.market);
-    });
-  } else {
-    console.log("Saint's Lock: already at today's cap, or too soon since the last slip — skipping this run.");
+  const need = opts.need
+    ? opts.need
+    : ['saints_lock', 'duo', 'mega'].flatMap((tier) => slotsToFill(slipState.get(tier), now).map((slot) => ({ tier, slot })));
+  if (need.length === 0) console.log('Nothing due this run — every due slot already exists.');
+
+  // Slot-major: slot 0 gets first pick of the pool, then slot 1. Within a slot:
+  // Saint's Lock, then Duo (the more constrained ticket — two legs must multiply to
+  // >= 2), then Mega (can reach 1.97 from three short-priced legs).
+  const TIER_ORDER = ['saints_lock', 'duo', 'mega'];
+  const slots = [...new Set(need.map((n) => n.slot))].sort((x, y) => x - y);
+  for (const slot of slots) {
+    for (const tierName of TIER_ORDER) {
+      if (!need.some((n) => n.tier === tierName && n.slot === slot)) continue;
+
+      if (tierName === 'saints_lock') {
+        const sl = buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, excludeFromSaintsLock, existingMarkets, levels);
+        if (sl.tickets.length === 0) {
+          console.warn(`Saint's Lock (slot ${slot}): no fixture qualified on this ladder.`);
+          missing.push({ tier: tierName, slot });
+          continue;
+        }
+        tickets.push(...sl.tickets);
+        ticketMatches.push(...sl.ticketMatches);
+        sl.fixturesUsed.forEach((f) => {
+          fixturesUsed.set(f.fixtureId, f);
+          chosenMarket.set(f.fixtureId, f.market);
+        });
+        continue;
+      }
+
+      const config = TIER_CONFIG.find((c) => c.tier === tierName);
+      let built = false;
+
+      for (const level of levels) {
+        const targetRange = level.oddsRange[config.tier];
+        const floor = level.oddsFloor[config.tier];
+        const pool = poolAtLevel(dailyPool, config.tier, level, existingMarkets, chosenMarket);
+        // Mega Day = exactly 3 matches, Duo = exactly 2 (config.matchCount).
+        const picks = pickCombo(pool, config.matchCount, usageCount, targetRange, config.tier === 'mega');
+        if (picks.length === 0) continue;
+
+        // Hard floor on cumulative odds, on the UNROUNDED product, BEFORE the
+        // picks are registered as used.
+        const rawTotal = computeRawOdds(picks);
+        if (floor !== undefined && rawTotal < floor) continue;
+
+        picks.forEach((p) => {
+          fixturesUsed.set(p.fixtureId, p);
+          usageCount.set(p.fixtureId, (usageCount.get(p.fixtureId) ?? 0) + 1);
+          chosenMarket.set(p.fixtureId, p.market);
+        });
+
+        const ticketId = `${today}-${config.tier}-${slot}`;
+        tickets.push({
+          id: ticketId,
+          ticket_date: today,
+          tier: config.tier,
+          slip_label: null,
+          match_count: picks.length,
+          odds_range: config.oddsRange,
+          total_odds: computeTotalOdds(picks),
+          is_free: config.alwaysFree,
+          release_slot: slot,
+          available_at: releaseTimeFor(slot, now),
+        });
+        picks.forEach((p, idx) => ticketMatches.push({ ticket_id: ticketId, fixture_id: p.fixtureId, sort_order: idx }));
+        console.log(`${config.label} (slot ${slot}): built at rule level "${level.name}" — total odds ${computeTotalOdds(picks)}.`);
+        built = true;
+        break;
+      }
+
+      if (!built) {
+        console.warn(`${config.label} (slot ${slot}): no valid combination on this ladder.`);
+        missing.push({ tier: tierName, slot });
+      }
+    }
   }
 
-  // Duo is built BEFORE Mega: Duo is the more constrained ticket (two legs must
-  // multiply to >= 2, which needs the richer, higher-priced markets), whereas
-  // Mega can reach 1.97 from three short-priced legs. Building Mega first used
-  // up the fixtures (and locked their markets to the shortest price) and
-  // starved Duo on small days.
-  const BUILD_ORDER = ['duo', 'mega'];
-  for (const tierName of BUILD_ORDER) {
-    const config = TIER_CONFIG.find((c) => c.tier === tierName);
-
-    const slot = nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get(config.tier));
-    if (slot === null) {
-      console.log(`${config.label}: already at today's cap, or too soon since the last slip — skipping this run.`);
-      continue;
-    }
-
-    let built = false;
-
-    for (const level of RELAXATION_LEVELS) {
-      const targetRange = level.oddsRange[config.tier];
-      const floor = level.oddsFloor[config.tier];
-      const pool = poolAtLevel(dailyPool, config.tier, level, existingMarkets, chosenMarket);
-      // Mega Day = exactly 3 matches, Duo = exactly 2 (config.matchCount).
-      const picks = pickCombo(pool, config.matchCount, usageCount, targetRange, config.tier === 'mega');
-      if (picks.length === 0) continue;
-
-      // Hard floor on cumulative odds, on the UNROUNDED product, BEFORE the
-      // picks are registered as used.
-      const rawTotal = computeRawOdds(picks);
-      if (floor !== undefined && rawTotal < floor) continue;
-
-      picks.forEach((p) => {
-        fixturesUsed.set(p.fixtureId, p);
-        usageCount.set(p.fixtureId, (usageCount.get(p.fixtureId) ?? 0) + 1);
-        chosenMarket.set(p.fixtureId, p.market);
-      });
-
-      const ticketId = `${today}-${config.tier}-${slot}`;
-      tickets.push({
-        id: ticketId,
-        ticket_date: today,
-        tier: config.tier,
-        slip_label: null,
-        match_count: picks.length,
-        odds_range: config.oddsRange,
-        total_odds: computeTotalOdds(picks),
-        is_free: config.alwaysFree,
-        release_slot: slot,
-        available_at: releaseTimeFor(slot, now),
-      });
-      picks.forEach((p, idx) => ticketMatches.push({ ticket_id: ticketId, fixture_id: p.fixtureId, sort_order: idx }));
-      console.log(`${config.label}: built at rule level "${level.name}" — total odds ${computeTotalOdds(picks)}.`);
-      built = true;
-      break;
-    }
-
-    if (!built) {
-      console.warn(`${config.label}: no valid combination even at the most relaxed rule level — no ticket this run.`);
-    }
-  }
-
-  return { tickets, ticketMatches, fixturesUsed: Array.from(fixturesUsed.values()) };
+  return { tickets, ticketMatches, fixturesUsed: Array.from(fixturesUsed.values()), missing };
 }
 
 // --- Main ---------------------------------------------------------------------
@@ -958,60 +991,86 @@ function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set
 async function main() {
   const today = new Date();
   const todayStr = dateStr(today);
+  const tomorrowStr = dateStr(new Date(today.getTime() + 24 * 3600 * 1000));
   const supabase = getSupabaseAdmin();
 
   console.log("Checking today's existing slips (staggered-release state)...");
   const slipState = await fetchTodaysSlipState(supabase, todayStr);
 
-  const anySlotAvailable = TIER_CONFIG.some((c) => nextSlotFor(MAX_TICKETS_PER_CATEGORY, slipState.get(c.tier)) !== null);
-  if (!anySlotAvailable) {
-    console.log("Every category is already at today's cap, or within the min-gap window — nothing to do this run.");
+  const due = ['saints_lock', 'duo', 'mega'].flatMap((tier) => slotsToFill(slipState.get(tier), today).map((slot) => ({ tier, slot })));
+  if (due.length === 0) {
+    console.log("Every due category/slot already exists — nothing to do this run.");
     return;
   }
+  console.log(`Due this run: ${due.map((d) => `${d.tier}#${d.slot}`).join(', ')}`);
 
-  console.log('Fetching daily fixture pool...');
+  // ---- Pass 1: today's pool, strict -> relaxed-3 ----
+  console.log('Pass 1: fetching daily fixture pool...');
   const dailyPool = await fetchPricedFixtures([todayStr], MAX_ODDS_LOOKUPS_PER_RUN, today);
   console.log(`Priced ${dailyPool.length} qualifying fixtures for today.`);
 
-  const existingMarkets = await fetchExistingMarkets(supabase, dailyPool.map((p) => p.fixtureId));
-
   const alreadyUsed = await fetchTodaysUsedFixtureIds(supabase, todayStr);
+  let existingMarkets = await fetchExistingMarkets(supabase, dailyPool.map((p) => p.fixtureId));
   const freshPool = dailyPool.filter((p) => !alreadyUsed.has(p.fixtureId));
   if (freshPool.length < dailyPool.length) {
     console.log(`Excluded ${dailyPool.length - freshPool.length} fixture(s) already used by earlier batches today.`);
   }
 
-  const { tickets, ticketMatches, fixturesUsed } = buildTickets(freshPool, slipState, today, new Set(), existingMarkets);
+  const pass1 = buildTickets(freshPool, slipState, today, new Set(), existingMarkets, { levels: STANDARD_LEVELS, need: due });
+  const tickets = [...pass1.tickets];
+  const ticketMatches = [...pass1.ticketMatches];
+  const fixturesUsed = new Map(pass1.fixturesUsed.map((f) => [f.fixtureId, f]));
+  let missing = pass1.missing;
 
-  if (tickets.length === 0) {
-    console.warn('No tickets could be assembled this run — nothing written.');
-    return;
+  // ---- Pass 2: only the missing categories, today + tomorrow, full ladder incl. relaxed-4 ----
+  if (missing.length > 0) {
+    console.warn(`Pass 1 left ${missing.length} category(ies) unbuilt: ${missing.map((m) => `${m.tier}#${m.slot}`).join(', ')}. Pass 2: widening to tomorrow's fixtures and the full ladder.`);
+    const widePool = await fetchPricedFixtures([todayStr, tomorrowStr], MAX_ODDS_LOOKUPS_PER_RUN, today);
+    console.log(`Priced ${widePool.length} qualifying fixtures for today + tomorrow.`);
+    const wideMarkets = await fetchExistingMarkets(supabase, widePool.map((p) => p.fixtureId));
+    existingMarkets = new Map([...existingMarkets, ...wideMarkets]);
+    const wideFresh = widePool.filter((p) => !alreadyUsed.has(p.fixtureId) && !fixturesUsed.has(p.fixtureId));
+
+    const pass2 = buildTickets(wideFresh, slipState, today, new Set(), existingMarkets, { levels: RELAXATION_LEVELS, need: missing });
+    tickets.push(...pass2.tickets);
+    ticketMatches.push(...pass2.ticketMatches);
+    pass2.fixturesUsed.forEach((f) => fixturesUsed.set(f.fixtureId, f));
+    missing = pass2.missing;
   }
 
-  const fixtureRows = fixturesUsed.map((f) => ({
-    id: f.fixtureId,
-    ticket_date: f.ticketDate,
-    league: f.league,
-    country: f.country,
-    home_team: f.homeTeam,
-    away_team: f.awayTeam,
-    kickoff: f.kickoff,
-    market: f.market,
-    odds: f.odds,
-    confidence: f.confidence,
-  }));
+  if (tickets.length > 0) {
+    const fixtureRows = Array.from(fixturesUsed.values()).map((f) => ({
+      id: f.fixtureId,
+      ticket_date: f.ticketDate,
+      league: f.league,
+      country: f.country,
+      home_team: f.homeTeam,
+      away_team: f.awayTeam,
+      kickoff: f.kickoff,
+      market: f.market,
+      odds: f.odds,
+      confidence: f.confidence,
+    }));
 
-  const { error: fixturesErr } = await supabase.from('fixtures').upsert(fixtureRows, { onConflict: 'id' });
-  if (fixturesErr) throw fixturesErr;
-  const { error: ticketsErr } = await supabase.from('tickets').upsert(tickets, { onConflict: 'id' });
-  if (ticketsErr) throw ticketsErr;
-  const { error: linksErr } = await supabase.from('ticket_matches').upsert(ticketMatches, { onConflict: 'ticket_id,fixture_id' });
-  if (linksErr) throw linksErr;
+    const { error: fixturesErr } = await supabase.from('fixtures').upsert(fixtureRows, { onConflict: 'id' });
+    if (fixturesErr) throw fixturesErr;
+    const { error: ticketsErr } = await supabase.from('tickets').upsert(tickets, { onConflict: 'id' });
+    if (ticketsErr) throw ticketsErr;
+    const { error: linksErr } = await supabase.from('ticket_matches').upsert(ticketMatches, { onConflict: 'ticket_id,fixture_id' });
+    if (linksErr) throw linksErr;
 
-  console.log(`Wrote ${tickets.length} new ticket(s), ${fixtureRows.length} fixture(s). Previous slips today are untouched.`);
+    console.log(`Wrote ${tickets.length} new ticket(s), ${fixtureRows.length} fixture(s). Previous slips today are untouched.`);
+  } else {
+    console.warn('No tickets could be assembled this run — nothing written.');
+  }
+
+  if (missing.length > 0) {
+    console.error(`GUARANTEE NOT MET: still missing ${missing.map((m) => `${m.tier}#${m.slot}`).join(', ')} after the full ladder and tomorrow's fixtures (likely no eligible priced fixtures today).`);
+    process.exitCode = 1;
+  }
 }
 
-export { nextSlotFor, buildTickets, pickCombo, marketAllowedAt, chooseBookmaker, fetchPricedFixtures, RELAXATION_LEVELS };
+export { nextSlotFor, slotsToFill, STANDARD_LEVELS, buildTickets, pickCombo, marketAllowedAt, chooseBookmaker, fetchPricedFixtures, RELAXATION_LEVELS };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main().catch((err) => {
