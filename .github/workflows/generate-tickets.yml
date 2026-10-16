@@ -7,20 +7,24 @@ name: Odd Saint — Generate Daily Tickets
 # WHY SO MANY CRON LINES: GitHub's scheduled runs are best-effort — they are often
 # delayed by hours at busy times (top of the hour is the worst) and are occasionally
 # dropped. So each slot has a primary run at an off-peak minute plus catch-up retries.
-# The script is safe to run repeatedly: it skips a tier that already has today's slot
-# filled, or (for slot 1) before 06:00 UTC, so a retry that
-# isn't needed does nothing. No manual runs should be necessary.
-#   Slot 0 (released 03:00 UTC): 00:13 primary, retries 01:43 and 03:13
-#   Slot 1 (released 09:00 UTC): 06:23 primary, retries 07:53 and 09:23
+# The script is safe to run repeatedly: it only builds the category/slot pairs that
+# are DUE and still missing (slot 0 always; slot 1 from 06:00 UTC), so a retry that
+# isn't needed does nothing. Every due Mega Day, Duo and Saint's Lock must exist;
+# if the script cannot build one even after its last-resort rules and tomorrow's
+# fixtures, it exits non-zero (this run shows red) and the next cron line tries again.
+#   Slot 0 (released 03:00 UTC): 00:13 primary, retries 01:43, 03:13 and 04:43
+#   Slot 1 (released 09:00 UTC): 06:23 primary, retries 07:53, 09:23 and 11:23
 # Can still be triggered manually (workflow_dispatch) if ever wanted.
 on:
   schedule:
     - cron: '13 0 * * *'
     - cron: '43 1 * * *'
     - cron: '13 3 * * *'
+    - cron: '43 4 * * *'
     - cron: '23 6 * * *'
     - cron: '53 7 * * *'
     - cron: '23 9 * * *'
+    - cron: '23 11 * * *'
   workflow_dispatch: {}
 
 # Never run two generations at once (a retry must wait for the one in progress).
@@ -31,6 +35,7 @@ concurrency:
 jobs:
   generate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
