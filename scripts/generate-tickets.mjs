@@ -896,7 +896,39 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, exclude
  * that could not be built.
  */
 function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set(), existingMarkets = new Map(), opts = {}) {
-  const levels = opts.levels ?? STANDARD_LEVELS;
+  const need = opts.need
+    ? opts.need
+    : ['saints_lock', 'duo', 'mega'].flatMap((tier) => slotsToFill(slipState.get(tier), now).map((slot) => ({ tier, slot })));
+  if (need.length === 0) console.log('Nothing due this run — every due slot already exists.');
+
+  // Categories compete for the same scarce fixtures, so the ORDER they are built in can decide
+  // whether one is starved (e.g. Duo, built first, using up the only short-priced legs Mega can
+  // accept). The default order (Saint's Lock, Duo, Mega) is tried first; further orders are tried
+  // ONLY if it leaves something unbuilt, and the order that builds the most categories wins.
+  const orders = [
+    ['saints_lock', 'duo', 'mega'],
+    ['saints_lock', 'mega', 'duo'],
+    ['mega', 'duo', 'saints_lock'],
+    ['mega', 'saints_lock', 'duo'],
+    ['duo', 'mega', 'saints_lock'],
+    ['duo', 'saints_lock', 'mega'],
+  ];
+  let best = null;
+  for (const order of orders) {
+    const quiet = best !== null; // log only the first (default) attempt in full
+    const result = buildTicketsInOrder(dailyPool, now, excludeFromSaintsLock, existingMarkets, opts.levels ?? STANDARD_LEVELS, need, order, quiet);
+    if (!best || result.missing.length < best.missing.length) {
+      best = result;
+      if (quiet) console.log(`Build order ${order.join(' > ')} builds more categories — using it.`);
+    }
+    if (best.missing.length === 0) break;
+  }
+  return best;
+}
+
+function buildTicketsInOrder(dailyPool, now, excludeFromSaintsLock, existingMarkets, levels, need, tierOrder, quiet) {
+  const log = quiet ? () => {} : console.log.bind(console);
+  const warn = quiet ? () => {} : console.warn.bind(console);
   const today = dateStr(now);
   const tickets = [];
   const ticketMatches = [];
@@ -905,24 +937,18 @@ function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set
   const chosenMarket = new Map(); // fixtureId -> market already used by a ticket built this run
   const missing = [];
 
-  const need = opts.need
-    ? opts.need
-    : ['saints_lock', 'duo', 'mega'].flatMap((tier) => slotsToFill(slipState.get(tier), now).map((slot) => ({ tier, slot })));
-  if (need.length === 0) console.log('Nothing due this run — every due slot already exists.');
-
   // Slot-major: slot 0 gets first pick of the pool, then slot 1. Within a slot:
   // Saint's Lock, then Duo (the more constrained ticket — two legs must multiply to
   // >= 2), then Mega (can reach 1.97 from three short-priced legs).
-  const TIER_ORDER = ['saints_lock', 'duo', 'mega'];
   const slots = [...new Set(need.map((n) => n.slot))].sort((x, y) => x - y);
   for (const slot of slots) {
-    for (const tierName of TIER_ORDER) {
+    for (const tierName of tierOrder) {
       if (!need.some((n) => n.tier === tierName && n.slot === slot)) continue;
 
       if (tierName === 'saints_lock') {
         const sl = buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, excludeFromSaintsLock, existingMarkets, levels);
         if (sl.tickets.length === 0) {
-          console.warn(`Saint's Lock (slot ${slot}): no fixture qualified on this ladder.`);
+          warn(`Saint's Lock (slot ${slot}): no fixture qualified on this ladder.`);
           missing.push({ tier: tierName, slot });
           continue;
         }
@@ -937,6 +963,7 @@ function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set
 
       const config = TIER_CONFIG.find((c) => c.tier === tierName);
       let built = false;
+      const diag = [];
 
       for (const level of levels) {
         const targetRange = level.oddsRange[config.tier];
@@ -944,6 +971,7 @@ function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set
         const pool = poolAtLevel(dailyPool, config.tier, level, existingMarkets, chosenMarket);
         // Mega Day = exactly 3 matches, Duo = exactly 2 (config.matchCount).
         const picks = pickCombo(pool, config.matchCount, usageCount, targetRange, config.tier === 'mega');
+        diag.push(`${level.name}=${pool.filter((c) => (usageCount.get(c.fixtureId) ?? 0) < MAX_FIXTURE_APPEARANCES_PER_DAY).length} legs/${new Set(pool.map((c) => c.fixtureId)).size} fixtures`);
         if (picks.length === 0) continue;
 
         // Hard floor on cumulative odds, on the UNROUNDED product, BEFORE the
@@ -971,13 +999,13 @@ function buildTickets(dailyPool, slipState, now, excludeFromSaintsLock = new Set
           available_at: releaseTimeFor(slot, now),
         });
         picks.forEach((p, idx) => ticketMatches.push({ ticket_id: ticketId, fixture_id: p.fixtureId, sort_order: idx }));
-        console.log(`${config.label} (slot ${slot}): built at rule level "${level.name}" — total odds ${computeTotalOdds(picks)}.`);
+        log(`${config.label} (slot ${slot}): built at rule level "${level.name}" — total odds ${computeTotalOdds(picks)}.`);
         built = true;
         break;
       }
 
       if (!built) {
-        console.warn(`${config.label} (slot ${slot}): no valid combination on this ladder.`);
+        warn(`${config.label} (slot ${slot}): no valid combination on this ladder. Candidate legs per level: ${diag.join('; ')}`);
         missing.push({ tier: tierName, slot });
       }
     }
@@ -1025,11 +1053,13 @@ async function main() {
   // ---- Pass 2: only the missing categories, today + tomorrow, full ladder incl. relaxed-4 ----
   if (missing.length > 0) {
     console.warn(`Pass 1 left ${missing.length} category(ies) unbuilt: ${missing.map((m) => `${m.tier}#${m.slot}`).join(', ')}. Pass 2: widening to tomorrow's fixtures and the full ladder.`);
-    const widePool = await fetchPricedFixtures([todayStr, tomorrowStr], MAX_ODDS_LOOKUPS_PER_RUN, today);
-    console.log(`Priced ${widePool.length} qualifying fixtures for today + tomorrow.`);
-    const wideMarkets = await fetchExistingMarkets(supabase, widePool.map((p) => p.fixtureId));
-    existingMarkets = new Map([...existingMarkets, ...wideMarkets]);
-    const wideFresh = widePool.filter((p) => !alreadyUsed.has(p.fixtureId) && !fixturesUsed.has(p.fixtureId));
+    // Only TOMORROW is fetched here: today's fixtures are already priced in dailyPool (re-fetching
+    // them would burn the odds-lookup budget on the same fixtures again and never reach tomorrow).
+    const tomorrowPool = await fetchPricedFixtures([tomorrowStr], MAX_ODDS_LOOKUPS_PER_RUN, today);
+    console.log(`Priced ${tomorrowPool.length} qualifying fixtures for tomorrow.`);
+    const tomorrowMarkets = await fetchExistingMarkets(supabase, tomorrowPool.map((p) => p.fixtureId));
+    existingMarkets = new Map([...existingMarkets, ...tomorrowMarkets]);
+    const wideFresh = [...dailyPool, ...tomorrowPool].filter((p) => !alreadyUsed.has(p.fixtureId) && !fixturesUsed.has(p.fixtureId));
 
     const pass2 = buildTickets(wideFresh, slipState, today, new Set(), existingMarkets, { levels: RELAXATION_LEVELS, need: missing });
     tickets.push(...pass2.tickets);
