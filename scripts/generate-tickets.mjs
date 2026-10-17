@@ -700,6 +700,36 @@ async function fetchPricedFixtures(dates, maxOddsLookups, now) {
   });
 }
 
+/**
+ * DIAGNOSTIC ONLY (changes nothing): why do priced fixtures fail to become Mega / Duo legs at `level`?
+ * Counts, per rule, the outcomes each gate rejects (first failing gate wins), so a run that cannot
+ * build a category shows WHICH rule is the bottleneck — e.g. missing recent-match history (an API
+ * problem) versus genuinely strict form / odds / confidence rules.
+ */
+function explainPool(pool, level) {
+  const counts = new Map();
+  const bump = (k) => counts.set(k, (counts.get(k) ?? 0) + 1);
+  let withHistory = 0;
+  for (const p of pool) {
+    if (p.goals?.history) withHistory++;
+    for (const o of p.viable ?? []) {
+      if (GOALS_MARKETS.has(o.market)) {
+        const v = goalsVerdict(o, p, level);
+        if (v.ok) bump('goals: pass'); else bump(`goals: ${(v.reasons?.[0] ?? 'rejected').toString().slice(0, 60)}`);
+      } else if (o.market === 'Home Win' || o.market === 'Away Win') {
+        const side = o.market === 'Home Win' ? 'home' : 'away';
+        if (p.directWinOk === false) bump('win: division cap');
+        else if (!winGoalFormPasses(p.goals, side)) bump(p.goals?.history ? 'win: scoring/conceding form' : 'win: no recent-match history');
+        else if (!(winPasses(p.win, level) && p.win.favoured === side) && level.requireStandings) bump('win: rank gap / last-5 wins');
+        else if (impliedConfidence(o.odds) < level.minConf.mega) bump('win: below Mega confidence floor (odds too long)');
+        else bump('win: pass');
+      }
+    }
+  }
+  console.log(`Diagnostic @${level.name}: ${pool.length} fixtures, ${withHistory} with recent-match history. Outcome gates: ` +
+    Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).map(([k, c]) => `${k} = ${c}`).join('; '));
+}
+
 // --- Assemble tickets ---------------------------------------------------------
 
 function computeRawOdds(picks) {
@@ -853,7 +883,7 @@ function saintsLockCandidates(dailyPool, level, usageCount, excludeFixtureIds, e
  * ticket so no other ticket reuses it with a different market (the fixtures
  * table stores one market per fixture).
  */
-function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, excludeFixtureIds, existingMarkets, levels = STANDARD_LEVELS) {
+function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, excludeFixtureIds, existingMarkets, levels = STANDARD_LEVELS, log = console.log.bind(console)) {
   const config = TIER_CONFIG.find((c) => c.tier === 'saints_lock');
 
   for (const level of levels) {
@@ -862,7 +892,7 @@ function buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, exclude
 
     const pick = candidates[0];
     usageCount.set(pick.fixtureId, MAX_FIXTURE_APPEARANCES_PER_DAY);
-    console.log(`Saint's Lock: built at rule level "${level.name}" — ${pick.homeTeam} vs ${pick.awayTeam}, ${pick.market} @ ${pick.odds}.`);
+    log(`Saint's Lock: built at rule level "${level.name}" — ${pick.homeTeam} vs ${pick.awayTeam}, ${pick.market} @ ${pick.odds}.`);
 
     const ticketId = `${today}-saints_lock-${slot}`;
     return {
@@ -946,7 +976,7 @@ function buildTicketsInOrder(dailyPool, now, excludeFromSaintsLock, existingMark
       if (!need.some((n) => n.tier === tierName && n.slot === slot)) continue;
 
       if (tierName === 'saints_lock') {
-        const sl = buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, excludeFromSaintsLock, existingMarkets, levels);
+        const sl = buildSaintsLockTickets(dailyPool, usageCount, today, slot, now, excludeFromSaintsLock, existingMarkets, levels, log);
         if (sl.tickets.length === 0) {
           warn(`Saint's Lock (slot ${slot}): no fixture qualified on this ladder.`);
           missing.push({ tier: tierName, slot });
@@ -1049,6 +1079,7 @@ async function main() {
   const ticketMatches = [...pass1.ticketMatches];
   const fixturesUsed = new Map(pass1.fixturesUsed.map((f) => [f.fixtureId, f]));
   let missing = pass1.missing;
+  if (missing.some((m) => m.tier !== 'saints_lock')) explainPool(freshPool, STANDARD_LEVELS[STANDARD_LEVELS.length - 1]);
 
   // ---- Pass 2: only the missing categories, today + tomorrow, full ladder incl. relaxed-4 ----
   if (missing.length > 0) {
@@ -1066,6 +1097,7 @@ async function main() {
     ticketMatches.push(...pass2.ticketMatches);
     pass2.fixturesUsed.forEach((f) => fixturesUsed.set(f.fixtureId, f));
     missing = pass2.missing;
+    if (missing.some((m) => m.tier !== 'saints_lock')) explainPool(wideFresh, RELAXATION_LEVELS[RELAXATION_LEVELS.length - 1]);
   }
 
   if (tickets.length > 0) {
@@ -1100,7 +1132,7 @@ async function main() {
   }
 }
 
-export { nextSlotFor, slotsToFill, STANDARD_LEVELS, buildTickets, pickCombo, marketAllowedAt, chooseBookmaker, fetchPricedFixtures, RELAXATION_LEVELS };
+export { explainPool, nextSlotFor, slotsToFill, STANDARD_LEVELS, buildTickets, pickCombo, marketAllowedAt, chooseBookmaker, fetchPricedFixtures, RELAXATION_LEVELS };
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   main().catch((err) => {
