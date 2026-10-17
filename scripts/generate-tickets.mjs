@@ -41,7 +41,7 @@
 //            European countries and up to the 2nd division elsewhere (leaguePolicy.mjs,
 //            directWinAllowedForLeague); cups / continental competitions are unaffected. Never relaxed.
 //   Direct wins also need the BACKED team to average >= 1.75 goals scored and < 1.0 conceded per
-//            match over its last 5 finished matches (never relaxed; missing history = rejected).
+//            match over its last 5 finished matches (never relaxed, except the Mega/Duo-only relaxed-5 last resort; missing history = rejected).
 //   Any other market (Mega/Duo only): no rank/form requirement.
 //   Mega Day: any market, EXACTLY 3 matches, cumulative odds >= 1.97 (floor never
 //            relaxes; NO ceiling — going above the displayed 3 is fine).
@@ -155,11 +155,14 @@ const SAINTS_LOCK_MARKETS = new Set(['Home Win', 'Away Win', 'Over 2.5 Goals']);
 // NEVER relaxed, even at relaxed-4: Saint's Lock markets (direct win / Over 2.5
 // only) and odds band, the Double Chance cap (1.3), the Mega / Duo
 // cumulative-odds ranges and 1.97 floor, per-tier confidence floors, tier sizes
-// (Mega 3, Duo 2), the direct-win division cap and scoring/conceding rule, the
+// (Mega 3, Duo 2), the direct-win division cap (and, except at relaxed-5, the scoring/conceding rule), the
 // goals-quality gate (relaxed-4 reuses the relaxed-3 thresholds), no South
 // American leagues, the 2h minimum before kickoff, and no fixture reuse.
 // relaxed-4 ONLY drops the rank-gap / last-5-wins requirement
 // (requireStandings: false), so a win may back the bookmaker's favourite.
+// relaxed-5 (final) also drops the win scoring/conceding check (skipWinForm) for Mega / Duo legs only
+// (Saint's Lock keeps it) — owner decision
+// 2026-10-17, because that rule alone rejected ~370 of ~470 win outcomes on a real day.
 // (goalsLevel names the goals-gate thresholds in goalsQuality.mjs; default = level name.)
 const BASE_LEVEL = {
   dcMaxOdds: 1.3,
@@ -177,6 +180,9 @@ const RELAXATION_LEVELS = [
   { ...BASE_LEVEL, name: 'relaxed-3', minRankGap: 4, minWins: 2 },
   // LAST RESORT — only used in pass 2 (see GUARANTEE above).
   { ...BASE_LEVEL, name: 'relaxed-4', minRankGap: 0, minWins: 0, requireStandings: false, goalsLevel: 'relaxed-3' },
+  // FINAL LAST RESORT (owner decision, 2026-10-17): additionally drops the win scoring/conceding
+  // check, so any bookmaker favourite inside the tier's odds cap and confidence floor may be used.
+  { ...BASE_LEVEL, name: 'relaxed-5', minRankGap: 0, minWins: 0, requireStandings: false, skipWinForm: true, goalsLevel: 'relaxed-3' },
 ];
 const STANDARD_LEVELS = RELAXATION_LEVELS.slice(0, 4);
 const MIN_GAMES_PLAYED = 5; // early-season tables are meaningless
@@ -392,7 +398,7 @@ async function goalMetrics(f) {
 
 // A team may only be BACKED to win outright if, over its last 5 finished matches (any competition),
 // it scores at least WIN_MIN_AVG_SCORED goals per match AND concedes fewer than WIN_MAX_AVG_CONCEDED
-// per match. Applies to every ticket including Saint's Lock; never relaxed. Missing history = rejected.
+// per match. Applies to every ticket including Saint's Lock; never relaxed, except the Mega/Duo-only relaxed-5 last resort. Missing history = rejected.
 const WIN_MIN_AVG_SCORED = 1.75;
 const WIN_MAX_AVG_CONCEDED = 1; // strictly less than
 const WIN_FORM_SAMPLE = 5;
@@ -476,7 +482,7 @@ function marketAllowedAt(outcome, p, level, saintsLockOnly) {
   if (outcome.market === 'Home Win' || outcome.market === 'Away Win') {
     if (p.directWinOk === false) return false; // division cap for direct wins — never relaxed, even at last resort
     const side = outcome.market === 'Home Win' ? 'home' : 'away';
-    if (!winGoalFormPasses(p.goals, side)) return false; // scoring / conceding rule — never relaxed
+    if (!(level.skipWinForm && !saintsLockOnly) && !winGoalFormPasses(p.goals, side)) return false; // scoring / conceding rule — dropped ONLY at relaxed-5, and never for Saint's Lock
     if (winPasses(p.win, level) && p.win.favoured === side) return true;
     return !level.requireStandings && isMarketFavourite(outcome, p);
   }
@@ -719,7 +725,7 @@ function explainPool(pool, level) {
       } else if (o.market === 'Home Win' || o.market === 'Away Win') {
         const side = o.market === 'Home Win' ? 'home' : 'away';
         if (p.directWinOk === false) bump('win: division cap');
-        else if (!winGoalFormPasses(p.goals, side)) bump(p.goals?.history ? 'win: scoring/conceding form' : 'win: no recent-match history');
+        else if (!level.skipWinForm && !winGoalFormPasses(p.goals, side)) bump(p.goals?.history ? 'win: scoring/conceding form' : 'win: no recent-match history');
         else if (!(winPasses(p.win, level) && p.win.favoured === side) && level.requireStandings) bump('win: rank gap / last-5 wins');
         else if (impliedConfidence(o.odds) < level.minConf.mega) bump('win: below Mega confidence floor (odds too long)');
         else bump('win: pass');
