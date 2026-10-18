@@ -74,6 +74,9 @@ import { fileURLToPath } from 'node:url';
 
 const MAX_ODDS_LOOKUPS_PER_RUN = 200;
 const PER_LEAGUE_LOOKUPS_PER_ROUND = 3;
+// Pass 2 (tomorrow's fixtures, only when pass 1 left a category unbuilt) gets a smaller odds budget:
+// every priced fixture also costs standings / last-5 requests, and a failing day retries on every cron.
+const MAX_ODDS_LOOKUPS_PASS_2 = 100;
 
 const PRIORITY_LEAGUE_NAMES = new Set([
   'Premier League', 'La Liga', 'Serie A', 'Bundesliga', 'Ligue 1',
@@ -1088,11 +1091,15 @@ async function main() {
   if (missing.some((m) => m.tier !== 'saints_lock')) explainPool(freshPool, STANDARD_LEVELS[STANDARD_LEVELS.length - 1]);
 
   // ---- Pass 2: only the missing categories, today + tomorrow, full ladder incl. relaxed-4 ----
-  if (missing.length > 0) {
+  if (missing.length > 0 && dailyPool.length === 0) {
+    // Nothing priced at all: this is a data-source problem (most likely API-Football's daily request
+    // limit or an outage), not a rules problem — pass 2 would only spend more requests for nothing.
+    console.error("Pass 1 priced ZERO fixtures — check the API-Football response above (daily request limit reached? outage?). Skipping pass 2 to avoid wasting requests.");
+  } else if (missing.length > 0) {
     console.warn(`Pass 1 left ${missing.length} category(ies) unbuilt: ${missing.map((m) => `${m.tier}#${m.slot}`).join(', ')}. Pass 2: widening to tomorrow's fixtures and the full ladder.`);
     // Only TOMORROW is fetched here: today's fixtures are already priced in dailyPool (re-fetching
     // them would burn the odds-lookup budget on the same fixtures again and never reach tomorrow).
-    const tomorrowPool = await fetchPricedFixtures([tomorrowStr], MAX_ODDS_LOOKUPS_PER_RUN, today);
+    const tomorrowPool = await fetchPricedFixtures([tomorrowStr], MAX_ODDS_LOOKUPS_PASS_2, today);
     console.log(`Priced ${tomorrowPool.length} qualifying fixtures for tomorrow.`);
     const tomorrowMarkets = await fetchExistingMarkets(supabase, tomorrowPool.map((p) => p.fixtureId));
     existingMarkets = new Map([...existingMarkets, ...tomorrowMarkets]);
